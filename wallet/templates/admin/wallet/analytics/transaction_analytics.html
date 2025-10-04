@@ -1,0 +1,179 @@
+{% extends "admin/base_site.html" %}
+{% load i18n static %}
+
+{% block extrastyle %}
+  {{ block.super }}
+  <link rel="stylesheet" href="{% static 'admin/css/forms.css' %}">
+  <style>
+    .dashboard {
+      display: flex;
+      flex-wrap: wrap;
+      margin: -10px;
+    }
+    .card {
+      background: #fff;
+      border-radius: 4px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24);
+      margin: 10px;
+      padding: 20px;
+      flex: 1;
+      min-width: 250px;
+    }
+    .card h3 {
+      margin-top: 0;
+      color: #417690;
+      font-size: 16px;
+    }
+    .card .number {
+      font-size: 32px;
+      font-weight: bold;
+      margin: 15px 0;
+      color: #444;
+    }
+    .card .description {
+      color: #666;
+      font-size: 14px;
+    }
+    .chart {
+      width: 100%;
+      min-height: 300px;
+      margin: 20px 0;
+      padding: 20px;
+      background: #fff;
+      border-radius: 4px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24);
+    }
+    .chart h3 {
+      margin-top: 0;
+      color: #417690;
+    }
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+{% endblock %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+  <a href="{% url 'admin:index' %}">{% trans 'Home' %}</a>
+  &rsaquo; <a href="{% url 'admin:app_list' app_label=opts.app_label %}">{{ opts.app_config.verbose_name }}</a>
+  &rsaquo; <a href="{% url 'admin:wallet_transaction_changelist' %}">{{ opts.verbose_name_plural|capfirst }}</a>
+  &rsaquo; {% trans 'Analytics' %}
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="content-main">
+  <h1>{% trans 'Transaction Analytics' %}</h1>
+  
+  <div class="dashboard">
+    <div class="card">
+      <h3>{% trans 'Total Transactions' %}</h3>
+      <div class="number">{{ total_transactions }}</div>
+      <div class="description">{% trans 'Total number of transactions in the system' %}</div>
+    </div>
+    
+    <div class="card">
+      <h3>{% trans 'Successful Transactions' %}</h3>
+      <div class="number">{{ successful_transactions }}</div>
+      <div class="description">{% trans 'Number of successful transactions' %}</div>
+    </div>
+    
+    <div class="card">
+      <h3>{% trans 'Failed Transactions' %}</h3>
+      <div class="number">{{ failed_transactions }}</div>
+      <div class="description">{% trans 'Number of failed transactions' %}</div>
+    </div>
+    
+    <div class="card">
+      <h3>{% trans 'Pending Transactions' %}</h3>
+      <div class="number">{{ pending_transactions }}</div>
+      <div class="description">{% trans 'Number of pending transactions' %}</div>
+    </div>
+    
+    <div class="card">
+      <h3>{% trans 'Total Amount' %}</h3>
+      <div class="number">{{ amount_sum }}</div>
+      <div class="description">{% trans 'Total amount of successful transactions' %}</div>
+    </div>
+  </div>
+  
+  <div class="chart">
+    <h3>{% trans 'Transaction Trend' %}</h3>
+    <canvas id="transactionsChart"></canvas>
+  </div>
+  
+  <div class="chart">
+    <h3>{% trans 'Transaction Types Distribution' %}</h3>
+    <canvas id="transactionTypesChart"></canvas>
+  </div>
+</div>
+
+<script>
+  document.addEventListener('DOMContentLoaded', function() {
+    // Transaction trend
+    var ctx1 = document.getElementById('transactionsChart').getContext('2d');
+    var transactionsChart = new Chart(ctx1, {
+      type: 'line',
+      data: {
+        labels: [{% for item in transactions_by_date %}'{{ item.date|date:"Y-m-d" }}'{% if not forloop.last %}, {% endif %}{% endfor %}],
+        datasets: [{
+          label: '{% trans "Transactions" %}',
+          data: [{% for item in transactions_by_date %}{{ item.count }}{% if not forloop.last %}, {% endif %}{% endfor %}],
+          backgroundColor: 'rgba(65, 118, 144, 0.2)',
+          borderColor: 'rgba(65, 118, 144, 1)',
+          borderWidth: 2,
+          pointBackgroundColor: 'rgba(65, 118, 144, 1)',
+          tension: 0.4
+        }]
+      },
+      options: {
+        responsive: true,
+        scales: {
+          y: {
+            beginAtZero: true,
+            precision: 0
+          }
+        }
+      }
+    });
+
+    // Transaction types distribution
+    var ctx2 = document.getElementById('transactionTypesChart').getContext('2d');
+    var transactionTypesChart = new Chart(ctx2, {
+      type: 'pie',
+      data: {
+        labels: [{% for item in transactions_by_type %}'{{ item.transaction_type }}'{% if not forloop.last %}, {% endif %}{% endfor %}],
+        datasets: [{
+          data: [{% for item in transactions_by_type %}{{ item.count }}{% if not forloop.last %}, {% endif %}{% endfor %}],
+          backgroundColor: [
+            'rgba(65, 118, 144, 0.7)',
+            'rgba(239, 71, 111, 0.7)',
+            'rgba(255, 209, 102, 0.7)',
+            'rgba(6, 214, 160, 0.7)',
+            'rgba(17, 138, 178, 0.7)',
+            'rgba(255, 140, 50, 0.7)',
+            'rgba(153, 102, 255, 0.7)'
+          ],
+          borderColor: [
+            'rgba(65, 118, 144, 1)',
+            'rgba(239, 71, 111, 1)',
+            'rgba(255, 209, 102, 1)',
+            'rgba(6, 214, 160, 1)',
+            'rgba(17, 138, 178, 1)',
+            'rgba(255, 140, 50, 1)',
+            'rgba(153, 102, 255, 1)'
+          ],
+          borderWidth: 1
+        }]
+      },
+      options: {
+        responsive: true,
+        plugins: {
+          legend: {
+            position: 'right',
+          }
+        }
+      }
+    });
+  });
+</script>
+{% endblock %}

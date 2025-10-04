@@ -1,0 +1,7 @@
+include LICENSE
+include README.md
+include CHANGELOG.md
+recursive-include wallet/templates *
+recursive-include wallet/static *
+recursive-include wallet/locale *
+recursive-include docs *

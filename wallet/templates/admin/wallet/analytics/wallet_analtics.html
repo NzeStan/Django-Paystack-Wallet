@@ -1,0 +1,129 @@
+{% extends "admin/base_site.html" %}
+{% load i18n static %}
+
+{% block extrastyle %}
+  {{ block.super }}
+  <link rel="stylesheet" href="{% static 'admin/css/forms.css' %}">
+  <style>
+    .dashboard {
+      display: flex;
+      flex-wrap: wrap;
+      margin: -10px;
+    }
+    .card {
+      background: #fff;
+      border-radius: 4px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24);
+      margin: 10px;
+      padding: 20px;
+      flex: 1;
+      min-width: 250px;
+    }
+    .card h3 {
+      margin-top: 0;
+      color: #417690;
+      font-size: 16px;
+    }
+    .card .number {
+      font-size: 32px;
+      font-weight: bold;
+      margin: 15px 0;
+      color: #444;
+    }
+    .card .description {
+      color: #666;
+      font-size: 14px;
+    }
+    .chart {
+      width: 100%;
+      min-height: 300px;
+      margin: 20px 0;
+      padding: 20px;
+      background: #fff;
+      border-radius: 4px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24);
+    }
+    .chart h3 {
+      margin-top: 0;
+      color: #417690;
+    }
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+{% endblock %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+  <a href="{% url 'admin:index' %}">{% trans 'Home' %}</a>
+  &rsaquo; <a href="{% url 'admin:app_list' app_label=opts.app_label %}">{{ opts.app_config.verbose_name }}</a>
+  &rsaquo; <a href="{% url 'admin:wallet_wallet_changelist' %}">{{ opts.verbose_name_plural|capfirst }}</a>
+  &rsaquo; {% trans 'Analytics' %}
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="content-main">
+  <h1>{% trans 'Wallet Analytics' %}</h1>
+  
+  <div class="dashboard">
+    <div class="card">
+      <h3>{% trans 'Total Wallets' %}</h3>
+      <div class="number">{{ total_wallets }}</div>
+      <div class="description">{% trans 'Total number of wallets in the system' %}</div>
+    </div>
+    
+    <div class="card">
+      <h3>{% trans 'Active Wallets' %}</h3>
+      <div class="number">{{ active_wallets }}</div>
+      <div class="description">{% trans 'Number of active wallets' %}</div>
+    </div>
+    
+    <div class="card">
+      <h3>{% trans 'Locked Wallets' %}</h3>
+      <div class="number">{{ locked_wallets }}</div>
+      <div class="description">{% trans 'Number of locked wallets' %}</div>
+    </div>
+    
+    <div class="card">
+      <h3>{% trans 'Total Balance' %}</h3>
+      <div class="number">{{ balance_sum }}</div>
+      <div class="description">{% trans 'Total balance across all wallets' %}</div>
+    </div>
+  </div>
+  
+  <div class="chart">
+    <h3>{% trans 'Wallet Creation Trend' %}</h3>
+    <canvas id="walletsChart"></canvas>
+  </div>
+</div>
+
+<script>
+  document.addEventListener('DOMContentLoaded', function() {
+    // Wallet creation trend
+    var ctx = document.getElementById('walletsChart').getContext('2d');
+    var walletsChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: [{% for item in wallets_by_date %}'{{ item.date|date:"Y-m-d" }}'{% if not forloop.last %}, {% endif %}{% endfor %}],
+        datasets: [{
+          label: '{% trans "Wallets Created" %}',
+          data: [{% for item in wallets_by_date %}{{ item.count }}{% if not forloop.last %}, {% endif %}{% endfor %}],
+          backgroundColor: 'rgba(65, 118, 144, 0.2)',
+          borderColor: 'rgba(65, 118, 144, 1)',
+          borderWidth: 2,
+          pointBackgroundColor: 'rgba(65, 118, 144, 1)',
+          tension: 0.4
+        }]
+      },
+      options: {
+        responsive: true,
+        scales: {
+          y: {
+            beginAtZero: true,
+            precision: 0
+          }
+        }
+      }
+    });
+  });
+</script>
+{% endblock %}

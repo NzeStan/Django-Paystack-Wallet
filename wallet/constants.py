@@ -1,0 +1,114 @@
+from django.utils.translation import gettext_lazy as _
+
+# Transaction Types
+TRANSACTION_TYPE_DEPOSIT = 'deposit'
+TRANSACTION_TYPE_WITHDRAWAL = 'withdrawal'
+TRANSACTION_TYPE_TRANSFER = 'transfer'
+TRANSACTION_TYPE_PAYMENT = 'payment'
+TRANSACTION_TYPE_REFUND = 'refund'
+TRANSACTION_TYPE_REVERSAL = 'reversal'
+TRANSACTION_TYPE_FEE = 'fee'
+TRANSACTION_TYPE_COMMISSION = 'commission'
+
+TRANSACTION_TYPES = (
+    (TRANSACTION_TYPE_DEPOSIT, _('Deposit')),
+    (TRANSACTION_TYPE_WITHDRAWAL, _('Withdrawal')),
+    (TRANSACTION_TYPE_TRANSFER, _('Transfer')),
+    (TRANSACTION_TYPE_PAYMENT, _('Payment')),
+    (TRANSACTION_TYPE_REFUND, _('Refund')),
+    (TRANSACTION_TYPE_REVERSAL, _('Reversal')),
+    (TRANSACTION_TYPE_FEE, _('Fee')),
+    (TRANSACTION_TYPE_COMMISSION, _('Commission')),
+)
+
+# Transaction Status
+TRANSACTION_STATUS_PENDING = 'pending'
+TRANSACTION_STATUS_SUCCESS = 'success'
+TRANSACTION_STATUS_FAILED = 'failed'
+TRANSACTION_STATUS_CANCELLED = 'cancelled'
+TRANSACTION_STATUS_REVERSED = 'reversed'
+TRANSACTION_STATUS_PROCESSING = 'processing'
+
+TRANSACTION_STATUSES = (
+    (TRANSACTION_STATUS_PENDING, _('Pending')),
+    (TRANSACTION_STATUS_SUCCESS, _('Success')),
+    (TRANSACTION_STATUS_FAILED, _('Failed')),
+    (TRANSACTION_STATUS_CANCELLED, _('Cancelled')),
+    (TRANSACTION_STATUS_REVERSED, _('Reversed')),
+    (TRANSACTION_STATUS_PROCESSING, _('Processing')),
+)
+
+# Payment Methods
+PAYMENT_METHOD_CARD = 'card'
+PAYMENT_METHOD_BANK = 'bank'
+PAYMENT_METHOD_USSD = 'ussd'
+PAYMENT_METHOD_QR = 'qr'
+PAYMENT_METHOD_MOBILE_MONEY = 'mobile_money'
+PAYMENT_METHOD_BANK_TRANSFER = 'bank_transfer'
+PAYMENT_METHOD_WALLET = 'wallet'
+
+PAYMENT_METHODS = (
+    (PAYMENT_METHOD_CARD, _('Card')),
+    (PAYMENT_METHOD_BANK, _('Bank')),
+    (PAYMENT_METHOD_USSD, _('USSD')),
+    (PAYMENT_METHOD_QR, _('QR Code')),
+    (PAYMENT_METHOD_MOBILE_MONEY, _('Mobile Money')),
+    (PAYMENT_METHOD_BANK_TRANSFER, _('Bank Transfer')),
+    (PAYMENT_METHOD_WALLET, _('Wallet')),
+)
+
+# Bank Account Types
+BANK_ACCOUNT_TYPE_SAVINGS = 'savings'
+BANK_ACCOUNT_TYPE_CURRENT = 'current'
+
+BANK_ACCOUNT_TYPES = (
+    (BANK_ACCOUNT_TYPE_SAVINGS, _('Savings')),
+    (BANK_ACCOUNT_TYPE_CURRENT, _('Current')),
+)
+
+# Card Types
+CARD_TYPE_MASTERCARD = 'mastercard'
+CARD_TYPE_VISA = 'visa'
+CARD_TYPE_VERVE = 'verve'
+CARD_TYPE_DISCOVER = 'discover'
+CARD_TYPE_AMEX = 'amex'
+
+CARD_TYPES = (
+    (CARD_TYPE_MASTERCARD, _('Mastercard')),
+    (CARD_TYPE_VISA, _('Visa')),
+    (CARD_TYPE_VERVE, _('Verve')),
+    (CARD_TYPE_DISCOVER, _('Discover')),
+    (CARD_TYPE_AMEX, _('American Express')),
+)
+
+# Webhook Event Types
+WEBHOOK_EVENT_CHARGE_SUCCESS = 'charge.success'
+WEBHOOK_EVENT_CHARGE_FAILED = 'charge.failed'
+WEBHOOK_EVENT_TRANSFER_SUCCESS = 'transfer.success'
+WEBHOOK_EVENT_TRANSFER_FAILED = 'transfer.failed'
+WEBHOOK_EVENT_TRANSFER_REVERSED = 'transfer.reversed'
+WEBHOOK_EVENT_SUBSCRIPTION_SUCCESS = 'subscription.success'
+WEBHOOK_EVENT_SUBSCRIPTION_FAILED = 'subscription.failed'
+
+WEBHOOK_EVENTS = (
+    (WEBHOOK_EVENT_CHARGE_SUCCESS, _('Charge Success')),
+    (WEBHOOK_EVENT_CHARGE_FAILED, _('Charge Failed')),
+    (WEBHOOK_EVENT_TRANSFER_SUCCESS, _('Transfer Success')),
+    (WEBHOOK_EVENT_TRANSFER_FAILED, _('Transfer Failed')),
+    (WEBHOOK_EVENT_TRANSFER_REVERSED, _('Transfer Reversed')),
+    (WEBHOOK_EVENT_SUBSCRIPTION_SUCCESS, _('Subscription Success')),
+    (WEBHOOK_EVENT_SUBSCRIPTION_FAILED, _('Subscription Failed')),
+)
+
+# Settlement Status
+SETTLEMENT_STATUS_PENDING = 'pending'
+SETTLEMENT_STATUS_PROCESSING = 'processing'
+SETTLEMENT_STATUS_SUCCESS = 'success'
+SETTLEMENT_STATUS_FAILED = 'failed'
+
+SETTLEMENT_STATUSES = (
+    (SETTLEMENT_STATUS_PENDING, _('Pending')),
+    (SETTLEMENT_STATUS_PROCESSING, _('Processing')),
+    (SETTLEMENT_STATUS_SUCCESS, _('Success')),
+    (SETTLEMENT_STATUS_FAILED, _('Failed')),
+)

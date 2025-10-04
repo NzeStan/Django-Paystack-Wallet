@@ -1,0 +1,67 @@
+.env# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+*.pyo
+*.pyd
+*.pdb
+*.dll
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+ENV/
+*.env
+*.venv
+
+# Django/DRF specific
+*.log
+local_settings.py
+db.sqlite3
+media/
+staticfiles/
+static/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*~
+.project
+.pydevproject
+
+# Distribution / Packaging
+dist/
+build/
+*.manifest
+*.spec
+.eggs/
+MANIFEST
+pip-wheel-metadata/
+*.egg-info/
+
+# Coverage / Testing
+htmlcov/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.pytest_cache/
+.tox/
+.mypy_cache/
+.dmypy.json
+.pyre/
+.pytype/
+
+# Docs
+docs/_build/
+
+# testing
+test_project/
