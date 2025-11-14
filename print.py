@@ -1,627 +1,834 @@
 """
-Django Paystack Wallet - Wallet Model
-Refactored with Django best practices and query optimizations
+Django Paystack Wallet - Wallet API Views
+Refactored with query optimization, comprehensive error handling, and clean architecture
 """
-from decimal import Decimal
-from django.db import models, transaction
+import logging
+from typing import Any, Dict
+
+from rest_framework import viewsets, status, permissions
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.request import Request
 from django.utils.translation import gettext_lazy as _
-from django.utils import timezone
-from djmoney.models.fields import MoneyField
-from djmoney.money import Money
+from django.shortcuts import get_object_or_404
+from django.db import transaction as db_transaction
+from django.db.models import Prefetch
 
-from wallet.exceptions import (
-    InsufficientFunds,
-    WalletLocked,
-    InvalidAmount,
-    CurrencyMismatchError
+from wallet.models import Wallet, Transaction
+from wallet.serializers.wallet_serializer import (
+    WalletSerializer,
+    WalletDetailSerializer,
+    WalletCreateUpdateSerializer,
+    WalletDepositSerializer,
+    WalletWithdrawSerializer,
+    WalletTransferSerializer,
+    FinalizeWithdrawalSerializer
 )
-from wallet.models.base import BaseModel
-from wallet.settings import get_wallet_setting
+from wallet.serializers.transaction_serializer import TransactionListSerializer
+from wallet.services.wallet_service import WalletService
+from wallet.services.transaction_service import TransactionService
+from wallet.utils.id_generators import generate_transaction_reference
+from wallet.exceptions import (
+    WalletLocked,
+    InsufficientFunds,
+    InvalidAmount,
+    BankAccountError,
+    PaystackAPIError
+)
 
 
-class WalletQuerySet(models.QuerySet):
-    """Custom QuerySet for Wallet model with optimized queries"""
+logger = logging.getLogger(__name__)
+
+
+# ==========================================
+# CUSTOM PERMISSIONS
+# ==========================================
+
+class IsWalletOwner(permissions.BasePermission):
+    """
+    Permission to check if user is the wallet owner
     
-    def active(self):
-        """Return only active wallets"""
-        return self.filter(is_active=True, is_locked=False)
+    Ensures that users can only access and modify their own wallets.
+    """
     
-    def locked(self):
-        """Return only locked wallets"""
-        return self.filter(is_locked=True)
+    message = _("You do not have permission to access this wallet")
     
-    def with_user_details(self):
-        """Prefetch user details to avoid N+1 queries"""
-        return self.select_related('user')
-    
-    def with_full_details(self):
-        """Prefetch all related data for comprehensive wallet views"""
-        return self.select_related('user').prefetch_related(
-            'transactions',
-            'cards',
-            'bank_accounts',
-            'received_transactions'
-        )
-    
-    def with_transaction_summary(self):
-        """Annotate wallets with transaction statistics"""
-        from django.db.models import Count, Sum, Q
-        from wallet.constants import TRANSACTION_STATUS_SUCCESS
+    def has_object_permission(self, request: Request, view: Any, obj: Wallet) -> bool:
+        """
+        Check if user owns the wallet
         
-        return self.annotate(
-            total_transactions=Count('transactions'),
-            successful_transactions=Count(
-                'transactions',
-                filter=Q(transactions__status=TRANSACTION_STATUS_SUCCESS)
-            ),
-            total_received=Sum(
-                'received_transactions__amount',
-                filter=Q(received_transactions__status=TRANSACTION_STATUS_SUCCESS)
-            )
-        )
+        Args:
+            request (Request): HTTP request
+            view: View instance
+            obj (Wallet): Wallet object to check
+            
+        Returns:
+            bool: True if user owns wallet
+        """
+        return obj.user == request.user
 
 
-class WalletManager(models.Manager):
-    """Custom Manager for Wallet model"""
+# ==========================================
+# UTILITY FUNCTIONS
+# ==========================================
+
+def get_client_ip(request: Request) -> str:
+    """
+    Extract client IP address from request
+    
+    Handles proxy headers and direct connections.
+    
+    Args:
+        request (Request): HTTP request
+        
+    Returns:
+        str: Client IP address
+    """
+    x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+    if x_forwarded_for:
+        # Get first IP from list (client IP)
+        return x_forwarded_for.split(',')[0].strip()
+    return request.META.get('REMOTE_ADDR', '')
+
+
+def build_error_response(
+    message: str,
+    status_code: int = status.HTTP_400_BAD_REQUEST,
+    errors: Dict = None
+) -> Response:
+    """
+    Build a standardized error response
+    
+    Args:
+        message (str): Error message
+        status_code (int): HTTP status code
+        errors (dict, optional): Additional error details
+        
+    Returns:
+        Response: DRF Response object
+    """
+    response_data = {'detail': message}
+    if errors:
+        response_data['errors'] = errors
+    
+    return Response(response_data, status=status_code)
+
+
+# ==========================================
+# WALLET VIEWSET
+# ==========================================
+
+class WalletViewSet(viewsets.ModelViewSet):
+    """
+    API endpoint for wallet operations
+    
+    Provides CRUD operations for wallets plus custom actions for
+    deposits, withdrawals, transfers, and account management.
+    
+    List/Retrieve: GET /api/wallets/
+    Create: POST /api/wallets/
+    Update: PUT/PATCH /api/wallets/{id}/
+    Delete: DELETE /api/wallets/{id}/
+    
+    Custom Actions:
+    - deposit: POST /api/wallets/{id}/deposit/
+    - withdraw: POST /api/wallets/{id}/withdraw/
+    - transfer: POST /api/wallets/{id}/transfer/
+    - balance: GET /api/wallets/{id}/balance/
+    - transactions: GET /api/wallets/{id}/transactions/
+    - dedicated_account: GET /api/wallets/{id}/dedicated_account/
+    """
+    
+    serializer_class = WalletSerializer
+    permission_classes = [permissions.IsAuthenticated, IsWalletOwner]
     
     def get_queryset(self):
-        """Return custom queryset"""
-        return WalletQuerySet(self.model, using=self._db)
-    
-    def active(self):
-        """Return only active wallets"""
-        return self.get_queryset().active()
-    
-    def with_user_details(self):
-        """Get wallets with user details"""
-        return self.get_queryset().with_user_details()
-    
-    def with_full_details(self):
-        """Get wallets with full related data"""
-        return self.get_queryset().with_full_details()
-    
-    def get_or_create_for_user(self, user):
         """
-        Get or create a wallet for a user (atomic operation)
+        Get wallets for the current user with optimized queries
+        
+        Returns:
+            QuerySet: Filtered and optimized wallet queryset
+        """
+        return Wallet.objects.filter(user=self.request.user).select_related('user')
+    
+    def get_serializer_class(self):
+        """
+        Return appropriate serializer based on action
+        
+        Returns:
+            Serializer class: Appropriate serializer for the action
+        """
+        action_serializers = {
+            'retrieve': WalletDetailSerializer,
+            'create': WalletCreateUpdateSerializer,
+            'update': WalletCreateUpdateSerializer,
+            'partial_update': WalletCreateUpdateSerializer,
+            'deposit': WalletDepositSerializer,
+            'withdraw': WalletWithdrawSerializer,
+            'transfer': WalletTransferSerializer,
+        }
+        
+        return action_serializers.get(self.action, self.serializer_class)
+    
+    def get_object(self):
+        """
+        Get wallet object with special handling for 'default' pk
+        
+        Returns:
+            Wallet: Wallet instance
+        """
+        pk = self.kwargs.get('pk')
+        
+        # Handle 'default' as special keyword for user's wallet
+        if pk == 'default':
+            try:
+                wallet = Wallet.objects.select_related('user').get(user=self.request.user)
+                self.check_object_permissions(self.request, wallet)
+                return wallet
+            except Wallet.DoesNotExist:
+                # Create wallet if it doesn't exist
+                wallet_service = WalletService()
+                wallet = wallet_service.get_wallet(self.request.user)
+                self.check_object_permissions(self.request, wallet)
+                return wallet
+        
+        # Standard object retrieval
+        return super().get_object()
+    
+    # ==========================================
+    # CRUD OPERATIONS
+    # ==========================================
+    
+    def create(self, request: Request, *args, **kwargs) -> Response:
+        """
+        Create a new wallet for the user
         
         Args:
-            user: User instance
+            request (Request): HTTP request
             
         Returns:
-            tuple: (Wallet instance, created boolean)
+            Response: Created wallet data
         """
-        return self.get_or_create(user=user)
-
-
-class Wallet(BaseModel):
-    """
-    Wallet model for storing user balance and wallet information
-    
-    This model represents a digital wallet that can hold monetary balance,
-    track transactions, and enforce business rules for financial operations.
-    """
-    
-    # Core Fields
-    user = models.OneToOneField(
-        get_wallet_setting('USER_MODEL'),
-        on_delete=models.CASCADE,
-        related_name='wallet',
-        verbose_name=_('User'),
-        help_text=_('The user who owns this wallet')
-    )
-    
-    balance = MoneyField(
-        max_digits=19,
-        decimal_places=2,
-        default=0,
-        default_currency=get_wallet_setting('CURRENCY'),
-        verbose_name=_('Balance'),
-        help_text=_('Current balance in the wallet')
-    )
-    
-    # Optional Identifiers
-    tag = models.CharField(
-        max_length=100,
-        blank=True,
-        null=True,
-        db_index=True,
-        verbose_name=_('Tag'),
-        help_text=_('A custom identifier for the wallet')
-    )
-    
-    # Status Fields
-    is_active = models.BooleanField(
-        default=True,
-        db_index=True,
-        verbose_name=_('Is active'),
-        help_text=_('Whether the wallet is active and can perform operations')
-    )
-    
-    is_locked = models.BooleanField(
-        default=False,
-        db_index=True,
-        verbose_name=_('Is locked'),
-        help_text=_('Locked wallets cannot perform transactions')
-    )
-    
-    # Transaction Tracking
-    last_transaction_date = models.DateTimeField(
-        null=True,
-        blank=True,
-        db_index=True,
-        verbose_name=_('Last transaction date'),
-        help_text=_('Date and time of the last transaction')
-    )
-    
-    # Daily Limits Tracking
-    daily_transaction_total = MoneyField(
-        max_digits=19,
-        decimal_places=2,
-        default=0,
-        default_currency=get_wallet_setting('CURRENCY'),
-        verbose_name=_('Daily transaction total'),
-        help_text=_('Total amount transacted today')
-    )
-    
-    daily_transaction_count = models.PositiveIntegerField(
-        default=0,
-        verbose_name=_('Daily transaction count'),
-        help_text=_('Number of transactions performed today')
-    )
-    
-    daily_transaction_reset = models.DateField(
-        null=True,
-        blank=True,
-        verbose_name=_('Daily transaction reset date'),
-        help_text=_('Date when daily limits were last reset')
-    )
-    
-    # Paystack Integration Fields
-    paystack_customer_code = models.CharField(
-        max_length=100,
-        blank=True,
-        null=True,
-        db_index=True,
-        unique=True,
-        verbose_name=_('Paystack customer code'),
-        help_text=_('Paystack customer identifier')
-    )
-    
-    dedicated_account_number = models.CharField(
-        max_length=50,
-        blank=True,
-        null=True,
-        db_index=True,
-        verbose_name=_('Dedicated account number'),
-        help_text=_('Virtual account number for direct deposits')
-    )
-    
-    dedicated_account_bank = models.CharField(
-        max_length=100,
-        blank=True,
-        null=True,
-        verbose_name=_('Dedicated account bank'),
-        help_text=_('Bank name for the dedicated account')
-    )
-    
-    # Custom Manager
-    objects = WalletManager()
-    
-    class Meta:
-        verbose_name = _('Wallet')
-        verbose_name_plural = _('Wallets')
-        ordering = ['-created_at']
-        indexes = [
-            models.Index(fields=['user'], name='wallet_user_idx'),
-            models.Index(fields=['is_active', 'is_locked'], name='wallet_status_idx'),
-            models.Index(fields=['tag'], name='wallet_tag_idx'),
-            models.Index(fields=['paystack_customer_code'], name='wallet_paystack_idx'),
-            models.Index(fields=['last_transaction_date'], name='wallet_last_txn_idx'),
-        ]
-    
-    def __str__(self):
-        """String representation of the wallet"""
-        user_display = getattr(self.user, 'email', str(self.user))
-        return f"Wallet ({user_display}) - {self.balance}"
-    
-    def __repr__(self):
-        """Developer-friendly representation"""
-        return (
-            f"<Wallet id={self.id} user_id={self.user_id} "
-            f"balance={self.balance} active={self.is_active}>"
-        )
-    
-    # ==========================================
-    # PROPERTIES
-    # ==========================================
-    
-    @property
-    def available_balance(self):
-        """
-        Get the available balance (alias for balance)
-        
-        Returns:
-            Money: Available balance
-        """
-        return self.balance
-    
-    @property
-    def is_operational(self):
-        """
-        Check if wallet can perform operations
-        
-        Returns:
-            bool: True if active and not locked
-        """
-        return self.is_active and not self.is_locked
-    
-    @property
-    def needs_daily_reset(self):
-        """
-        Check if daily limits need to be reset
-        
-        Returns:
-            bool: True if reset is needed
-        """
-        if not self.daily_transaction_reset:
-            return True
-        return self.daily_transaction_reset < timezone.now().date()
-    
-    # ==========================================
-    # VALIDATION METHODS
-    # ==========================================
-    
-    def check_active(self):
-        """
-        Verify wallet is active and unlocked
-        
-        Raises:
-            WalletLocked: If wallet is locked or inactive
-        """
-        if not self.is_active:
-            raise WalletLocked(_("Wallet is inactive"))
-        
-        if self.is_locked:
-            raise WalletLocked(self)
-    
-    def validate_amount(self, amount):
-        """
-        Validate and normalize amount to Money object
-        
-        Args:
-            amount: Amount to validate (Decimal, int, float, or Money)
-            
-        Returns:
-            Money: Validated Money object
-            
-        Raises:
-            InvalidAmount: If amount is invalid
-            CurrencyMismatchError: If currencies don't match
-        """
-        # Convert to Money if needed
-        if isinstance(amount, (Decimal, int, float)):
-            amount = Money(amount, self.balance.currency)
-        elif not isinstance(amount, Money):
-            raise InvalidAmount(f"Expected Money object, got {type(amount).__name__}")
-        
-        # Validate positive amount
-        if amount.amount <= 0:
-            raise InvalidAmount(amount)
-        
-        # Validate currency match
-        if amount.currency != self.balance.currency:
-            raise CurrencyMismatchError(
-                f"Currency mismatch: wallet uses {self.balance.currency}, "
-                f"but got {amount.currency}"
+        # Check if user already has a wallet
+        if Wallet.objects.filter(user=request.user).exists():
+            logger.warning(f"User {request.user.id} attempted to create duplicate wallet")
+            return build_error_response(
+                _("User already has a wallet"),
+                status.HTTP_400_BAD_REQUEST
             )
         
-        return amount
-    
-    def validate_sufficient_funds(self, amount):
-        """
-        Verify wallet has sufficient funds for withdrawal
-        
-        Args:
-            amount (Money): Amount to check
+        try:
+            # Create wallet using service
+            wallet_service = WalletService()
+            wallet = wallet_service.get_wallet(request.user)
             
-        Raises:
-            InsufficientFunds: If balance is insufficient
-        """
-        if self.balance < amount:
-            raise InsufficientFunds(self, amount)
-    
-    # ==========================================
-    # STATUS MANAGEMENT
-    # ==========================================
-    
-    def lock(self):
-        """
-        Lock the wallet to prevent transactions
-        
-        Returns:
-            bool: True if locked successfully
-        """
-        if not self.is_locked:
-            self.is_locked = True
-            self.save(update_fields=['is_locked', 'updated_at'])
-        return True
-    
-    def unlock(self):
-        """
-        Unlock the wallet to allow transactions
-        
-        Returns:
-            bool: True if unlocked successfully
-        """
-        if self.is_locked:
-            self.is_locked = False
-            self.save(update_fields=['is_locked', 'updated_at'])
-        return True
-    
-    def deactivate(self):
-        """
-        Deactivate the wallet
-        
-        Returns:
-            bool: True if deactivated successfully
-        """
-        if self.is_active:
-            self.is_active = False
-            self.save(update_fields=['is_active', 'updated_at'])
-        return True
-    
-    def activate(self):
-        """
-        Activate the wallet
-        
-        Returns:
-            bool: True if activated successfully
-        """
-        if not self.is_active:
-            self.is_active = True
-            self.save(update_fields=['is_active', 'updated_at'])
-        return True
-    
-    # ==========================================
-    # DAILY LIMITS MANAGEMENT
-    # ==========================================
-    
-    def reset_daily_limit(self):
-        """
-        Reset daily transaction limits if needed
-        
-        This method is automatically called during transactions
-        to ensure daily limits are properly managed.
-        """
-        if self.needs_daily_reset:
-            self.daily_transaction_total = Money(0, self.balance.currency)
-            self.daily_transaction_count = 0
-            self.daily_transaction_reset = timezone.now().date()
-            self.save(update_fields=[
-                'daily_transaction_total',
-                'daily_transaction_count',
-                'daily_transaction_reset',
-                'updated_at'
-            ])
-    
-    def update_transaction_metrics(self, amount):
-        """
-        Update daily transaction metrics
-        
-        Args:
-            amount (Decimal): Transaction amount to add to daily total
+            # Update wallet with provided data
+            serializer = self.get_serializer(wallet, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
             
-        Raises:
-            InvalidAmount: If amount is invalid
-            CurrencyMismatchError: If currencies don't match
-        """
-        # Update last transaction date
-        self.last_transaction_date = timezone.now()
-        
-        # Reset daily limits if needed
-        self.reset_daily_limit()
-        
-        # Validate and convert amount
-        if isinstance(amount, (Decimal, int, float)):
-            amount = Money(amount, self.balance.currency)
-        elif not isinstance(amount, Money):
-            raise InvalidAmount(f"Expected Money object, got {type(amount).__name__}")
-        
-        # Validate currency match
-        if amount.currency != self.daily_transaction_total.currency:
-            raise CurrencyMismatchError(
-                f"Currency mismatch: wallet uses {self.daily_transaction_total.currency}, "
-                f"but got {amount.currency}"
+            logger.info(f"Created wallet {wallet.id} for user {request.user.id}")
+            
+            # Return detailed wallet info
+            return Response(
+                WalletDetailSerializer(wallet).data,
+                status=status.HTTP_201_CREATED
             )
         
-        # Prevent negative daily total
-        new_total = self.daily_transaction_total + amount
-        if new_total.amount < 0:
-            raise InvalidAmount(f"Negative daily total not allowed: {new_total}")
-        
-        # Update metrics
-        self.daily_transaction_total = new_total
-        self.daily_transaction_count += 1
-        
-        # Save updates
-        self.save(update_fields=[
-            'last_transaction_date',
-            'daily_transaction_total',
-            'daily_transaction_count',
-            'updated_at'
-        ])
+        except Exception as e:
+            logger.error(
+                f"Error creating wallet for user {request.user.id}: {str(e)}",
+                exc_info=True
+            )
+            return build_error_response(
+                _("Failed to create wallet. Please try again."),
+                status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
     
     # ==========================================
-    # CORE WALLET OPERATIONS
+    # DEPOSIT ACTION
     # ==========================================
     
-    @transaction.atomic
-    def deposit(self, amount):
+    @action(detail=True, methods=['post'])
+    def deposit(self, request: Request, pk=None) -> Response:
         """
-        Add funds to the wallet
+        Initialize a deposit to the wallet
         
-        This method handles the core deposit operation, updating the wallet
-        balance and transaction metrics. Transaction records should be
-        created by the service layer.
+        This creates a Paystack charge transaction and returns
+        the authorization URL for completing the payment.
+        
+        POST /api/wallets/{id}/deposit/
+        
+        Request Body:
+        {
+            "amount": 1000.00,
+            "email": "user@example.com",  # Optional
+            "callback_url": "https://...",  # Optional
+            "description": "Wallet top-up",  # Optional
+            "reference": "REF123",  # Optional
+            "metadata": {}  # Optional
+        }
         
         Args:
-            amount: Amount to deposit (Money, Decimal, int, or float)
+            request (Request): HTTP request
+            pk: Wallet primary key
             
         Returns:
-            Money: Updated balance
+            Response: Charge initialization data with authorization URL
+        """
+        wallet = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        wallet_service = WalletService()
+        
+        try:
+            # Extract validated data
+            amount = serializer.validated_data['amount']
+            email = serializer.validated_data.get('email') or request.user.email
+            callback_url = serializer.validated_data.get('callback_url', '')
+            reference = serializer.validated_data.get('reference') or generate_transaction_reference()
+            description = serializer.validated_data.get('description', 'Card deposit to wallet')
             
-        Raises:
-            WalletLocked: If wallet is locked or inactive
-            InvalidAmount: If amount is invalid
-            CurrencyMismatchError: If currencies don't match
-        """
-        # Verify wallet is operational
-        self.check_active()
+            # Prepare metadata
+            metadata = serializer.validated_data.get('metadata') or {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            else:
+                metadata = metadata.copy()
+            
+            # Add request context to metadata
+            metadata.update({
+                'ip_address': get_client_ip(request),
+                'user_agent': request.META.get('HTTP_USER_AGENT', ''),
+                'description': description,
+            })
+            
+            logger.info(
+                f"Initializing deposit for wallet {wallet.id}: "
+                f"amount={amount}, reference={reference}"
+            )
+            
+            # Initialize Paystack transaction
+            charge_data = wallet_service.initialize_card_charge(
+                wallet=wallet,
+                amount=amount,
+                email=email,
+                reference=reference,
+                callback_url=callback_url,
+                metadata=metadata
+            )
+            
+            logger.info(
+                f"Deposit initialized for wallet {wallet.id}: "
+                f"reference={reference}, access_code={charge_data.get('access_code')}"
+            )
+            
+            return Response(charge_data, status=status.HTTP_200_OK)
         
-        # Validate and normalize amount
-        amount = self.validate_amount(amount)
+        except PaystackAPIError as e:
+            logger.error(
+                f"Paystack API error during deposit initialization for wallet {wallet.id}: {str(e)}",
+                exc_info=True
+            )
+            return build_error_response(
+                _("Payment gateway error. Please try again."),
+                status.HTTP_502_BAD_GATEWAY
+            )
         
-        # Add to balance
-        self.balance += amount
-        self.save(update_fields=['balance', 'updated_at'])
-        
-        # Update transaction metrics
-        self.update_transaction_metrics(amount.amount)
-        
-        return self.balance
+        except Exception as e:
+            logger.error(
+                f"Error initializing deposit for wallet {wallet.id}: {str(e)}",
+                exc_info=True
+            )
+            return build_error_response(
+                _("Failed to initialize deposit. Please try again."),
+                status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
     
-    @transaction.atomic
-    def withdraw(self, amount):
+    # ==========================================
+    # WITHDRAWAL ACTION
+    # ==========================================
+    
+    @action(detail=True, methods=['post'])
+    def withdraw(self, request: Request, pk=None) -> Response:
         """
-        Remove funds from the wallet
+        Withdraw funds from wallet to a bank account
         
-        This method handles the core withdrawal operation, updating the wallet
-        balance and transaction metrics. Transaction records should be
-        created by the service layer.
+        POST /api/wallets/{id}/withdraw/
+        
+        Request Body:
+        {
+            "amount": 5000.00,
+            "bank_account_id": "uuid-here",
+            "description": "Withdrawal",  # Optional
+            "reference": "REF123",  # Optional
+            "metadata": {}  # Optional
+        }
         
         Args:
-            amount: Amount to withdraw (Money, Decimal, int, or float)
+            request (Request): HTTP request
+            pk: Wallet primary key
             
         Returns:
-            Money: Updated balance
-            
-        Raises:
-            WalletLocked: If wallet is locked or inactive
-            InvalidAmount: If amount is invalid
-            InsufficientFunds: If balance is insufficient
-            CurrencyMismatchError: If currencies don't match
+            Response: Transaction data and transfer information
         """
-        # Verify wallet is operational
-        self.check_active()
+        wallet = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
         
-        # Validate and normalize amount
-        amount = self.validate_amount(amount)
+        wallet_service = WalletService()
         
-        # Verify sufficient funds
-        self.validate_sufficient_funds(amount)
+        try:
+            # Extract validated data
+            amount = serializer.validated_data['amount']
+            bank_account_id = serializer.validated_data['bank_account_id']
+            description = serializer.validated_data.get('description', 'Withdrawal to bank account')
+            reference = serializer.validated_data.get('reference')
+            metadata = serializer.validated_data.get('metadata') or {}
+            
+            # Add request context to metadata
+            if isinstance(metadata, dict):
+                metadata = metadata.copy()
+                metadata.update({
+                    'ip_address': get_client_ip(request),
+                    'user_agent': request.META.get('HTTP_USER_AGENT', ''),
+                })
+            
+            logger.info(
+                f"Initiating withdrawal for wallet {wallet.id}: "
+                f"amount={amount}, bank_account={bank_account_id}"
+            )
+            
+            # Get bank account
+            from wallet.models import BankAccount
+            bank_account = get_object_or_404(
+                BankAccount.objects.select_related('bank'),
+                id=bank_account_id,
+                wallet=wallet,
+                is_active=True
+            )
+            
+            # Process withdrawal
+            transaction, transfer_data = wallet_service.withdraw_to_bank(
+                wallet=wallet,
+                amount=amount,
+                bank_account=bank_account,
+                reason=description,
+                metadata=metadata,
+                reference=reference
+            )
+            
+            logger.info(
+                f"Withdrawal initiated for wallet {wallet.id}: "
+                f"transaction={transaction.id}, transfer_code={transfer_data.get('transfer_code')}"
+            )
+            
+            # Prepare response
+            from wallet.serializers.transaction_serializer import TransactionSerializer
+            response_data = {
+                'transaction': TransactionSerializer(transaction).data,
+                'transfer': {
+                    'transfer_code': transfer_data.get('transfer_code'),
+                    'status': transfer_data.get('status'),
+                    'requires_otp': transfer_data.get('requires_otp', False),
+                }
+            }
+            
+            return Response(response_data, status=status.HTTP_200_OK)
         
-        # Subtract from balance
-        self.balance -= amount
-        self.save(update_fields=['balance', 'updated_at'])
+        except BankAccountError as e:
+            logger.warning(
+                f"Bank account error during withdrawal for wallet {wallet.id}: {str(e)}"
+            )
+            return build_error_response(str(e), status.HTTP_400_BAD_REQUEST)
         
-        # Update transaction metrics
-        self.update_transaction_metrics(amount.amount)
+        except InsufficientFunds as e:
+            logger.warning(
+                f"Insufficient funds for withdrawal from wallet {wallet.id}: {str(e)}"
+            )
+            return build_error_response(str(e), status.HTTP_400_BAD_REQUEST)
         
-        return self.balance
+        except WalletLocked as e:
+            logger.warning(
+                f"Wallet {wallet.id} is locked, withdrawal denied"
+            )
+            return build_error_response(str(e), status.HTTP_403_FORBIDDEN)
+        
+        except PaystackAPIError as e:
+            logger.error(
+                f"Paystack API error during withdrawal for wallet {wallet.id}: {str(e)}",
+                exc_info=True
+            )
+            return build_error_response(
+                _("Payment gateway error. Please try again."),
+                status.HTTP_502_BAD_GATEWAY
+            )
+        
+        except Exception as e:
+            logger.error(
+                f"Error processing withdrawal for wallet {wallet.id}: {str(e)}",
+                exc_info=True
+            )
+            return build_error_response(
+                _("Failed to process withdrawal. Please try again."),
+                status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
     
-    @transaction.atomic
-    def transfer(self, destination_wallet, amount, description=None):
+    # ==========================================
+    # TRANSFER ACTION
+    # ==========================================
+    
+    @action(detail=True, methods=['post'])
+    def transfer(self, request: Request, pk=None) -> Response:
         """
         Transfer funds to another wallet
         
-        This method handles wallet-to-wallet transfers by withdrawing from
-        this wallet and depositing to the destination wallet. Transaction
-        records should be created by the service layer.
+        POST /api/wallets/{id}/transfer/
+        
+        Request Body:
+        {
+            "amount": 1000.00,
+            "destination_wallet_id": "uuid-here",
+            "description": "Payment",  # Optional
+            "reference": "REF123",  # Optional
+            "metadata": {}  # Optional
+        }
         
         Args:
-            destination_wallet (Wallet): Destination wallet
-            amount: Amount to transfer (Money, Decimal, int, or float)
-            description (str, optional): Transfer description
+            request (Request): HTTP request
+            pk: Wallet primary key
             
         Returns:
-            tuple: (source_balance, destination_balance)
-            
-        Raises:
-            WalletLocked: If either wallet is locked or inactive
-            InvalidAmount: If amount is invalid
-            InsufficientFunds: If source wallet has insufficient funds
-            CurrencyMismatchError: If currencies don't match
+            Response: Transaction data
         """
-        # Verify both wallets are operational
-        self.check_active()
-        destination_wallet.check_active()
+        source_wallet = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
         
-        # Validate and normalize amount
-        amount = self.validate_amount(amount)
-        
-        # Validate currency match between wallets
-        if amount.currency != destination_wallet.balance.currency:
-            raise CurrencyMismatchError(
-                f"Currency mismatch: source wallet uses {amount.currency}, "
-                f"destination wallet uses {destination_wallet.balance.currency}"
+        try:
+            # Extract validated data
+            amount = serializer.validated_data['amount']
+            destination_wallet_id = serializer.validated_data['destination_wallet_id']
+            description = serializer.validated_data.get('description', 'Wallet transfer')
+            reference = serializer.validated_data.get('reference')
+            metadata = serializer.validated_data.get('metadata') or {}
+            
+            # Validate amount
+            if amount <= 0:
+                logger.warning(
+                    f"Invalid transfer amount {amount} for wallet {source_wallet.id}"
+                )
+                return build_error_response(
+                    _("Transfer amount must be greater than zero"),
+                    status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Check for self-transfer
+            if str(destination_wallet_id) == str(source_wallet.id):
+                logger.warning(
+                    f"Self-transfer attempted for wallet {source_wallet.id}"
+                )
+                return build_error_response(
+                    _("Cannot transfer to the same wallet"),
+                    status.HTTP_400_BAD_REQUEST
+                )
+            
+            logger.info(
+                f"Initiating transfer from wallet {source_wallet.id}: "
+                f"amount={amount}, destination={destination_wallet_id}"
+            )
+            
+            # Get destination wallet
+            destination_wallet = get_object_or_404(
+                Wallet.objects.select_related('user'),
+                id=destination_wallet_id,
+                is_active=True
+            )
+            
+            # Add request context to metadata
+            if isinstance(metadata, dict):
+                metadata = metadata.copy()
+                metadata.update({
+                    'ip_address': get_client_ip(request),
+                    'user_agent': request.META.get('HTTP_USER_AGENT', ''),
+                })
+            
+            # Process transfer using transaction service
+            transaction_service = TransactionService()
+            transaction = transaction_service.transfer_between_wallets(
+                source_wallet=source_wallet,
+                destination_wallet=destination_wallet,
+                amount=amount,
+                description=description,
+                metadata=metadata,
+                reference=reference
+            )
+            
+            logger.info(
+                f"Transfer completed: transaction={transaction.id}, "
+                f"from={source_wallet.id}, to={destination_wallet.id}"
+            )
+            
+            # Return transaction data
+            from wallet.serializers.transaction_serializer import TransactionSerializer
+            return Response(
+                TransactionSerializer(transaction).data,
+                status=status.HTTP_200_OK
             )
         
-        # Verify sufficient funds
-        self.validate_sufficient_funds(amount)
+        except InsufficientFunds as e:
+            logger.warning(
+                f"Insufficient funds for transfer from wallet {source_wallet.id}: {str(e)}"
+            )
+            return build_error_response(str(e), status.HTTP_400_BAD_REQUEST)
         
-        # Perform transfer (withdrawal from source, deposit to destination)
-        source_balance = self.withdraw(amount)
-        destination_balance = destination_wallet.deposit(amount)
+        except WalletLocked as e:
+            logger.warning(
+                f"Wallet locked during transfer attempt: {str(e)}"
+            )
+            return build_error_response(str(e), status.HTTP_403_FORBIDDEN)
         
-        return source_balance, destination_balance
+        except Wallet.DoesNotExist:
+            logger.warning(
+                f"Invalid destination wallet for transfer from {source_wallet.id}"
+            )
+            return build_error_response(
+                _("Invalid or inactive destination wallet"),
+                status.HTTP_400_BAD_REQUEST
+            )
+        
+        except Exception as e:
+            logger.error(
+                f"Error processing transfer from wallet {source_wallet.id}: {str(e)}",
+                exc_info=True
+            )
+            return build_error_response(
+                _("Failed to process transfer. Please try again."),
+                status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
     
     # ==========================================
-    # UTILITY METHODS
+    # BALANCE ACTION
     # ==========================================
     
-    def refresh_balance(self):
+    @action(detail=True, methods=['get'])
+    def balance(self, request: Request, pk=None) -> Response:
         """
-        Refresh balance from database
+        Get current wallet balance
         
-        Useful when balance might have been updated by another process
-        """
-        self.refresh_from_db(fields=['balance', 'balance_currency'])
-    
-    def get_transaction_count(self):
-        """
-        Get total transaction count
+        GET /api/wallets/{id}/balance/
         
+        Args:
+            request (Request): HTTP request
+            pk: Wallet primary key
+            
         Returns:
-            int: Total number of transactions
+            Response: Balance information
         """
-        return self.transactions.count()
-    
-    def get_successful_transactions_count(self):
-        """
-        Get count of successful transactions
+        wallet = self.get_object()
+        wallet_service = WalletService()
         
-        Returns:
-            int: Number of successful transactions
-        """
-        from wallet.constants import TRANSACTION_STATUS_SUCCESS
-        return self.transactions.filter(status=TRANSACTION_STATUS_SUCCESS).count()
-    
-    def get_pending_transactions_count(self):
-        """
-        Get count of pending transactions
+        try:
+            # Get current balance
+            balance = wallet_service.get_balance(wallet)
+            
+            logger.debug(f"Balance retrieved for wallet {wallet.id}: {balance}")
+            
+            response_data = {
+                'balance_amount': balance.amount,
+                'balance_currency': balance.currency.code,
+                'available_balance': balance.amount,
+                'is_operational': wallet.is_operational,
+                'last_updated': wallet.updated_at,
+            }
+            
+            return Response(response_data, status=status.HTTP_200_OK)
         
-        Returns:
-            int: Number of pending transactions
-        """
-        from wallet.constants import TRANSACTION_STATUS_PENDING
-        return self.transactions.filter(status=TRANSACTION_STATUS_PENDING).count()
+        except Exception as e:
+            logger.error(
+                f"Error retrieving balance for wallet {wallet.id}: {str(e)}",
+                exc_info=True
+            )
+            return build_error_response(
+                _("Failed to retrieve balance"),
+                status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
     
-    def has_pending_transactions(self):
+    # ==========================================
+    # TRANSACTIONS ACTION
+    # ==========================================
+    
+    @action(detail=True, methods=['get'])
+    def transactions(self, request: Request, pk=None) -> Response:
         """
-        Check if wallet has any pending transactions
+        Get wallet transaction history
         
+        GET /api/wallets/{id}/transactions/?limit=20&offset=0
+        
+        Query Parameters:
+        - limit: Number of transactions to return (default: 20)
+        - offset: Offset for pagination (default: 0)
+        
+        Args:
+            request (Request): HTTP request
+            pk: Wallet primary key
+            
         Returns:
-            bool: True if there are pending transactions
+            Response: Paginated transaction list
         """
-        from wallet.constants import TRANSACTION_STATUS_PENDING
-        return self.transactions.filter(status=TRANSACTION_STATUS_PENDING).exists()
+        wallet = self.get_object()
+        
+        try:
+            # Get pagination parameters
+            limit = int(request.query_params.get('limit', 20))
+            offset = int(request.query_params.get('offset', 0))
+            
+            # Validate pagination parameters
+            limit = min(max(1, limit), 100)  # Between 1 and 100
+            offset = max(0, offset)  # Non-negative
+            
+            logger.debug(
+                f"Fetching transactions for wallet {wallet.id}: "
+                f"limit={limit}, offset={offset}"
+            )
+            
+            # Get transactions with optimized query
+            transactions = Transaction.objects.filter(
+                wallet=wallet
+            ).select_related(
+                'recipient_wallet__user',
+                'recipient_bank_account__bank',
+                'card'
+            ).order_by('-created_at')[offset:offset + limit]
+            
+            # Get total count
+            total_count = Transaction.objects.filter(wallet=wallet).count()
+            
+            # Serialize transactions
+            transaction_data = TransactionListSerializer(transactions, many=True).data
+            
+            # Prepare pagination info
+            next_offset = offset + limit if offset + limit < total_count else None
+            previous_offset = offset - limit if offset > 0 else None
+            
+            response_data = {
+                'count': total_count,
+                'next': next_offset,
+                'previous': previous_offset,
+                'results': transaction_data
+            }
+            
+            logger.info(
+                f"Retrieved {len(transaction_data)} transactions for wallet {wallet.id}"
+            )
+            
+            return Response(response_data, status=status.HTTP_200_OK)
+        
+        except ValueError as e:
+            logger.warning(
+                f"Invalid pagination parameters for wallet {wallet.id}: {str(e)}"
+            )
+            return build_error_response(
+                _("Invalid pagination parameters"),
+                status.HTTP_400_BAD_REQUEST
+            )
+        
+        except Exception as e:
+            logger.error(
+                f"Error fetching transactions for wallet {wallet.id}: {str(e)}",
+                exc_info=True
+            )
+            return build_error_response(
+                _("Failed to retrieve transactions"),
+                status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    # ==========================================
+    # DEDICATED ACCOUNT ACTION
+    # ==========================================
+    
+    @action(detail=True, methods=['get'])
+    def dedicated_account(self, request: Request, pk=None) -> Response:
+        """
+        Get or create dedicated virtual account
+        
+        GET /api/wallets/{id}/dedicated_account/
+        
+        Args:
+            request (Request): HTTP request
+            pk: Wallet primary key
+            
+        Returns:
+            Response: Dedicated account details
+        """
+        wallet = self.get_object()
+        wallet_service = WalletService()
+        
+        try:
+            logger.info(f"Dedicated account requested for wallet {wallet.id}")
+            
+            # Check if wallet already has a dedicated account
+            if wallet.dedicated_account_number:
+                logger.info(
+                    f"Existing dedicated account found for wallet {wallet.id}: "
+                    f"{wallet.dedicated_account_number}"
+                )
+                
+                # Get account name
+                if hasattr(wallet.user, 'get_full_name'):
+                    account_name = wallet.user.get_full_name()
+                else:
+                    account_name = str(wallet.user)
+                
+                response_data = {
+                    'account_number': wallet.dedicated_account_number,
+                    'bank_name': wallet.dedicated_account_bank or 'N/A',
+                    'account_name': account_name
+                }
+                
+                return Response(response_data, status=status.HTTP_200_OK)
+            
+            # Create dedicated account
+            logger.info(f"Creating new dedicated account for wallet {wallet.id}")
+            
+            success = wallet_service.create_dedicated_account(wallet)
+            
+            if success:
+                logger.info(
+                    f"Dedicated account created successfully for wallet {wallet.id}"
+                )
+                
+                # Refresh wallet to get updated account details
+                wallet.refresh_from_db()
+                
+                # Get account name
+                if hasattr(wallet.user, 'get_full_name'):
+                    account_name = wallet.user.get_full_name()
+                else:
+                    account_name = str(wallet.user)
+                
+                response_data = {
+                    'account_number': wallet.dedicated_account_number,
+                    'bank_name': wallet.dedicated_account_bank or 'N/A',
+                    'account_name': account_name
+                }
+                
+                return Response(response_data, status=status.HTTP_201_CREATED)
+            
+            # Failed to create account
+            logger.error(f"Failed to create dedicated account for wallet {wallet.id}")
+            return build_error_response(
+                _("Failed to create dedicated account. Please try again later."),
+                status.HTTP_502_BAD_GATEWAY
+            )
+        
+        except Exception as e:
+            logger.error(
+                f"Error processing dedicated account for wallet {wallet.id}: {str(e)}",
+                exc_info=True
+            )
+            return build_error_response(
+                _("An unexpected error occurred. Please try again later."),
+                status.HTTP_500_INTERNAL_SERVER_ERROR
+            )

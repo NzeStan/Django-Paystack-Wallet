@@ -1,6 +1,8 @@
 """
-Django Paystack Wallet - Wallet Service Layer
-Refactored with improved organization, error handling, and transaction management
+Django Paystack Wallet - Wallet Service Layer (FIXED VERSION)
+Fixed issues:
+1. Added validation to prevent transfers to the same wallet
+2. Modified transaction handling to persist failed transaction records
 """
 import logging
 from decimal import Decimal
@@ -194,7 +196,6 @@ class WalletService:
     # DEPOSIT OPERATIONS
     # ==========================================
     
-    @transaction.atomic
     def deposit(
         self,
         wallet: Wallet,
@@ -207,7 +208,8 @@ class WalletService:
         Deposit funds into a wallet
         
         This method creates a transaction record and updates the wallet balance.
-        The operation is wrapped in a database transaction for consistency.
+        Uses a two-phase approach: create transaction first, then update balance
+        in a nested transaction to ensure failed transactions are still recorded.
         
         Args:
             wallet (Wallet): Wallet to deposit into
@@ -229,7 +231,7 @@ class WalletService:
         if not transaction_reference:
             transaction_reference = generate_transaction_reference()
         
-        # Create pending transaction
+        # Create pending transaction (outside the atomic block to persist even on failure)
         txn = Transaction.objects.create(
             wallet=wallet,
             amount=amount,
@@ -246,8 +248,10 @@ class WalletService:
         )
         
         try:
-            # Add funds to wallet
-            wallet.deposit(amount)
+            # Use atomic block for the balance update
+            with transaction.atomic():
+                # Add funds to wallet
+                wallet.deposit(amount)
             
             # Mark transaction as successful
             txn.status = TRANSACTION_STATUS_SUCCESS
@@ -347,7 +351,6 @@ class WalletService:
     # WITHDRAWAL OPERATIONS
     # ==========================================
     
-    @transaction.atomic
     def withdraw(
         self,
         wallet: Wallet,
@@ -360,7 +363,8 @@ class WalletService:
         Withdraw funds from a wallet
         
         This method creates a transaction record and updates the wallet balance.
-        The operation is wrapped in a database transaction for consistency.
+        Uses a two-phase approach: create transaction first, then update balance
+        in a nested transaction to ensure failed transactions are still recorded.
         
         Args:
             wallet (Wallet): Wallet to withdraw from
@@ -383,7 +387,7 @@ class WalletService:
         if not transaction_reference:
             transaction_reference = generate_transaction_reference()
         
-        # Create pending transaction
+        # Create pending transaction (outside the atomic block to persist even on failure)
         txn = Transaction.objects.create(
             wallet=wallet,
             amount=amount,
@@ -400,8 +404,10 @@ class WalletService:
         )
         
         try:
-            # Remove funds from wallet
-            wallet.withdraw(amount)
+            # Use atomic block for the balance update
+            with transaction.atomic():
+                # Remove funds from wallet
+                wallet.withdraw(amount)
             
             # Mark transaction as successful
             txn.status = TRANSACTION_STATUS_SUCCESS
@@ -425,8 +431,7 @@ class WalletService:
             
             # Re-raise the exception
             raise
-    
-    @transaction.atomic
+
     def withdraw_to_bank(
         self,
         wallet: Wallet,
@@ -440,8 +445,9 @@ class WalletService:
         Withdraw funds from wallet to a bank account
         
         This initiates a bank transfer via Paystack and creates a withdrawal
-        transaction. The wallet balance is deducted immediately, but the
-        transfer may take time to complete.
+        transaction. Uses a two-phase approach: create transaction first, 
+        then update balance in a nested transaction to ensure failed 
+        transactions are still recorded.
         
         Args:
             wallet (Wallet): Wallet to withdraw from
@@ -486,7 +492,7 @@ class WalletService:
         # Convert amount to minor units
         amount_in_minor_unit = int(Decimal(amount) * 100)
         
-        # Create withdrawal transaction
+        # Create withdrawal transaction (outside atomic block to persist even on failure)
         txn = Transaction.objects.create(
             wallet=wallet,
             amount=amount,
@@ -504,7 +510,7 @@ class WalletService:
         )
         
         try:
-            # Initiate Paystack transfer
+            # Initiate Paystack transfer (outside atomic block - API call)
             transfer_data = self.paystack.initiate_transfer(
                 amount=amount_in_minor_unit,
                 recipient=bank_account.paystack_recipient_code,
@@ -512,15 +518,21 @@ class WalletService:
                 reference=reference
             )
             
-            # Withdraw from wallet
-            wallet.withdraw(amount)
+            # Use atomic block only for the wallet balance update
+            with transaction.atomic():
+                # Withdraw from wallet
+                wallet.withdraw(amount)
             
-            # Update transaction with Paystack data
+            # Update transaction with Paystack data (outside atomic block)
             txn.paystack_reference = transfer_data.get('transfer_code')
             txn.paystack_response = transfer_data
+            txn.status = TRANSACTION_STATUS_SUCCESS
+            txn.completed_at = timezone.now()
             txn.save(update_fields=[
                 'paystack_reference',
                 'paystack_response',
+                'status',
+                'completed_at',
                 'updated_at'
             ])
             
@@ -532,7 +544,7 @@ class WalletService:
             return txn, transfer_data
         
         except Exception as e:
-            # Mark transaction as failed
+            # Mark transaction as failed (outside atomic block, so it persists)
             txn.status = TRANSACTION_STATUS_FAILED
             txn.failed_reason = str(e)
             txn.save(update_fields=['status', 'failed_reason', 'updated_at'])
@@ -544,6 +556,8 @@ class WalletService:
             
             # Re-raise the exception
             raise
+    
+    
     
     # ==========================================
     # TRANSFER OPERATIONS
@@ -581,7 +595,12 @@ class WalletService:
             WalletLocked: If either wallet is locked or inactive
             InvalidAmount: If amount is invalid
             InsufficientFunds: If source wallet has insufficient funds
+            ValueError: If source and destination wallets are the same
         """
+        # FIX #1: Validate that source and destination are different
+        if source_wallet.id == destination_wallet.id:
+            raise ValueError(_("Cannot transfer to the same wallet"))
+        
         # Default description
         if not description:
             destination_user = getattr(destination_wallet.user, 'email', str(destination_wallet.user))
@@ -785,15 +804,21 @@ class WalletService:
         except Bank.DoesNotExist:
             raise BankAccountError(f"Bank with code {bank_code} not found")
         
+        # Prepare data for bank account creation
+        bank_account_data = {
+            'wallet': wallet,
+            'bank': bank,
+            'account_number': account_number,
+            'account_name': account_name,
+            'is_verified': True
+        }
+        
+        # Only add account_type if it's provided (otherwise use model default)
+        if account_type:
+            bank_account_data['account_type'] = account_type
+        
         # Create bank account
-        bank_account = BankAccount.objects.create(
-            wallet=wallet,
-            bank=bank,
-            account_number=account_number,
-            account_name=account_name,
-            account_type=account_type,
-            is_verified=True
-        )
+        bank_account = BankAccount.objects.create(**bank_account_data)
         
         logger.info(
             f"Created bank account {bank_account.id} for wallet {wallet.id}: "

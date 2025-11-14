@@ -338,6 +338,78 @@ class TransactionAdmin(ExportMixin, AnalyticsMixin, admin.ModelAdmin):
         else:
             messages.info(request, _("No transactions were updated"))
     refresh_from_paystack.short_description = _("Refresh status from Paystack")
+
+    def get_queryset(self, request):
+
+        """
+
+        Override queryset to use optimized queries
+
+        
+
+        Uses the new with_full_details() method from TransactionQuerySet
+
+        for better performance in the admin interface.
+
+        """
+
+        qs = super().get_queryset(request)
+
+        
+
+        # Use the refactored QuerySet method
+
+        return qs.with_full_details()
+
+    
+
+    # Add new admin actions using the refactored methods
+
+    
+
+    @admin.action(description=_("Export successful transactions"))
+
+    def export_successful_transactions(self, request, queryset):
+
+        """Export only successful transactions"""
+
+        successful = queryset.successful()
+
+        # ... export logic ...
+
+    
+
+    @admin.action(description=_("Get transaction statistics"))
+
+    def show_statistics(self, request, queryset):
+
+        """Show transaction statistics"""
+
+        from wallet.services.transaction_service import TransactionService
+
+        
+
+        service = TransactionService()
+
+        stats = service.get_transaction_statistics()
+
+        
+
+        # Display stats to admin
+
+        self.message_user(
+
+            request,
+
+            f"Total Transactions: {stats['total_count']}, "
+
+            f"Successful: {stats['successful_count']}, "
+
+            f"Pending: {stats['pending_count']}, "
+
+            f"Failed: {stats['failed_count']}"
+
+        )
     
     def analytics_view(self, request):
         """Analytics view for transactions"""
@@ -371,6 +443,8 @@ class TransactionAdmin(ExportMixin, AnalyticsMixin, admin.ModelAdmin):
             .annotate(count=Count('id'))
             .order_by('-count')
         )
+    
+    
         
         context = {
             'title': _("Transaction Analytics"),

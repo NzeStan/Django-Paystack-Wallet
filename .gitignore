@@ -65,3 +65,4 @@ docs/_build/
 
 # testing
 test_project/
+django-package-test/
