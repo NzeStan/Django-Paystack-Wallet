@@ -393,7 +393,6 @@ class TransactionService:
         
         return transaction
     
-    @db_transaction.atomic
     def cancel_transaction(
         self,
         transaction: Transaction,
@@ -401,6 +400,9 @@ class TransactionService:
     ) -> Transaction:
         """
         Cancel a pending transaction
+        
+        Uses a two-phase approach: create transaction record first, then update balance
+        in a nested transaction to ensure failed cancellations are still recorded.
         
         Args:
             transaction: Transaction to cancel
@@ -422,7 +424,7 @@ class TransactionService:
             )
             raise ValueError(error_msg)
         
-        # Update transaction
+        # Update transaction to cancelled (outside atomic block to persist even on failure)
         transaction.status = TRANSACTION_STATUS_CANCELLED
         transaction.failed_reason = reason or _("Transaction cancelled")
         transaction.completed_at = timezone.now()
@@ -436,11 +438,14 @@ class TransactionService:
             f"reason={reason}"
         )
         
-        # Perform actions based on transaction type
+        # Perform wallet refund actions based on transaction type
         if transaction.transaction_type == TRANSACTION_TYPE_WITHDRAWAL:
-            # Refund the wallet
+            # Refund the wallet if withdrawal was cancelled
             try:
-                transaction.wallet.deposit(transaction.amount.amount)
+                # Use atomic block ONLY for the wallet balance update
+                with db_transaction.atomic():
+                    transaction.wallet.deposit(transaction.amount.amount)
+                    
                 logger.info(
                     f"Refunded wallet {transaction.wallet.id} with "
                     f"{transaction.amount.amount} for cancelled transaction {transaction.id}"
@@ -451,6 +456,7 @@ class TransactionService:
                     f"for cancelled transaction {transaction.id}: {str(e)}",
                     exc_info=True
                 )
+                # Don't re-raise - cancellation is recorded even if refund fails
         
         return transaction
     
@@ -458,7 +464,6 @@ class TransactionService:
     # REFUND & REVERSAL OPERATIONS
     # ==========================================
     
-    @db_transaction.atomic
     def refund_transaction(
         self,
         transaction: Transaction,
@@ -467,6 +472,9 @@ class TransactionService:
     ) -> Transaction:
         """
         Create a refund for a transaction
+        
+        Uses a two-phase approach: create transaction first, then update balance
+        in a nested transaction to ensure failed refunds are still recorded.
         
         Args:
             transaction: Transaction to refund
@@ -505,7 +513,7 @@ class TransactionService:
                 )
                 raise ValueError(error_msg)
         
-        # Create refund transaction
+        # Create refund transaction (outside atomic block to persist even on failure)
         refund_transaction = self.create_transaction(
             wallet=transaction.wallet,
             amount=amount,
@@ -522,39 +530,43 @@ class TransactionService:
             f"transaction {transaction.id}: amount={amount}, reason={reason}"
         )
         
-        # Process refund
-        if transaction.transaction_type == TRANSACTION_TYPE_PAYMENT:
-            # Credit the wallet
-            try:
-                transaction.wallet.deposit(amount)
-                
-                # Update refund transaction
-                refund_transaction.status = TRANSACTION_STATUS_SUCCESS
-                refund_transaction.completed_at = timezone.now()
-                refund_transaction.save(update_fields=[
-                    'status', 'completed_at', 'updated_at'
-                ])
-                
-                logger.info(
-                    f"Refund transaction {refund_transaction.id} processed successfully"
-                )
-            except Exception as e:
-                # Mark refund as failed
-                refund_transaction.status = TRANSACTION_STATUS_FAILED
-                refund_transaction.failed_reason = str(e)
-                refund_transaction.save(update_fields=[
-                    'status', 'failed_reason', 'updated_at'
-                ])
-                
-                logger.error(
-                    f"Refund transaction {refund_transaction.id} failed: {str(e)}",
-                    exc_info=True
-                )
-                raise
+        # Process refund based on original transaction type
+        try:
+            # Use atomic block ONLY for the wallet balance update
+            with db_transaction.atomic():
+                if transaction.transaction_type == TRANSACTION_TYPE_PAYMENT:
+                    # Credit the wallet
+                    transaction.wallet.deposit(amount)
+            
+            # Update refund transaction as successful (outside atomic block)
+            refund_transaction.status = TRANSACTION_STATUS_SUCCESS
+            refund_transaction.completed_at = timezone.now()
+            refund_transaction.save(update_fields=[
+                'status', 'completed_at', 'updated_at'
+            ])
+            
+            logger.info(
+                f"Refund transaction {refund_transaction.id} processed successfully"
+            )
+            
+        except Exception as e:
+            # Mark refund as failed (outside atomic block, so it persists)
+            refund_transaction.status = TRANSACTION_STATUS_FAILED
+            refund_transaction.failed_reason = str(e)
+            refund_transaction.save(update_fields=[
+                'status', 'failed_reason', 'updated_at'
+            ])
+            
+            logger.error(
+                f"Refund transaction {refund_transaction.id} failed: {str(e)}",
+                exc_info=True
+            )
+            
+            # Re-raise the exception
+            raise
         
         return refund_transaction
     
-    @db_transaction.atomic
     def reverse_transaction(
         self,
         transaction: Transaction,
@@ -562,6 +574,9 @@ class TransactionService:
     ) -> Transaction:
         """
         Create a reversal for a transaction
+        
+        Uses a two-phase approach: create transaction first, then update balance
+        in a nested transaction to ensure failed reversals are still recorded.
         
         Args:
             transaction: Transaction to reverse
@@ -583,7 +598,7 @@ class TransactionService:
             )
             raise ValueError(error_msg)
         
-        # Create reversal transaction
+        # Create reversal transaction (outside atomic block to persist even on failure)
         reversal_transaction = self.create_transaction(
             wallet=transaction.wallet,
             amount=transaction.amount.amount,
@@ -603,15 +618,17 @@ class TransactionService:
         
         # Process reversal based on original transaction type
         try:
-            if transaction.transaction_type == TRANSACTION_TYPE_DEPOSIT:
-                # Debit the wallet
-                transaction.wallet.withdraw(transaction.amount.amount)
-                
-            elif transaction.transaction_type == TRANSACTION_TYPE_WITHDRAWAL:
-                # Credit the wallet
-                transaction.wallet.deposit(transaction.amount.amount)
+            # Use atomic block ONLY for the wallet balance updates
+            with db_transaction.atomic():
+                if transaction.transaction_type == TRANSACTION_TYPE_DEPOSIT:
+                    # Debit the wallet
+                    transaction.wallet.withdraw(transaction.amount.amount)
+                    
+                elif transaction.transaction_type == TRANSACTION_TYPE_WITHDRAWAL:
+                    # Credit the wallet
+                    transaction.wallet.deposit(transaction.amount.amount)
             
-            # Update reversal transaction
+            # Update reversal transaction as successful (outside atomic block)
             reversal_transaction.status = TRANSACTION_STATUS_SUCCESS
             reversal_transaction.completed_at = timezone.now()
             reversal_transaction.save(update_fields=[
@@ -623,7 +640,7 @@ class TransactionService:
             )
             
         except Exception as e:
-            # Mark reversal as failed
+            # Mark reversal as failed (outside atomic block, so it persists)
             reversal_transaction.status = TRANSACTION_STATUS_FAILED
             reversal_transaction.failed_reason = str(e)
             reversal_transaction.save(update_fields=[
@@ -634,6 +651,8 @@ class TransactionService:
                 f"Reversal transaction {reversal_transaction.id} failed: {str(e)}",
                 exc_info=True
             )
+            
+            # Re-raise the exception
             raise
         
         return reversal_transaction

@@ -14,12 +14,7 @@ from djmoney.money import Money
 
 from wallet.models import Wallet, Transaction, Card, BankAccount, TransferRecipient, Bank
 from wallet.exceptions import (
-    TransactionFailed,
-    InsufficientFunds,
-    InvalidAmount,
-    WalletLocked,
-    BankAccountError,
-    PaystackAPIError
+    BankAccountError
 )
 from wallet.constants import (
     TRANSACTION_TYPE_DEPOSIT,
