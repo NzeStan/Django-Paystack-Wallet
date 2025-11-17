@@ -32,6 +32,7 @@ from wallet.constants import (
 )
 
 
+
 User = get_user_model()
 
 
@@ -107,6 +108,12 @@ class WalletServiceTestCase(TestCase):
         self.service = WalletService()
         self.mock_paystack = Mock()
         self.service.paystack = self.mock_paystack
+
+        self.mock_paystack.finalize_transfer.return_value = {
+            "status": "success",
+            "message": "Transfer finalized",
+            # include any other fields your service expects
+        }
 
 
 class WalletManagementTests(WalletServiceTestCase):
@@ -430,6 +437,24 @@ class WithdrawalOperationsTests(WalletServiceTestCase):
         
         self.assertIsNotNone(transaction)
         self.assertEqual(transaction.status, TRANSACTION_STATUS_FAILED)
+
+    def test_finalize_withdrawal(self):
+        """Test finalizing a withdrawal transaction"""
+        # Create a pending withdrawal transaction
+        transaction = Transaction.objects.create(
+            wallet=self.wallet1,
+            amount=Money(150, 'NGN'),
+            transaction_type=TRANSACTION_TYPE_WITHDRAWAL,
+            status=TRANSACTION_STATUS_PENDING,
+            reference='TXN_finalize_withdraw123',
+            paystack_reference='TRF_test_transfer_code_123'
+        )
+        
+        self.service.finalize_withdrawal(transaction, otp='123456')
+        
+        transaction.refresh_from_db()
+        self.assertEqual(transaction.status, TRANSACTION_STATUS_SUCCESS)
+        self.assertIsNotNone(transaction.completed_at)
 
 
 class TransferOperationsTests(WalletServiceTestCase):

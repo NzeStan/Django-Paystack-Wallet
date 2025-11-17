@@ -4,7 +4,6 @@ Refactored with query optimization, comprehensive error handling, and clean arch
 """
 import logging
 from typing import Any, Dict
-
 from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -31,10 +30,15 @@ from wallet.utils.id_generators import generate_transaction_reference
 from wallet.exceptions import (
     WalletLocked,
     InsufficientFunds,
-    InvalidAmount,
     BankAccountError,
     PaystackAPIError
 )
+from wallet.constants import (
+       TRANSACTION_TYPE_WITHDRAWAL,
+       TRANSACTION_STATUS_PENDING,
+       TRANSACTION_STATUS_SUCCESS,
+      TRANSACTION_STATUS_FAILED
+  )
 
 
 logger = logging.getLogger(__name__)
@@ -166,9 +170,11 @@ class WalletViewSet(viewsets.ModelViewSet):
             'deposit': WalletDepositSerializer,
             'withdraw': WalletWithdrawSerializer,
             'transfer': WalletTransferSerializer,
+            'finalize_withdrawal': FinalizeWithdrawalSerializer,  # <-- Added
         }
-        
+
         return action_serializers.get(self.action, self.serializer_class)
+
     
     def get_object(self):
         """
@@ -475,6 +481,169 @@ class WalletViewSet(viewsets.ModelViewSet):
                 status.HTTP_500_INTERNAL_SERVER_ERROR
             )
     
+    @action(detail=True, methods=['post'])
+    def finalize_withdrawal(self, request: Request, pk=None) -> Response:
+        """
+        Finalize a pending bank withdrawal with OTP
+        
+        This endpoint is used when a withdrawal requires OTP verification.
+        After calling the withdraw endpoint, if the response indicates OTP
+        is required, the user receives an OTP and calls this endpoint to
+        complete the withdrawal.
+        
+        POST /api/wallets/{id}/finalize-withdrawal/
+        
+        Request Body:
+        {
+            "transfer_code": "TRF_xxxxx",  # From initial withdrawal response
+            "otp": "123456"  # OTP received by user
+        }
+        
+        Args:
+            request (Request): HTTP request
+            pk: Wallet primary key
+            
+        Returns:
+            Response: Finalization status and transaction data
+            
+        Response:
+        {
+            "status": "success",
+            "message": "Transfer completed successfully",
+            "transaction": {
+                "id": "...",
+                "reference": "...",
+                "amount": "5000.00",
+                "status": "success",
+                ...
+            }
+        }
+        """
+        wallet = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        wallet_service = WalletService()
+        
+        try:
+            # Extract validated data
+            transfer_code = serializer.validated_data['transfer_code']
+            otp = serializer.validated_data['otp']
+            
+            logger.info(
+                f"Finalizing withdrawal for wallet {wallet.id}: "
+                f"transfer_code={transfer_code}"
+            )
+            
+            # Find the transaction by transfer code
+            from wallet.models import Transaction
+            try:
+                transaction = Transaction.objects.select_related('wallet').get(
+                    wallet=wallet,
+                    paystack_reference=transfer_code,
+                    transaction_type=TRANSACTION_TYPE_WITHDRAWAL,
+                    status=TRANSACTION_STATUS_PENDING
+                )
+            except Transaction.DoesNotExist:
+                logger.warning(
+                    f"No pending withdrawal transaction found for wallet {wallet.id} "
+                    f"with transfer_code={transfer_code}"
+                )
+                return build_error_response(
+                    _("No pending withdrawal found with this transfer code"),
+                    status.HTTP_404_NOT_FOUND
+                )
+            except Transaction.MultipleObjectsReturned:
+                logger.error(
+                    f"Multiple pending withdrawal transactions found for wallet {wallet.id} "
+                    f"with transfer_code={transfer_code}"
+                )
+                return build_error_response(
+                    _("Multiple pending withdrawals found. Please contact support."),
+                    status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+            
+            # Finalize the withdrawal
+            finalization_response = wallet_service.finalize_withdrawal(
+                transaction=transaction,
+                otp=otp
+            )
+            
+            # Refresh transaction from database to get updated status
+            transaction.refresh_from_db()
+            
+            logger.info(
+                f"Withdrawal finalized for wallet {wallet.id}: "
+                f"transaction={transaction.id}, status={transaction.status}"
+            )
+            
+            # Serialize the updated transaction
+            from wallet.serializers.transaction_serializer import TransactionDetailSerializer
+            transaction_serializer = TransactionDetailSerializer(
+                transaction,
+                context={'request': request}
+            )
+            
+            # Prepare response based on finalization status
+            response_status = finalization_response.get('status', '').lower()
+            
+            if response_status == 'success' or transaction.status == TRANSACTION_STATUS_SUCCESS:
+                response_data = {
+                    'status': 'success',
+                    'message': _('Transfer completed successfully'),
+                    'transaction': transaction_serializer.data,
+                    'paystack_response': finalization_response
+                }
+                return Response(response_data, status=status.HTTP_200_OK)
+            
+            elif response_status in ['failed', 'error'] or transaction.status == TRANSACTION_STATUS_FAILED:
+                response_data = {
+                    'status': 'failed',
+                    'message': finalization_response.get('message', _('Transfer finalization failed')),
+                    'transaction': transaction_serializer.data,
+                    'paystack_response': finalization_response
+                }
+                return Response(response_data, status=status.HTTP_400_BAD_REQUEST)
+            
+            else:
+                # Still processing
+                response_data = {
+                    'status': 'processing',
+                    'message': _('Transfer is being processed'),
+                    'transaction': transaction_serializer.data,
+                    'paystack_response': finalization_response
+                }
+                return Response(response_data, status=status.HTTP_202_ACCEPTED)
+        
+        except PaystackAPIError as e:
+            logger.error(
+                f"Paystack API error during withdrawal finalization for wallet {wallet.id}: {str(e)}",
+                exc_info=True
+            )
+            return build_error_response(
+                _("Payment gateway error. Please try again or contact support."),
+                status.HTTP_502_BAD_GATEWAY
+            )
+        
+        except ValueError as e:
+            logger.warning(
+                f"Validation error during withdrawal finalization for wallet {wallet.id}: {str(e)}"
+            )
+            return build_error_response(
+                str(e),
+                status.HTTP_400_BAD_REQUEST
+            )
+        
+        except Exception as e:
+            logger.error(
+                f"Error finalizing withdrawal for wallet {wallet.id}: {str(e)}",
+                exc_info=True
+            )
+            return build_error_response(
+                _("Failed to finalize withdrawal. Please try again."),
+                status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
     # ==========================================
     # TRANSFER ACTION
     # ==========================================

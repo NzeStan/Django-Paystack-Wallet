@@ -843,8 +843,6 @@ class WalletDedicatedAccountActionTestCase(APITestCase):
 
 class WalletFinalizeWithdrawalActionTestCase(APITestCase):
     """Test case for finalize withdrawal action"""
-    # NOTE: finalize_withdrawal action doesn't exist in current API implementation
-    # These tests are commented out but kept for reference if the feature is added
 
     def setUp(self):
         """Set up test data"""
@@ -857,10 +855,26 @@ class WalletFinalizeWithdrawalActionTestCase(APITestCase):
         
         wallet_service = WalletService()
         self.wallet = wallet_service.get_wallet(self.user)
+        
+        # Give wallet some balance for withdrawals
+        self.wallet.balance = Money(5000, DEFAULT_CURRENCY)
+        self.wallet.save()
 
     @patch('wallet.services.wallet_service.WalletService.finalize_withdrawal')
     def test_finalize_withdrawal_with_otp(self, mock_finalize):
         """Test finalizing withdrawal with OTP"""
+        # Create a pending withdrawal transaction
+        # This is what the API endpoint will search for
+        transaction = Transaction.objects.create(
+            wallet=self.wallet,
+            amount=Money(1000, DEFAULT_CURRENCY),
+            transaction_type=TRANSACTION_TYPE_WITHDRAWAL,
+            status=TRANSACTION_STATUS_PENDING,
+            description='Test withdrawal',
+            reference='TXN_test123',
+            paystack_reference='TRF_test123'  # This is the transfer_code
+        )
+        
         # Mock finalization response
         mock_finalize.return_value = {
             'status': 'success',
@@ -878,17 +892,81 @@ class WalletFinalizeWithdrawalActionTestCase(APITestCase):
         response = self.client.post(url, data, format='json')
         
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertIn('message', response.data)
+        self.assertIn('status', response.data)
+        self.assertEqual(response.data['status'], 'success')
+        # Verify the service method was called
+        mock_finalize.assert_called_once()
 
     def test_finalize_withdrawal_requires_otp_and_code(self):
         """Test that finalization requires OTP and transfer code"""
         self.client.force_authenticate(user=self.user)
         url = reverse('wallet-finalize-withdrawal', kwargs={'pk': self.wallet.id})
         
-        # Missing OTP
+        # Test missing OTP
         data = {'transfer_code': 'TRF_test'}
         response = self.client.post(url, data, format='json')
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('otp', response.data)
+        
+        # Test missing transfer_code
+        data = {'otp': '123456'}
+        response = self.client.post(url, data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('transfer_code', response.data)
+        
+        # Test both missing
+        data = {}
+        response = self.client.post(url, data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_finalize_withdrawal_transaction_not_found(self):
+        """Test finalization with non-existent transaction"""
+        self.client.force_authenticate(user=self.user)
+        url = reverse('wallet-finalize-withdrawal', kwargs={'pk': self.wallet.id})
+        
+        data = {
+            'transfer_code': 'TRF_nonexistent',
+            'otp': '123456'
+        }
+        
+        response = self.client.post(url, data, format='json')
+        
+        # Should return 404 when transaction is not found
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertIn('detail', response.data)
+
+    @patch('wallet.services.wallet_service.WalletService.finalize_withdrawal')
+    def test_finalize_withdrawal_invalid_otp(self, mock_finalize):
+        """Test finalization with invalid OTP"""
+        from wallet.exceptions import PaystackAPIError
+        
+        # Create a pending withdrawal transaction
+        transaction = Transaction.objects.create(
+            wallet=self.wallet,
+            amount=Money(1000, DEFAULT_CURRENCY),
+            transaction_type=TRANSACTION_TYPE_WITHDRAWAL,
+            status=TRANSACTION_STATUS_PENDING,
+            description='Test withdrawal',
+            reference='TXN_test456',
+            paystack_reference='TRF_test456'
+        )
+        
+        # Mock finalization to raise PaystackAPIError (invalid OTP)
+        mock_finalize.side_effect = PaystackAPIError("Invalid OTP")
+        
+        self.client.force_authenticate(user=self.user)
+        url = reverse('wallet-finalize-withdrawal', kwargs={'pk': self.wallet.id})
+        
+        data = {
+            'transfer_code': 'TRF_test456',
+            'otp': '000000'  # Wrong OTP
+        }
+        
+        response = self.client.post(url, data, format='json')
+        
+        # Should return 502 for Paystack API errors
+        self.assertEqual(response.status_code, status.HTTP_502_BAD_GATEWAY)
+        self.assertIn('detail', response.data)
 
     def test_placeholder(self):
         """Placeholder test to prevent empty test class errors"""

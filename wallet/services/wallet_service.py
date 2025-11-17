@@ -14,7 +14,8 @@ from djmoney.money import Money
 
 from wallet.models import Wallet, Transaction, Card, BankAccount, TransferRecipient, Bank
 from wallet.exceptions import (
-    BankAccountError
+    BankAccountError,
+    PaystackAPIError
 )
 from wallet.constants import (
     TRANSACTION_TYPE_DEPOSIT,
@@ -24,6 +25,7 @@ from wallet.constants import (
     TRANSACTION_STATUS_SUCCESS,
     TRANSACTION_STATUS_FAILED
 )
+from django.db import transaction as db_transaction
 from wallet.settings import get_wallet_setting
 from wallet.services.paystack_service import PaystackService
 from wallet.utils.id_generators import generate_transaction_reference, generate_wallet_tag
@@ -550,6 +552,166 @@ class WalletService:
             )
             
             # Re-raise the exception
+            raise
+
+    def finalize_withdrawal(
+        self,
+        transaction: Transaction,
+        otp: str
+    ) -> Dict[str, Any]:
+        """
+        Finalize a pending bank withdrawal with OTP
+        
+        This method is used when Paystack requires OTP verification to complete
+        a bank transfer. The transfer_code from the initial withdraw_to_bank
+        call is stored in the transaction's paystack_reference field.
+        
+        Args:
+            transaction (Transaction): The pending withdrawal transaction
+            otp (str): One-Time Password received by the user
+            
+        Returns:
+            Dict[str, Any]: Finalization response from Paystack
+            
+        Raises:
+            ValueError: If transaction is invalid or not pending
+            PaystackAPIError: If Paystack API call fails
+            
+        Example:
+            # After withdraw_to_bank returns a transfer requiring OTP
+            transaction, transfer_data = wallet_service.withdraw_to_bank(...)
+            
+            if transfer_data.get('requires_otp'):
+                # User receives OTP via SMS/email
+                # User submits OTP
+                result = wallet_service.finalize_withdrawal(
+                    transaction=transaction,
+                    otp='123456'
+                )
+        """
+        # Validate transaction
+        if not transaction:
+            raise ValueError(_("Transaction is required"))
+        
+        if transaction.transaction_type != TRANSACTION_TYPE_WITHDRAWAL:
+            raise ValueError(_("Transaction must be a withdrawal"))
+        
+        if transaction.status != TRANSACTION_STATUS_PENDING:
+            raise ValueError(
+                _("Transaction is not pending. Current status: {}").format(
+                    transaction.status
+                )
+            )
+        
+        if not transaction.paystack_reference:
+            raise ValueError(
+                _("Transaction does not have a Paystack transfer code")
+            )
+        
+        transfer_code = transaction.paystack_reference
+        
+        logger.info(
+            f"Finalizing withdrawal transaction {transaction.id} for wallet {transaction.wallet.id}: "
+            f"transfer_code={transfer_code}"
+        )
+        
+        try:
+            # Call Paystack to finalize the transfer
+            finalization_response = self.paystack.finalize_transfer(
+                transfer_code=transfer_code,
+                otp=otp
+            )
+            
+            logger.info(
+                f"Transfer finalization successful for transaction {transaction.id}: "
+                f"status={finalization_response.get('status')}"
+            )
+            
+            # Update transaction status based on response
+            response_status = finalization_response.get('status', '').lower()
+            
+            if response_status == 'success':
+                transaction.status = TRANSACTION_STATUS_SUCCESS
+                transaction.completed_at = timezone.now()
+                transaction.paystack_response = finalization_response
+                transaction.save(update_fields=[
+                    'status', 'completed_at', 'paystack_response', 'updated_at'
+                ])
+                
+                logger.info(
+                    f"Withdrawal transaction {transaction.id} completed successfully after OTP verification"
+                )
+            
+            elif response_status in ['failed', 'error']:
+                # Finalization failed - need to reverse the wallet withdrawal
+                transaction.status = TRANSACTION_STATUS_FAILED
+                transaction.failed_reason = finalization_response.get(
+                    'message',
+                    'Transfer finalization failed'
+                )
+                transaction.paystack_response = finalization_response
+                transaction.save(update_fields=[
+                    'status', 'failed_reason', 'paystack_response', 'updated_at'
+                ])
+                
+                # Reverse the withdrawal amount back to wallet
+                wallet = transaction.wallet
+                with db_transaction.atomic():
+                    wallet.deposit(transaction.amount)
+                
+                logger.warning(
+                    f"Withdrawal transaction {transaction.id} failed during finalization. "
+                    f"Amount reversed to wallet. Reason: {transaction.failed_reason}"
+                )
+            
+            else:
+                # Status is still pending or processing
+                transaction.paystack_response = finalization_response
+                transaction.save(update_fields=['paystack_response', 'updated_at'])
+                
+                logger.info(
+                    f"Withdrawal transaction {transaction.id} finalization in progress. "
+                    f"Status: {response_status}"
+                )
+            
+            return finalization_response
+        
+        except PaystackAPIError as e:
+            logger.error(
+                f"Paystack API error during withdrawal finalization for transaction {transaction.id}: {str(e)}",
+                exc_info=True
+            )
+            
+            # Mark transaction as failed
+            transaction.status = TRANSACTION_STATUS_FAILED
+            transaction.failed_reason = f"OTP verification failed: {str(e)}"
+            transaction.save(update_fields=['status', 'failed_reason', 'updated_at'])
+            
+            # Reverse the withdrawal amount back to wallet
+            wallet = transaction.wallet
+            try:
+                with db_transaction.atomic():
+                    wallet.deposit(transaction.amount)
+                
+                logger.info(
+                    f"Reversed failed withdrawal amount to wallet {wallet.id}"
+                )
+            except Exception as reverse_error:
+                logger.critical(
+                    f"CRITICAL: Failed to reverse withdrawal to wallet {wallet.id} "
+                    f"after failed OTP verification. Transaction {transaction.id}. "
+                    f"Error: {str(reverse_error)}",
+                    exc_info=True
+                )
+            
+            # Re-raise the exception
+            raise
+        
+        except Exception as e:
+            logger.error(
+                f"Unexpected error during withdrawal finalization for transaction {transaction.id}: {str(e)}",
+                exc_info=True
+            )
             raise
     
     
