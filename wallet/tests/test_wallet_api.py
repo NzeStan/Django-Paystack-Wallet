@@ -858,41 +858,41 @@ class WalletFinalizeWithdrawalActionTestCase(APITestCase):
         wallet_service = WalletService()
         self.wallet = wallet_service.get_wallet(self.user)
 
-    # @patch('wallet.services.wallet_service.WalletService.finalize_withdrawal')
-    # def test_finalize_withdrawal_with_otp(self, mock_finalize):
-    #     """Test finalizing withdrawal with OTP"""
-    #     # Mock finalization response
-    #     mock_finalize.return_value = {
-    #         'status': 'success',
-    #         'message': 'Transfer finalized'
-    #     }
+    @patch('wallet.services.wallet_service.WalletService.finalize_withdrawal')
+    def test_finalize_withdrawal_with_otp(self, mock_finalize):
+        """Test finalizing withdrawal with OTP"""
+        # Mock finalization response
+        mock_finalize.return_value = {
+            'status': 'success',
+            'message': 'Transfer finalized'
+        }
         
-    #     self.client.force_authenticate(user=self.user)
-    #     url = reverse('wallet-finalize-withdrawal', kwargs={'pk': self.wallet.id})
+        self.client.force_authenticate(user=self.user)
+        url = reverse('wallet-finalize-withdrawal', kwargs={'pk': self.wallet.id})
         
-    #     data = {
-    #         'transfer_code': 'TRF_test123',
-    #         'otp': '123456'
-    #     }
+        data = {
+            'transfer_code': 'TRF_test123',
+            'otp': '123456'
+        }
         
-    #     response = self.client.post(url, data, format='json')
+        response = self.client.post(url, data, format='json')
         
-    #     self.assertEqual(response.status_code, status.HTTP_200_OK)
-    #     self.assertIn('message', response.data)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('message', response.data)
 
-    # def test_finalize_withdrawal_requires_otp_and_code(self):
-    #     """Test that finalization requires OTP and transfer code"""
-    #     self.client.force_authenticate(user=self.user)
-    #     url = reverse('wallet-finalize-withdrawal', kwargs={'pk': self.wallet.id})
+    def test_finalize_withdrawal_requires_otp_and_code(self):
+        """Test that finalization requires OTP and transfer code"""
+        self.client.force_authenticate(user=self.user)
+        url = reverse('wallet-finalize-withdrawal', kwargs={'pk': self.wallet.id})
         
-    #     # Missing OTP
-    #     data = {'transfer_code': 'TRF_test'}
-    #     response = self.client.post(url, data, format='json')
-    #     self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        # Missing OTP
+        data = {'transfer_code': 'TRF_test'}
+        response = self.client.post(url, data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-    # def test_placeholder(self):
-    #     """Placeholder test to prevent empty test class errors"""
-    #     self.assertTrue(True)
+    def test_placeholder(self):
+        """Placeholder test to prevent empty test class errors"""
+        self.assertTrue(True)
 
 
 class WalletPermissionTestCase(APITestCase):

@@ -4,10 +4,8 @@ Comprehensive test coverage for transaction API endpoints
 """
 import json
 from decimal import Decimal
-from datetime import datetime, timedelta
+from datetime import timedelta
 from unittest.mock import patch, Mock
-
-from django.test import TestCase
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 from django.urls import reverse
@@ -173,8 +171,7 @@ class TransactionListAPITests(TransactionAPITestCase):
         self.client.force_authenticate(user=None)
         response = self.client.get(self.list_url)
         
-        # DRF returns 403 Forbidden when no credentials are provided
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
     
     def test_list_transactions_only_own_transactions(self):
         """Test that users only see their own transactions"""
@@ -341,8 +338,8 @@ class TransactionVerifyAPITests(TransactionAPITestCase):
             'reference': 'TXN_FAKE_999'
         })
         
-        # Serializer validation returns 400 for non-existent reference
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertIn('error', response.data)
     
     def test_verify_transaction_missing_reference(self):
         """Test verify with missing reference"""
@@ -451,12 +448,7 @@ class TransactionRefundAPITests(TransactionAPITestCase):
             'reason': 'Unauthorized refund attempt'
         })
         
-        # Should return 404, but may return 500 if error handling needs improvement
-        self.assertIn(
-            response.status_code,
-            [status.HTTP_404_NOT_FOUND, status.HTTP_500_INTERNAL_SERVER_ERROR],
-            "Should deny access to other user's transaction"
-        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
     
     def test_refund_creates_transaction_record(self):
         """Test that refund creates a transaction record even on failure"""
@@ -563,12 +555,7 @@ class TransactionCancelAPITests(TransactionAPITestCase):
             'reason': 'Unauthorized cancel'
         })
         
-        # Should return 404, but may return 500 if error handling needs improvement
-        self.assertIn(
-            response.status_code,
-            [status.HTTP_404_NOT_FOUND, status.HTTP_500_INTERNAL_SERVER_ERROR],
-            "Should deny access to other user's transaction"
-        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
     
     def test_cancel_records_cancellation_even_if_refund_fails(self):
         """Test that cancellation is recorded even if wallet refund fails"""
@@ -675,21 +662,8 @@ class TransactionSummaryAPITests(TransactionAPITestCase):
 class TransactionExportAPITests(TransactionAPITestCase):
     """Tests for transaction export endpoint"""
     
-    def setUp(self):
-        """Additional setup for export tests"""
-        super().setUp()
-        # Check if export endpoint exists
-        try:
-            response = self.client.get(self.export_url)
-            self.export_available = response.status_code != 404
-        except:
-            self.export_available = False
-    
     def test_export_csv_success(self):
         """Test exporting transactions to CSV"""
-        if not self.export_available:
-            self.skipTest("Export endpoint not configured")
-            
         response = self.client.get(self.export_url, {
             'format': 'csv'
         })
@@ -700,9 +674,6 @@ class TransactionExportAPITests(TransactionAPITestCase):
     
     def test_export_csv_default_format(self):
         """Test that CSV is the default export format"""
-        if not self.export_available:
-            self.skipTest("Export endpoint not configured")
-            
         response = self.client.get(self.export_url)
         
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -710,9 +681,6 @@ class TransactionExportAPITests(TransactionAPITestCase):
     
     def test_export_xlsx_success(self):
         """Test exporting transactions to Excel"""
-        if not self.export_available:
-            self.skipTest("Export endpoint not configured")
-            
         response = self.client.get(self.export_url, {
             'format': 'xlsx'
         })
@@ -725,9 +693,6 @@ class TransactionExportAPITests(TransactionAPITestCase):
     
     def test_export_invalid_format(self):
         """Test export with invalid format"""
-        if not self.export_available:
-            self.skipTest("Export endpoint not configured")
-            
         response = self.client.get(self.export_url, {
             'format': 'pdf'  # Not supported
         })
@@ -736,9 +701,6 @@ class TransactionExportAPITests(TransactionAPITestCase):
     
     def test_export_with_filters(self):
         """Test export with transaction filters"""
-        if not self.export_available:
-            self.skipTest("Export endpoint not configured")
-            
         response = self.client.get(self.export_url, {
             'format': 'csv',
             'transaction_type': TRANSACTION_TYPE_DEPOSIT,
@@ -749,9 +711,6 @@ class TransactionExportAPITests(TransactionAPITestCase):
     
     def test_export_csv_contains_correct_headers(self):
         """Test that CSV export contains correct headers"""
-        if not self.export_available:
-            self.skipTest("Export endpoint not configured")
-            
         response = self.client.get(self.export_url, {
             'format': 'csv'
         })
@@ -781,15 +740,14 @@ class TransactionPermissionTests(TransactionAPITestCase):
             self.verify_url,
             self.statistics_url,
             self.summary_url,
-            # Skip export_url - see test_export tests
+            self.export_url,
         ]
         
         for url in endpoints:
             response = self.client.get(url)
-            # DRF returns 403 Forbidden when no credentials provided
             self.assertEqual(
                 response.status_code,
-                status.HTTP_403_FORBIDDEN,
+                status.HTTP_401_UNAUTHORIZED,
                 f"Endpoint {url} should require authentication"
             )
     
@@ -806,22 +764,12 @@ class TransactionPermissionTests(TransactionAPITestCase):
         # Try to refund user1's transaction
         url = reverse('transaction-refund', kwargs={'pk': self.txn_payment.id})
         response = self.client.post(url, {'reason': 'Unauthorized'})
-        # May return 404 or 500 depending on error handling
-        self.assertIn(
-            response.status_code,
-            [status.HTTP_404_NOT_FOUND, status.HTTP_500_INTERNAL_SERVER_ERROR],
-            "Should deny refund access"
-        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
         
-        # Try to cancel user1's transaction  
+        # Try to cancel user1's transaction
         url = reverse('transaction-cancel', kwargs={'pk': self.txn_pending.id})
         response = self.client.post(url, {'reason': 'Unauthorized'})
-        # May return 404 or 500 depending on error handling
-        self.assertIn(
-            response.status_code,
-            [status.HTTP_404_NOT_FOUND, status.HTTP_500_INTERNAL_SERVER_ERROR],
-            "Should deny cancel access"
-        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
 
 # ==========================================
@@ -853,12 +801,7 @@ class TransactionEdgeCaseTests(TransactionAPITestCase):
             'reason': 'Test'
         })
         
-        # May return 400 or 500 depending on validation implementation
-        self.assertIn(
-            response.status_code,
-            [status.HTTP_400_BAD_REQUEST, status.HTTP_500_INTERNAL_SERVER_ERROR],
-            "Should reject invalid amount format"
-        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
     
     def test_verify_with_empty_reference(self):
         """Test verify with empty reference"""
@@ -875,18 +818,14 @@ class TransactionEdgeCaseTests(TransactionAPITestCase):
             'end_date': 'also-invalid'
         })
         
-        # Should handle gracefully - may return 200 (ignores bad dates), 400, or 500
+        # Should handle gracefully
         self.assertIn(
             response.status_code,
-            [status.HTTP_200_OK, status.HTTP_400_BAD_REQUEST, status.HTTP_500_INTERNAL_SERVER_ERROR],
-            "Should handle invalid date format"
+            [status.HTTP_200_OK, status.HTTP_400_BAD_REQUEST]
         )
     
     def test_export_empty_result_set(self):
         """Test export when no transactions match filters"""
-        if not self.export_available:
-            self.skipTest("Export endpoint not configured")
-            
         # Delete all user1 transactions
         Transaction.objects.filter(wallet=self.wallet1).delete()
         
