@@ -7,7 +7,7 @@ WALLET_SETTINGS = {
     'USE_UUID': getattr(settings, 'WALLET_USE_UUID', True),
     
     # Use celery for asynchronous tasks
-    'USE_CELERY': getattr(settings, 'WALLET_USE_CELERY', True),
+    'USE_CELERY': getattr(settings, 'WALLET_USE_CELERY', False),     #still switch to true
 
     # Paystack Configuration
     'PAYSTACK_SECRET_KEY': getattr(settings, 'PAYSTACK_SECRET_KEY', ''),
