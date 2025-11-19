@@ -9,7 +9,8 @@ from django.db import transaction as db_transaction
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from django.db.models import Sum, Count, Avg, Q
-
+from django.utils import timezone
+from djmoney.money import Money
 from wallet.models import Transaction, Wallet
 from wallet.constants import (
     TRANSACTION_STATUS_PENDING, TRANSACTION_STATUS_SUCCESS, 
@@ -17,7 +18,8 @@ from wallet.constants import (
     TRANSACTION_TYPE_DEPOSIT, TRANSACTION_TYPE_WITHDRAWAL, 
     TRANSACTION_TYPE_TRANSFER, TRANSACTION_TYPE_PAYMENT,
     TRANSACTION_TYPE_REFUND, TRANSACTION_TYPE_REVERSAL,
-    TRANSACTION_TYPES, TRANSACTION_STATUSES
+    TRANSACTION_TYPES, TRANSACTION_STATUSES,
+    WEBHOOK_EVENT_CHARGE_SUCCESS, WEBHOOK_EVENT_CHARGE_FAILED,
 )
 from wallet.exceptions import (
     TransactionFailed,
@@ -955,3 +957,209 @@ class TransactionService:
         )
         
         return updated_count
+    
+    def process_paystack_webhook(self, event_type: str, data: dict) -> bool:
+        """
+        Process a Paystack webhook event related to transactions.
+        
+        This method handles charge-related webhook events from Paystack:
+        - charge.success: When a charge is successful
+        - charge.failed: When a charge fails
+        
+        Args:
+            event_type (str): Webhook event type
+            data (dict): Webhook event data
+            
+        Returns:
+            bool: True if processed successfully, False if not a relevant event
+        """
+        # Handle charge.success event
+        if event_type == WEBHOOK_EVENT_CHARGE_SUCCESS:
+            return self._process_charge_success(data)
+            
+        # Handle charge.failed event
+        elif event_type == WEBHOOK_EVENT_CHARGE_FAILED:
+            return self._process_charge_failed(data)
+            
+        # Not a transaction-related event
+        return False
+
+
+    def _process_charge_success(self, data: dict) -> bool:
+        """
+        Process charge.success webhook event.
+        
+        This event is triggered when a charge (deposit) is successful.
+        Updates the transaction status and credits the wallet balance.
+        
+        Args:
+            data (dict): Webhook event data
+            
+        Returns:
+            bool: True if processed successfully
+        """
+        reference = data.get('reference')
+        
+        if not reference:
+            logger.warning("Charge success webhook missing reference")
+            return False
+        
+        logger.info(f"Processing charge.success webhook for reference: {reference}")
+        
+        try:
+            # Find transaction by reference
+            from wallet.models import Transaction
+            
+            try:
+                transaction = Transaction.objects.select_related('wallet').get(
+                    reference=reference
+                )
+                logger.debug(f"Retrieved transaction with reference {reference}")
+            except Transaction.DoesNotExist:
+                logger.error(f"Transaction with reference {reference} not found")
+                return False
+            
+            # Check if already processed
+            if transaction.status == TRANSACTION_STATUS_SUCCESS:
+                logger.info(
+                    f"Transaction {transaction.id} already marked as success, "
+                    f"wallet balance already updated"
+                )
+                return True
+            
+            # Extract amount from webhook
+            amount_kobo = data.get('amount', 0)
+            currency = data.get('currency', 'NGN')
+            webhook_amount = Money(amount_kobo / 100, currency)  # Convert from kobo to main currency
+            
+            # Verify amount matches
+            if transaction.amount != webhook_amount:
+                logger.warning(
+                    f"Amount mismatch for transaction {transaction.id}: "
+                    f"expected={transaction.amount}, webhook={webhook_amount}"
+                )
+            
+            # Prepare Paystack data
+            paystack_data = {
+                'status': data.get('status'),
+                'reference': reference,
+                'amount': amount_kobo,
+                'currency': currency,
+                'channel': data.get('channel'),
+                'paid_at': data.get('paid_at'),
+                'customer': data.get('customer', {}),
+            }
+            
+            # Use atomic transaction to ensure consistency
+            with db_transaction.atomic():
+                # Use the correct method name: mark_transaction_as_success
+                updated_transaction = self.mark_transaction_as_success(
+                    transaction,
+                    paystack_data=paystack_data
+                )
+                
+                # Credit the wallet if it's a deposit transaction
+                if transaction.transaction_type == TRANSACTION_TYPE_DEPOSIT:
+                    # Get wallet with select_for_update to prevent race conditions
+                    wallet = updated_transaction.wallet
+                    
+                    # Refresh wallet to get current balance
+                    wallet.refresh_from_db()
+                    
+                    # Credit the wallet
+                    wallet.deposit(updated_transaction.amount.amount)
+                    
+                    logger.info(
+                        f"Credited wallet {wallet.id} with {updated_transaction.amount} "
+                        f"for transaction {updated_transaction.id}, "
+                        f"new balance: {wallet.balance}"
+                    )
+                
+                logger.info(
+                    f"Successfully processed charge.success webhook: "
+                    f"transaction={updated_transaction.id}, "
+                    f"status={updated_transaction.status}, "
+                    f"wallet_balance={updated_transaction.wallet.balance}"
+                )
+            
+            return True
+            
+        except Exception as e:
+            logger.error(
+                f"Error processing charge.success webhook for reference {reference}: {str(e)}",
+                exc_info=True
+            )
+            return False
+
+
+    def _process_charge_failed(self, data: dict) -> bool:
+        """
+        Process charge.failed webhook event.
+        
+        This event is triggered when a charge (deposit) fails.
+        Updates the transaction status to failed.
+        
+        Args:
+            data (dict): Webhook event data
+            
+        Returns:
+            bool: True if processed successfully
+        """
+        reference = data.get('reference')
+        
+        if not reference:
+            logger.warning("Charge failed webhook missing reference")
+            return False
+        
+        logger.info(f"Processing charge.failed webhook for reference: {reference}")
+        
+        try:
+            # Find transaction by reference
+            from wallet.models import Transaction
+            
+            try:
+                transaction = Transaction.objects.get(reference=reference)
+                logger.debug(f"Retrieved transaction with reference {reference}")
+            except Transaction.DoesNotExist:
+                logger.error(f"Transaction with reference {reference} not found")
+                return False
+            
+            # Check if already processed
+            if transaction.status == TRANSACTION_STATUS_FAILED:
+                logger.info(
+                    f"Transaction {transaction.id} already marked as failed"
+                )
+                return True
+            
+            # Extract failure reason
+            gateway_response = data.get('gateway_response', 'Charge failed')
+            customer_message = data.get('message', gateway_response)
+            
+            # Prepare Paystack data
+            paystack_data = {
+                'status': data.get('status'),
+                'reference': reference,
+                'message': customer_message,
+                'gateway_response': gateway_response,
+            }
+            
+            # Update transaction status to failed using the correct method name
+            with db_transaction.atomic():
+                updated_transaction = self.mark_transaction_as_failed(
+                    transaction,
+                    reason=customer_message,
+                    paystack_data=paystack_data
+                )
+            
+            logger.info(
+                f"Successfully processed charge.failed webhook for "
+                f"transaction {updated_transaction.id}: {customer_message}"
+            )
+            return True
+            
+        except Exception as e:
+            logger.error(
+                f"Error processing charge.failed webhook for reference {reference}: {str(e)}",
+                exc_info=True
+            )
+            return False

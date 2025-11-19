@@ -12,7 +12,6 @@ from django.utils.translation import gettext_lazy as _
 from django.shortcuts import get_object_or_404
 from django.db import transaction as db_transaction
 from django.db.models import Prefetch
-
 from wallet.models import Wallet, Transaction
 from wallet.serializers.wallet_serializer import (
     WalletSerializer,
@@ -37,7 +36,9 @@ from wallet.constants import (
        TRANSACTION_TYPE_WITHDRAWAL,
        TRANSACTION_STATUS_PENDING,
        TRANSACTION_STATUS_SUCCESS,
-      TRANSACTION_STATUS_FAILED
+      TRANSACTION_STATUS_FAILED,
+      TRANSACTION_TYPE_DEPOSIT
+
   )
 
 
@@ -260,8 +261,11 @@ class WalletViewSet(viewsets.ModelViewSet):
         """
         Initialize a deposit to the wallet
         
-        This creates a Paystack charge transaction and returns
-        the authorization URL for completing the payment.
+        This creates a Transaction record with PENDING status and a Paystack charge 
+        transaction, then returns the authorization URL for completing the payment.
+        
+        The Transaction record is created BEFORE initializing with Paystack so that
+        when the webhook arrives, it can find and update the transaction.
         
         POST /api/wallets/{id}/deposit/
         
@@ -280,13 +284,14 @@ class WalletViewSet(viewsets.ModelViewSet):
             pk: Wallet primary key
             
         Returns:
-            Response: Charge initialization data with authorization URL
+            Response: Charge initialization data with authorization URL and transaction details
         """
         wallet = self.get_object()
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
         wallet_service = WalletService()
+        transaction_service = TransactionService()
         
         try:
             # Extract validated data
@@ -315,20 +320,43 @@ class WalletViewSet(viewsets.ModelViewSet):
                 f"amount={amount}, reference={reference}"
             )
             
-            # Initialize Paystack transaction
-            charge_data = wallet_service.initialize_card_charge(
-                wallet=wallet,
-                amount=amount,
-                email=email,
-                reference=reference,
-                callback_url=callback_url,
-                metadata=metadata
-            )
-            
-            logger.info(
-                f"Deposit initialized for wallet {wallet.id}: "
-                f"reference={reference}, access_code={charge_data.get('access_code')}"
-            )
+            # CRITICAL: Create Transaction record FIRST with PENDING status
+            # This ensures the webhook can find and update the transaction
+            with db_transaction.atomic():
+                transaction = transaction_service.create_transaction(
+                    wallet=wallet,
+                    amount=amount,
+                    transaction_type=TRANSACTION_TYPE_DEPOSIT,
+                    status=TRANSACTION_STATUS_PENDING,
+                    reference=reference,
+                    description=description,
+                    metadata=metadata
+                )
+                
+                logger.info(
+                    f"Created pending deposit transaction {transaction.id} for wallet {wallet.id}: "
+                    f"reference={reference}"
+                )
+                
+                # Initialize Paystack transaction
+                charge_data = wallet_service.initialize_card_charge(
+                    wallet=wallet,
+                    amount=amount,
+                    email=email,
+                    reference=reference,
+                    callback_url=callback_url,
+                    metadata=metadata
+                )
+                
+                # Add transaction ID to response
+                charge_data['transaction_id'] = str(transaction.id)
+                charge_data['transaction_reference'] = reference
+                
+                logger.info(
+                    f"Deposit initialized for wallet {wallet.id}: "
+                    f"reference={reference}, access_code={charge_data.get('access_code')}, "
+                    f"transaction_id={transaction.id}"
+                )
             
             return Response(charge_data, status=status.HTTP_200_OK)
         
@@ -337,6 +365,17 @@ class WalletViewSet(viewsets.ModelViewSet):
                 f"Paystack API error during deposit initialization for wallet {wallet.id}: {str(e)}",
                 exc_info=True
             )
+            
+            # If we created a transaction, mark it as failed
+            try:
+                if 'transaction' in locals():
+                    transaction_service.mark_as_failed(
+                        transaction,
+                        reason=f"Paystack API error: {str(e)}"
+                    )
+            except Exception as inner_e:
+                logger.error(f"Failed to mark transaction as failed: {str(inner_e)}")
+            
             return build_error_response(
                 _("Payment gateway error. Please try again."),
                 status.HTTP_502_BAD_GATEWAY
@@ -347,6 +386,17 @@ class WalletViewSet(viewsets.ModelViewSet):
                 f"Error initializing deposit for wallet {wallet.id}: {str(e)}",
                 exc_info=True
             )
+            
+            # If we created a transaction, mark it as failed
+            try:
+                if 'transaction' in locals():
+                    transaction_service.mark_as_failed(
+                        transaction,
+                        reason=f"Initialization error: {str(e)}"
+                    )
+            except Exception as inner_e:
+                logger.error(f"Failed to mark transaction as failed: {str(inner_e)}")
+            
             return build_error_response(
                 _("Failed to initialize deposit. Please try again."),
                 status.HTTP_500_INTERNAL_SERVER_ERROR
