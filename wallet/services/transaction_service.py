@@ -958,7 +958,7 @@ class TransactionService:
         
         return updated_count
     
-    def process_paystack_webhook(self, event_type: str, data: dict) -> bool:
+    def process_paystack_webhook(self, event_type: str, data: dict, webhook_event=None) -> bool:
         """
         Process a Paystack webhook event related to transactions.
         
@@ -969,23 +969,24 @@ class TransactionService:
         Args:
             event_type (str): Webhook event type
             data (dict): Webhook event data
+            webhook_event (WebhookEvent, optional): The webhook event record to link
             
         Returns:
             bool: True if processed successfully, False if not a relevant event
         """
         # Handle charge.success event
         if event_type == WEBHOOK_EVENT_CHARGE_SUCCESS:
-            return self._process_charge_success(data)
+            return self._process_charge_success(data, webhook_event)
             
         # Handle charge.failed event
         elif event_type == WEBHOOK_EVENT_CHARGE_FAILED:
-            return self._process_charge_failed(data)
+            return self._process_charge_failed(data, webhook_event)
             
         # Not a transaction-related event
         return False
 
 
-    def _process_charge_success(self, data: dict) -> bool:
+    def _process_charge_success(self, data: dict, webhook_event=None) -> bool:
         """
         Process charge.success webhook event.
         
@@ -994,6 +995,7 @@ class TransactionService:
         
         Args:
             data (dict): Webhook event data
+            webhook_event (WebhookEvent, optional): The webhook event record to link
             
         Returns:
             bool: True if processed successfully
@@ -1025,12 +1027,16 @@ class TransactionService:
                     f"Transaction {transaction.id} already marked as success, "
                     f"wallet balance already updated"
                 )
+                # Still link webhook event if provided
+                if webhook_event and not webhook_event.transaction:
+                    webhook_event.transaction = transaction
+                    webhook_event.save(update_fields=['transaction'])
                 return True
             
             # Extract amount from webhook
             amount_kobo = data.get('amount', 0)
             currency = data.get('currency', 'NGN')
-            webhook_amount = Money(amount_kobo / 100, currency)  # Convert from kobo to main currency
+            webhook_amount = Money(amount_kobo / 100, currency)
             
             # Verify amount matches
             if transaction.amount != webhook_amount:
@@ -1039,34 +1045,45 @@ class TransactionService:
                     f"expected={transaction.amount}, webhook={webhook_amount}"
                 )
             
+            # Extract payment details
+            payment_method = data.get('channel', '')  # card, bank, ussd, etc.
+            authorization = data.get('authorization', {})
+            
             # Prepare Paystack data
             paystack_data = {
                 'status': data.get('status'),
                 'reference': reference,
                 'amount': amount_kobo,
                 'currency': currency,
-                'channel': data.get('channel'),
+                'channel': payment_method,
                 'paid_at': data.get('paid_at'),
                 'customer': data.get('customer', {}),
+                'authorization': authorization,
             }
             
             # Use atomic transaction to ensure consistency
             with db_transaction.atomic():
-                # Use the correct method name: mark_transaction_as_success
+                # Update payment method if available
+                if payment_method and not transaction.payment_method:
+                    transaction.payment_method = payment_method
+                    transaction.save(update_fields=['payment_method'])
+                
+                # Mark transaction as successful
                 updated_transaction = self.mark_transaction_as_success(
                     transaction,
                     paystack_data=paystack_data
                 )
                 
+                # Link webhook event to transaction
+                if webhook_event:
+                    webhook_event.transaction = updated_transaction
+                    webhook_event.save(update_fields=['transaction'])
+                    logger.debug(f"Linked webhook event {webhook_event.id} to transaction {updated_transaction.id}")
+                
                 # Credit the wallet if it's a deposit transaction
                 if transaction.transaction_type == TRANSACTION_TYPE_DEPOSIT:
-                    # Get wallet with select_for_update to prevent race conditions
                     wallet = updated_transaction.wallet
-                    
-                    # Refresh wallet to get current balance
                     wallet.refresh_from_db()
-                    
-                    # Credit the wallet
                     wallet.deposit(updated_transaction.amount.amount)
                     
                     logger.info(
@@ -1092,7 +1109,7 @@ class TransactionService:
             return False
 
 
-    def _process_charge_failed(self, data: dict) -> bool:
+    def _process_charge_failed(self, data: dict, webhook_event=None) -> bool:
         """
         Process charge.failed webhook event.
         
@@ -1101,6 +1118,7 @@ class TransactionService:
         
         Args:
             data (dict): Webhook event data
+            webhook_event (WebhookEvent, optional): The webhook event record to link
             
         Returns:
             bool: True if processed successfully
@@ -1129,11 +1147,16 @@ class TransactionService:
                 logger.info(
                     f"Transaction {transaction.id} already marked as failed"
                 )
+                # Still link webhook event if provided
+                if webhook_event and not webhook_event.transaction:
+                    webhook_event.transaction = transaction
+                    webhook_event.save(update_fields=['transaction'])
                 return True
             
-            # Extract failure reason
+            # Extract failure reason and payment method
             gateway_response = data.get('gateway_response', 'Charge failed')
             customer_message = data.get('message', gateway_response)
+            payment_method = data.get('channel', '')
             
             # Prepare Paystack data
             paystack_data = {
@@ -1141,15 +1164,28 @@ class TransactionService:
                 'reference': reference,
                 'message': customer_message,
                 'gateway_response': gateway_response,
+                'channel': payment_method,
             }
             
-            # Update transaction status to failed using the correct method name
+            # Update transaction
             with db_transaction.atomic():
+                # Update payment method if available
+                if payment_method and not transaction.payment_method:
+                    transaction.payment_method = payment_method
+                    transaction.save(update_fields=['payment_method'])
+                
+                # Mark as failed
                 updated_transaction = self.mark_transaction_as_failed(
                     transaction,
                     reason=customer_message,
                     paystack_data=paystack_data
                 )
+                
+                # Link webhook event to transaction
+                if webhook_event:
+                    webhook_event.transaction = updated_transaction
+                    webhook_event.save(update_fields=['transaction'])
+                    logger.debug(f"Linked webhook event {webhook_event.id} to transaction {updated_transaction.id}")
             
             logger.info(
                 f"Successfully processed charge.failed webhook for "
