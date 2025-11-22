@@ -11,7 +11,7 @@ from django.utils.translation import gettext_lazy as _
 from django.db.models import Sum, Count, Avg, Q
 from django.utils import timezone
 from djmoney.money import Money
-from wallet.models import Transaction, Wallet
+from wallet.models import Transaction, Card, Wallet
 from wallet.constants import (
     TRANSACTION_STATUS_PENDING, TRANSACTION_STATUS_SUCCESS, 
     TRANSACTION_STATUS_FAILED, TRANSACTION_STATUS_CANCELLED,
@@ -1099,6 +1099,33 @@ class TransactionService:
                     f"wallet_balance={updated_transaction.wallet.balance}"
                 )
             
+            # Save card from authorization if this was a card payment
+            # This is done OUTSIDE the atomic block so card save failures don't rollback the transaction
+            if payment_method == 'card' and authorization:
+                try:
+                    customer_data = data.get('customer', {})
+                    customer_email = customer_data.get('email')
+                    
+                    saved_card = self._save_card_from_authorization(
+                        wallet=updated_transaction.wallet,
+                        authorization=authorization,
+                        customer_email=customer_email
+                    )
+                    
+                    if saved_card:
+                        # Link the card to the transaction
+                        updated_transaction.card = saved_card
+                        updated_transaction.save(update_fields=['card'])
+                        logger.info(
+                            f"Saved card {saved_card.id} from transaction {updated_transaction.id}"
+                        )
+                except Exception as e:
+                    # Don't fail the entire webhook processing if card saving fails
+                    logger.error(
+                        f"Error saving card for transaction {updated_transaction.id}: {str(e)}",
+                        exc_info=True
+                    )
+            
             return True
             
         except Exception as e:
@@ -1199,3 +1226,122 @@ class TransactionService:
                 exc_info=True
             )
             return False
+        
+    def _save_card_from_authorization(
+        self,
+        wallet: 'Wallet',
+        authorization: dict,
+        customer_email: Optional[str] = None
+    ) -> Optional['Card']:
+        """
+        Save or update a card from Paystack authorization data
+        
+        This method extracts card details from the Paystack authorization
+        object and creates or updates a Card record.
+        
+        Args:
+            wallet: Wallet to associate the card with
+            authorization: Authorization data from Paystack webhook
+            customer_email: Email from the webhook customer data
+            
+        Returns:
+            Card: Created or updated card, or None if authorization is invalid
+        """
+        from wallet.models import Card
+        
+        # Validate authorization data
+        if not authorization or not isinstance(authorization, dict):
+            logger.warning("Invalid authorization data provided")
+            return None
+        
+        # Extract required fields
+        authorization_code = authorization.get('authorization_code')
+        if not authorization_code:
+            logger.warning("No authorization_code in authorization data")
+            return None
+        
+        # Extract card details
+        last_four = authorization.get('last4', '')
+        card_type = authorization.get("card_type")
+        if card_type:
+            card_type = card_type.strip().lower()
+        bin_number = authorization.get('bin', '')
+        exp_month = authorization.get('exp_month', '')
+        exp_year = authorization.get('exp_year', '')
+        bank = authorization.get('bank', '')
+        channel = authorization.get('channel', '')
+        signature = authorization.get('signature', '')
+        reusable = authorization.get('reusable', True)
+        country_code = authorization.get('country_code', '')
+        
+        # Only save reusable cards
+        if not reusable:
+            logger.info(
+                f"Card with authorization {authorization_code} is not reusable, skipping save"
+            )
+            return None
+        
+        try:
+            # Check if card already exists
+            card, created = Card.objects.get_or_create(
+                wallet=wallet,
+                paystack_authorization_code=authorization_code,
+                defaults={
+                    'card_type': card_type,
+                    'last_four': last_four,
+                    'expiry_month': str(exp_month).zfill(2),  # Pad with zero
+                    'expiry_year': str(exp_year),
+                    'bin': bin_number,
+                    'email': customer_email,
+                    'paystack_authorization_signature': signature,
+                    'paystack_card_data': {
+                        'bank': bank,
+                        'channel': channel,
+                        'country_code': country_code,
+                        'reusable': reusable,
+                    },
+                    "card_holder_name" :f"{wallet.user.first_name} {wallet.user.last_name}".strip(),
+                    'is_active': True,
+                    'is_default': False,
+                }
+            )
+            
+            if created:
+                logger.info(
+                    f"Created new card {card.id} for wallet {wallet.id}: "
+                    f"type={card_type}, last_four={last_four}"
+                )
+                
+                # Set as default if this is the first card for the wallet
+                if wallet.cards.count() == 1:
+                    card.is_default = True
+                    card.save(update_fields=['is_default'])
+                    logger.info(f"Set card {card.id} as default (first card)")
+            else:
+                # Update existing card
+                updated = False
+                if card.expiry_month != str(exp_month).zfill(2):
+                    card.expiry_month = str(exp_month).zfill(2)
+                    updated = True
+                if card.expiry_year != str(exp_year):
+                    card.expiry_year = str(exp_year)
+                    updated = True
+                if not card.is_active:
+                    card.is_active = True
+                    updated = True
+                if card.email != customer_email and customer_email:
+                    card.email = customer_email
+                    updated = True
+                
+                if updated:
+                    card.save()
+                    logger.info(f"Updated existing card {card.id}")
+            
+            return card
+            
+        except Exception as e:
+            logger.error(
+                f"Error saving card from authorization: {str(e)}",
+                exc_info=True
+            )
+            return None

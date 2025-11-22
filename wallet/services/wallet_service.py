@@ -288,6 +288,9 @@ class WalletService:
         This generates a payment link that users can use to fund their wallet
         via card payment through Paystack's payment gateway.
         
+        IMPORTANT: Creates a PENDING transaction FIRST, then initializes with Paystack.
+        This ensures the transaction exists when the webhook arrives.
+        
         Args:
             wallet (Wallet): Wallet to deposit into
             amount (Decimal): Amount to charge
@@ -302,6 +305,9 @@ class WalletService:
         Raises:
             PaystackAPIError: If Paystack API call fails
         """
+        from wallet.models import Transaction
+        from wallet.constants import TRANSACTION_TYPE_DEPOSIT, TRANSACTION_STATUS_PENDING
+        
         # Ensure we have the customer's email
         email = email or wallet.user.email
         
@@ -328,21 +334,54 @@ class WalletService:
             f"amount={amount}, reference={reference}"
         )
         
-        # Initialize transaction with Paystack
-        charge_data = self.paystack.initialize_transaction(
-            amount=amount_in_minor_unit,
-            email=email,
+        # CREATE PENDING TRANSACTION FIRST (this is the critical fix!)
+        # This ensures the transaction exists when the webhook arrives
+        transaction = Transaction.objects.create(
+            wallet=wallet,
+            amount=amount,
+            transaction_type=TRANSACTION_TYPE_DEPOSIT,
+            status=TRANSACTION_STATUS_PENDING,
+            description=f"Card deposit of {amount}",
+            metadata=charge_metadata,
             reference=reference,
-            callback_url=callback_url,
-            metadata=charge_metadata
+            payment_method='card'  # Set payment method
         )
         
         logger.info(
-            f"Card charge initialized for wallet {wallet.id}: "
-            f"reference={reference}, access_code={charge_data.get('access_code')}"
+            f"Created PENDING transaction {transaction.id} for card charge: "
+            f"reference={reference}, amount={amount}"
         )
         
-        return charge_data
+        try:
+            # Initialize transaction with Paystack
+            charge_data = self.paystack.initialize_transaction(
+                amount=amount_in_minor_unit,
+                email=email,
+                reference=reference,
+                callback_url=callback_url,
+                metadata=charge_metadata
+            )
+            
+            logger.info(
+                f"Card charge initialized for wallet {wallet.id}: "
+                f"reference={reference}, access_code={charge_data.get('access_code')}"
+            )
+            
+            return charge_data
+        
+        except Exception as e:
+            # If Paystack initialization fails, mark transaction as failed
+            transaction.status = TRANSACTION_STATUS_FAILED
+            transaction.failed_reason = f"Paystack initialization failed: {str(e)}"
+            transaction.save(update_fields=['status', 'failed_reason', 'updated_at'])
+            
+            logger.error(
+                f"Failed to initialize card charge: {str(e)}",
+                exc_info=True
+            )
+            
+            # Re-raise the exception
+            raise
     
     # ==========================================
     # WITHDRAWAL OPERATIONS
