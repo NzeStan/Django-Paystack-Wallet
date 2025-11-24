@@ -1,6 +1,7 @@
 """
 Django Paystack Wallet - Card Serializers
 Comprehensive serializers with validation and optimization
+PROPERLY ARCHITECTED: Following project patterns with security-first approach
 """
 from rest_framework import serializers
 from django.utils.translation import gettext_lazy as _
@@ -21,6 +22,9 @@ class CardSerializer(serializers.ModelSerializer):
     
     Provides basic card information with security considerations.
     Never exposes full card numbers or sensitive data.
+    
+    SECURITY: Card holder name and email are read-only as they're
+    automatically filled from wallet.user details.
     """
     
     # Related fields
@@ -70,6 +74,10 @@ class CardSerializer(serializers.ModelSerializer):
             'expiry_year',
             'expiry',
             'bin',
+            'card_holder_name',  # READ-ONLY: Auto-filled from wallet.user
+            'email',  # READ-ONLY: Auto-filled from wallet.user
+            'is_default',  # Use set_default action
+            'is_active',  # Use activate/deactivate actions
             'is_expired',
             'is_valid',
             'masked_pan',
@@ -105,6 +113,8 @@ class CardDetailSerializer(CardSerializer):
     Detailed serializer for the Card model
     
     Includes comprehensive information with transaction statistics.
+    
+    FIXED: Properly handles Decimal from aggregate functions
     """
     
     # Statistics
@@ -137,16 +147,27 @@ class CardDetailSerializer(CardSerializer):
         return card.transactions.count()
     
     def get_total_amount(self, card):
-        """Get the total amount of successful transactions"""
+        """
+        Get the total amount of successful transactions
+        
+        FIXED: Sum() returns Decimal, not Money object
+        """
         result = card.transactions.filter(
             status=TRANSACTION_STATUS_SUCCESS
         ).aggregate(total=Sum('amount'))
         
         total = result.get('total')
-        if total:
+        if total is not None:
+            # Aggregate returns Decimal directly, not Money
+            # Get currency from card's wallet
+            try:
+                currency = card.wallet.balance.currency.code
+            except (AttributeError, TypeError):
+                currency = 'NGN'  # Default fallback
+            
             return {
-                'amount': float(total.amount),
-                'currency': str(total.currency)
+                'amount': float(total),  # Direct conversion from Decimal
+                'currency': currency
             }
         return None
     
@@ -157,16 +178,27 @@ class CardDetailSerializer(CardSerializer):
         ).count()
     
     def get_average_transaction_amount(self, card):
-        """Get the average amount of successful transactions"""
+        """
+        Get the average amount of successful transactions
+        
+        FIXED: Avg() returns Decimal, not Money object
+        """
         result = card.transactions.filter(
             status=TRANSACTION_STATUS_SUCCESS
         ).aggregate(avg=Avg('amount'))
         
         avg = result.get('avg')
-        if avg:
+        if avg is not None:
+            # Aggregate returns Decimal directly, not Money
+            # Get currency from card's wallet
+            try:
+                currency = card.wallet.balance.currency.code
+            except (AttributeError, TypeError):
+                currency = 'NGN'  # Default fallback
+            
             return {
-                'amount': float(avg.amount),
-                'currency': str(avg.currency)
+                'amount': float(avg),  # Direct conversion from Decimal
+                'currency': currency
             }
         return None
     
@@ -180,71 +212,26 @@ class CardDetailSerializer(CardSerializer):
 
 class CardUpdateSerializer(serializers.ModelSerializer):
     """
-    Serializer for updating card information
+    RESTRICTED serializer for card updates
     
-    Allows updating specific fields while protecting sensitive data.
+    This serializer is NOT used in the API.
+    PUT/PATCH endpoints are disabled (not in http_method_names).
+    
+    Users should use specific actions like set_default, activate, deactivate
+    instead of generic update operations.
+    
+    Kept for potential internal use but not exposed through API.
     """
     
     class Meta:
         model = Card
-        fields = [
+        fields = []  # No fields allowed for update
+        read_only_fields = [
             'card_holder_name',
             'email',
             'is_default',
             'is_active'
         ]
-        extra_kwargs = {
-            'card_holder_name': {
-                'help_text': _('Update cardholder name')
-            },
-            'email': {
-                'help_text': _('Update email associated with card')
-            }
-        }
-    
-    def validate_is_default(self, value):
-        """
-        Validate is_default field
-        
-        Args:
-            value (bool): Is default value
-            
-        Returns:
-            bool: Validated value
-        """
-        # If setting to False, ensure there's another default card
-        if not value and self.instance.is_default:
-            wallet = self.instance.wallet
-            other_defaults = Card.objects.filter(
-                wallet=wallet,
-                is_default=True,
-                is_active=True
-            ).exclude(pk=self.instance.pk).count()
-            
-            if other_defaults == 0:
-                raise serializers.ValidationError(
-                    _("Cannot unset default. Please set another card as default first.")
-                )
-        
-        return value
-    
-    def validate_is_active(self, value):
-        """
-        Validate is_active field
-        
-        Args:
-            value (bool): Is active value
-            
-        Returns:
-            bool: Validated value
-        """
-        # Check if card is expired before activating
-        if value and self.instance.is_expired:
-            raise serializers.ValidationError(
-                _("Cannot activate an expired card")
-            )
-        
-        return value
 
 
 class CardChargeSerializer(serializers.Serializer):
@@ -252,18 +239,20 @@ class CardChargeSerializer(serializers.Serializer):
     Serializer for charging a saved card
     
     Validates payment amount and optional metadata for card charges.
+    Amount is automatically converted to kobo when sent to Paystack.
     """
     
     amount = serializers.DecimalField(
         decimal_places=2,
         max_digits=19,
         min_value=Decimal("0.01"),
-        help_text=_('Amount to charge in the wallet currency')
+        help_text=_('Amount to charge in Naira (automatically converted to kobo for Paystack)')
     )
     description = serializers.CharField(
         max_length=255,
         required=False,
         allow_blank=True,
+        default='Card charge',
         help_text=_('Transaction description')
     )
     reference = serializers.CharField(
@@ -274,6 +263,7 @@ class CardChargeSerializer(serializers.Serializer):
     )
     metadata = serializers.JSONField(
         required=False,
+        default=dict,
         help_text=_('Additional metadata for the transaction')
     )
     
@@ -292,10 +282,10 @@ class CardChargeSerializer(serializers.Serializer):
                 _("Amount must be greater than zero")
             )
         
-        # Check for reasonable maximum (e.g., 10 million)
+        # Check for reasonable maximum (e.g., 10 million Naira)
         if value > Decimal("10000000"):
             raise serializers.ValidationError(
-                _("Amount exceeds maximum allowed value")
+                _("Amount exceeds maximum allowed value of ₦10,000,000")
             )
         
         return value
@@ -326,29 +316,31 @@ class CardInitializeSerializer(serializers.Serializer):
     Serializer for initializing a card payment
     
     Used to start the card payment flow with Paystack.
+    
+    SECURITY:
+    - Email is NOT required - it's automatically filled from wallet.user.email
+    - Card holder name is NOT required - it's automatically filled from wallet.user.get_full_name()
+    - Amount is automatically converted to kobo for Paystack
     """
     
     amount = serializers.DecimalField(
         decimal_places=2,
         max_digits=19,
         min_value=Decimal("0.01"),
-        help_text=_('Amount to charge')
-    )
-    email = serializers.EmailField(
-        required=False,
-        help_text=_('Customer email (defaults to wallet user email)')
+        help_text=_('Amount to charge in Naira (automatically converted to kobo for Paystack)')
     )
     description = serializers.CharField(
         max_length=255,
         required=False,
         allow_blank=True,
+        default='Card deposit to wallet',
         help_text=_('Transaction description')
     )
     reference = serializers.CharField(
         max_length=100,
         required=False,
         allow_blank=True,
-        help_text=_('Custom transaction reference')
+        help_text=_('Custom transaction reference (auto-generated if not provided)')
     )
     callback_url = serializers.URLField(
         required=False,
@@ -357,19 +349,49 @@ class CardInitializeSerializer(serializers.Serializer):
     )
     metadata = serializers.JSONField(
         required=False,
-        help_text=_('Additional metadata')
+        default=dict,
+        help_text=_('Additional metadata for the transaction')
     )
     
     def validate_amount(self, value):
-        """Validate amount"""
+        """
+        Validate amount
+        
+        Args:
+            value (Decimal): Amount
+            
+        Returns:
+            Decimal: Validated amount
+        """
         if value <= 0:
             raise serializers.ValidationError(
                 _("Amount must be greater than zero")
             )
         
+        # Check for reasonable maximum (e.g., 10 million Naira)
         if value > Decimal("10000000"):
             raise serializers.ValidationError(
-                _("Amount exceeds maximum allowed value")
+                _("Amount exceeds maximum allowed value of ₦10,000,000")
+            )
+        
+        return value
+    
+    def validate_metadata(self, value):
+        """
+        Validate metadata
+        
+        Args:
+            value (dict): Metadata
+            
+        Returns:
+            dict: Validated metadata
+        """
+        if not value:
+            return {}
+        
+        if not isinstance(value, dict):
+            raise serializers.ValidationError(
+                _("Metadata must be a valid JSON object")
             )
         
         return value
@@ -380,6 +402,7 @@ class CardSetDefaultSerializer(serializers.Serializer):
     Serializer for setting a card as default
     
     Simple serializer for the set_default action.
+    No fields required - the action works on the card specified in the URL.
     """
     
     pass  # No additional fields needed
@@ -390,6 +413,7 @@ class CardStatisticsSerializer(serializers.Serializer):
     Serializer for card statistics
     
     Provides comprehensive statistics for a card.
+    Card IS directly linked to Transaction, so statistics come from card.transactions
     """
     
     # Card info
@@ -398,7 +422,7 @@ class CardStatisticsSerializer(serializers.Serializer):
     last_four = serializers.CharField(read_only=True)
     masked_pan = serializers.CharField(read_only=True)
     
-    # Statistics
+    # Statistics from card.transactions
     total_transactions = serializers.IntegerField(read_only=True)
     successful_transactions = serializers.IntegerField(read_only=True)
     failed_transactions = serializers.IntegerField(read_only=True)
