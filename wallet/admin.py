@@ -522,36 +522,49 @@ class BankAdmin(ExportMixin, admin.ModelAdmin):
     actions = ExportMixin.actions + ['sync_from_paystack']
     
     def sync_from_paystack(self, request, queryset):
-        """Sync bank data from Paystack"""
-        wallet_service = WalletService()
+        """Sync ALL banks from Paystack (respects USE_CELERY setting)"""
+        from wallet.utils.bank_sync import sync_banks_from_paystack
+        from wallet.settings import get_wallet_setting
         
         try:
-            # Get banks from Paystack
-            banks_data = wallet_service.list_banks()
-            
-            # Update selected banks
-            updated = 0
-            
-            for bank in queryset:
-                for bank_data in banks_data:
-                    if bank_data.get('code') == bank.code:
-                        bank.name = bank_data.get('name', bank.name)
-                        bank.slug = bank_data.get('slug', bank.slug)
-                        bank.type = bank_data.get('type', bank.type)
-                        bank.is_active = bank_data.get('active', bank.is_active)
-                        bank.paystack_data = bank_data
-                        bank.save()
-                        updated += 1
-                        break
-            
-            if updated:
-                messages.success(request, _("Updated {} banks from Paystack").format(updated))
-            else:
-                messages.info(request, _("No banks were updated"))
+            # Use Celery if available, otherwise sync directly
+            if get_wallet_setting('USE_CELERY'):
+                from wallet.tasks import sync_banks_from_paystack_task
                 
+                # Queue the task
+                sync_banks_from_paystack_task.delay(force_update=True)
+                
+                messages.success(
+                    request,
+                    _("Bank sync task queued. Check Celery logs for progress.")
+                )
+            else:
+                # Sync directly (no Celery)
+                created, updated, errors = sync_banks_from_paystack(force_update=True)
+                
+                if errors > 0:
+                    messages.warning(
+                        request,
+                        _("Synced banks with errors: {} created, {} updated, {} errors").format(
+                            created, updated, errors
+                        )
+                    )
+                else:
+                    messages.success(
+                        request,
+                        _("Successfully synced {} banks from Paystack ({} created, {} updated)").format(
+                            created + updated, created, updated
+                        )
+                    )
+                    
         except Exception as e:
-            messages.error(request, _("Error syncing banks from Paystack: {}").format(str(e)))
-    sync_from_paystack.short_description = _("Sync selected banks from Paystack")
+            messages.error(
+                request,
+                _("Error syncing banks from Paystack: {}").format(str(e))
+            )
+            logger.error(f"Admin bank sync failed: {str(e)}", exc_info=True)
+
+    sync_from_paystack.short_description = _("Sync ALL banks from Paystack")
 
 
 class BankAccountAdmin(ExportMixin, admin.ModelAdmin):

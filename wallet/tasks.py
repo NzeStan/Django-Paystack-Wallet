@@ -167,48 +167,37 @@ def retry_failed_webhook_deliveries_task():
 
 
 @shared_task
-def sync_banks_from_paystack_task():
+def sync_banks_from_paystack_task(force_update: bool = False):
     """
-    Sync banks from Paystack (scheduled task)
+    Sync banks from Paystack (Celery task wrapper)
+    
+    This is just a Celery wrapper around the utility function.
+    Users without Celery can call the utility directly.
+    
+    Args:
+        force_update (bool): If True, updates existing banks
+        
+    Returns:
+        dict: Statistics about the sync operation
     """
-    # Get models
-    Bank = apps.get_model('wallet', 'Bank')
+    from wallet.utils.bank_sync import sync_banks_from_paystack
     
     try:
-        # Get wallet service
-        wallet_service = WalletService()
+        created, updated, errors = sync_banks_from_paystack(force_update=force_update)
         
-        # Get banks from Paystack
-        banks_data = wallet_service.list_banks()
+        result = {
+            'created': created,
+            'updated': updated,
+            'errors': errors,
+            'total': created + updated
+        }
         
-        # Update or create banks
-        count = 0
-        for bank_data in banks_data:
-            bank_code = bank_data.get('code')
-            if not bank_code:
-                continue
-                
-            bank, created = Bank.objects.update_or_create(
-                code=bank_code,
-                defaults={
-                    'name': bank_data.get('name', ''),
-                    'slug': bank_data.get('slug', bank_code.lower()),
-                    'country': bank_data.get('country', 'NG'),
-                    'currency': bank_data.get('currency', 'NGN'),
-                    'type': bank_data.get('type'),
-                    'is_active': bank_data.get('active', True),
-                    'paystack_data': bank_data
-                }
-            )
-            
-            count += 1
+        logger.info(f"Bank sync task completed: {result}")
+        return result
         
-        logger.info(f"Synced {count} banks from Paystack")
-        return count
     except Exception as e:
-        logger.error(f"Error syncing banks from Paystack: {str(e)}")
+        logger.error(f"Error in bank sync task: {str(e)}")
         raise
-
 
 @shared_task
 def verify_pending_settlements_task():

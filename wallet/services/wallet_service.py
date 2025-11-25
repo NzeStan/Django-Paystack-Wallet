@@ -549,7 +549,7 @@ class WalletService:
             # Initiate Paystack transfer (outside atomic block - API call)
             transfer_data = self.paystack.initiate_transfer(
                 amount=amount_in_minor_unit,
-                recipient=bank_account.paystack_recipient_code,
+                recipient_code=bank_account.paystack_recipient_code,
                 reason=reason,
                 reference=reference
             )
@@ -1006,7 +1006,8 @@ class WalletService:
             'bank': bank,
             'account_number': account_number,
             'account_name': account_name,
-            'is_verified': True
+            'is_verified': True,
+            'bvn': bvn
         }
         
         # Only add account_type if it's provided (otherwise use model default)
@@ -1024,6 +1025,7 @@ class WalletService:
         # Create Paystack transfer recipient
         try:
             recipient_data = self.paystack.create_transfer_recipient(
+                account_type='nuban',
                 account_number=account_number,
                 bank_code=bank_code,
                 name=account_name,
@@ -1033,7 +1035,12 @@ class WalletService:
             if recipient_data and 'recipient_code' in recipient_data:
                 # Save recipient code to bank account
                 bank_account.paystack_recipient_code = recipient_data['recipient_code']
-                bank_account.save(update_fields=['paystack_recipient_code', 'updated_at'])
+                bank_account.paystack_recipient_data = recipient_data
+                bank_account.save(update_fields=[
+                    'paystack_recipient_code',
+                    'paystack_recipient_data',
+                    'updated_at'
+                ])
                 
                 # Also create TransferRecipient record
                 TransferRecipient.objects.create(

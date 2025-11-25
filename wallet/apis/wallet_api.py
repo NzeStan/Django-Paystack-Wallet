@@ -468,7 +468,7 @@ class WalletViewSet(viewsets.ModelViewSet):
             # Process withdrawal
             transaction, transfer_data = wallet_service.withdraw_to_bank(
                 wallet=wallet,
-                amount=amount,
+                amount=amount,  
                 bank_account=bank_account,
                 reason=description,
                 metadata=metadata,

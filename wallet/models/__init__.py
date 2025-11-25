@@ -1,6 +1,7 @@
 from wallet.models.wallet import Wallet, WalletQuerySet, WalletManager
 from wallet.models.transaction import Transaction, TransactionQuerySet, TransactionManager  
 from wallet.models.card import Card, CardQuerySet, CardManager
+from wallet.models.bank_account import Bank, BankAccount
 from wallet.models.bank_account import (
     Bank, BankQuerySet, BankManager,
     BankAccount, BankAccountQuerySet, BankAccountManager
