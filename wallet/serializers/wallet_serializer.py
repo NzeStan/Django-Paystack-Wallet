@@ -514,37 +514,98 @@ class WalletDepositSerializer(WalletTransactionSerializer):
         return value
 
 
-class WalletWithdrawSerializer(WalletTransactionSerializer):
-    """
-    Serializer for wallet withdrawal operations
+# class WalletWithdrawSerializer(WalletTransactionSerializer):
+#     """
+#     Serializer for wallet withdrawal operations
     
-    Extends base transaction serializer with withdrawal-specific fields.
-    """
+#     Extends base transaction serializer with withdrawal-specific fields.
+#     """
     
-    bank_account_id = serializers.CharField(
-        required=True,
-        help_text=_('ID of the bank account to withdraw to')
+#     bank_account_id = serializers.CharField(
+#         required=True,
+#         help_text=_('ID of the bank account to withdraw to')
+#     )
+    
+#     def validate_bank_account_id(self, value: str) -> str:
+#         """
+#         Validate bank account ID
+        
+#         Args:
+#             value (str): Bank account ID
+            
+#         Returns:
+#             str: Validated bank account ID
+            
+#         Raises:
+#             ValidationError: If bank account ID is invalid
+#         """
+#         if not value or not value.strip():
+#             raise serializers.ValidationError(
+#                 _("Bank account ID is required")
+#             )
+        
+#         return value.strip()
+
+class WalletWithdrawSerializer(serializers.Serializer):
+    """
+    Serializer for withdrawal requests
+    
+    Validates withdrawal data before processing
+    """
+    amount = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        min_value=Decimal('0.01'),
+        help_text=_("Amount to withdraw (e.g., 5000.00)")
     )
     
-    def validate_bank_account_id(self, value: str) -> str:
-        """
-        Validate bank account ID
-        
-        Args:
-            value (str): Bank account ID
-            
-        Returns:
-            str: Validated bank account ID
-            
-        Raises:
-            ValidationError: If bank account ID is invalid
-        """
-        if not value or not value.strip():
+    bank_account_id = serializers.UUIDField(
+        help_text=_("UUID of the bank account to withdraw to")
+    )
+    
+    description = serializers.CharField(
+        max_length=255,
+        required=False,
+        allow_blank=True,
+        help_text=_("Optional description for the withdrawal")
+    )
+    
+    reference = serializers.CharField(
+        max_length=100,
+        required=False,
+        allow_blank=True,
+        help_text=_("Optional custom reference")
+    )
+    
+    metadata = serializers.JSONField(
+        required=False,
+        allow_null=True,
+        help_text=_("Optional metadata as JSON object")
+    )
+    
+    def validate_amount(self, value):
+        """Validate withdrawal amount"""
+        if value <= 0:
             raise serializers.ValidationError(
-                _("Bank account ID is required")
+                _("Amount must be greater than zero")
             )
         
-        return value.strip()
+        # Check if amount is too large (optional - adjust based on your needs)
+        max_amount = Decimal('10000000.00')  # 10 million max
+        if value > max_amount:
+            raise serializers.ValidationError(
+                _("Amount exceeds maximum withdrawal limit of {}").format(max_amount)
+            )
+        
+        return value
+    
+    def validate_metadata(self, value):
+        """Validate metadata is a dict"""
+        if value is not None and not isinstance(value, dict):
+            raise serializers.ValidationError(
+                _("Metadata must be a JSON object")
+            )
+        return value
 
 
 class WalletTransferSerializer(WalletTransactionSerializer):
@@ -603,76 +664,57 @@ class WalletTransferSerializer(WalletTransactionSerializer):
 
 class FinalizeWithdrawalSerializer(serializers.Serializer):
     """
-    Serializer for finalizing bank withdrawals with OTP
+    Serializer for finalizing withdrawal with OTP
     
-    Used when Paystack requires OTP verification for transfers.
+    Validates OTP and transfer code
     """
-    
     transfer_code = serializers.CharField(
-        max_length=100,
-        required=True,
-        help_text=_('Paystack transfer code')
+        max_length=50,
+        help_text=_("Transfer code from initial withdrawal response")
     )
     
     otp = serializers.CharField(
+        min_length=4,
         max_length=10,
-        required=True,
-        help_text=_('One-Time Password for verification')
+        help_text=_("One-Time Password received by user")
     )
     
-    def validate_transfer_code(self, value: str) -> str:
-        """
-        Validate transfer code
-        
-        Args:
-            value (str): Transfer code
-            
-        Returns:
-            str: Validated transfer code
-            
-        Raises:
-            ValidationError: If transfer code is invalid
-        """
-        if not value or not value.strip():
+    def validate_transfer_code(self, value):
+        """Validate transfer code format"""
+        if not value:
             raise serializers.ValidationError(
                 _("Transfer code is required")
             )
         
-        return value.strip()
-    
-    def validate_otp(self, value: str) -> str:
-        """
-        Validate OTP
+        # Paystack transfer codes typically start with TRF_
+        if not value.startswith('TRF_'):
+            raise serializers.ValidationError(
+                _("Invalid transfer code format. Must start with 'TRF_'")
+            )
         
-        Args:
-            value (str): OTP to validate
-            
-        Returns:
-            str: Validated OTP
-            
-        Raises:
-            ValidationError: If OTP is invalid
-        """
-        if not value or not value.strip():
+        return value
+    
+    def validate_otp(self, value):
+        """Validate OTP format"""
+        if not value:
             raise serializers.ValidationError(
                 _("OTP is required")
             )
         
-        value = value.strip()
-        
-        # Check if OTP contains only digits
+        # OTP should be numeric
         if not value.isdigit():
             raise serializers.ValidationError(
-                _("OTP must contain only digits")
+                _("OTP must contain only numbers")
             )
         
-        # Check OTP length (typically 4-10 digits)
+        # OTP is typically 6 digits for Paystack
         if len(value) < 4 or len(value) > 10:
             raise serializers.ValidationError(
                 _("OTP must be between 4 and 10 digits")
             )
         
         return value
+
 
 
 # ==========================================

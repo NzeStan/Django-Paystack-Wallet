@@ -12,7 +12,9 @@ from django.utils.translation import gettext_lazy as _
 from django.shortcuts import get_object_or_404
 from django.db import transaction as db_transaction
 from django.db.models import Prefetch
-from wallet.models import Wallet, Transaction
+from wallet.models import Wallet, Transaction, BankAccount
+from decimal import Decimal
+
 from wallet.serializers.wallet_serializer import (
     WalletSerializer,
     WalletDetailSerializer,
@@ -78,45 +80,21 @@ class IsWalletOwner(permissions.BasePermission):
 # ==========================================
 
 def get_client_ip(request: Request) -> str:
-    """
-    Extract client IP address from request
-    
-    Handles proxy headers and direct connections.
-    
-    Args:
-        request (Request): HTTP request
-        
-    Returns:
-        str: Client IP address
-    """
+    """Get client IP from request"""
     x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
     if x_forwarded_for:
-        # Get first IP from list (client IP)
-        return x_forwarded_for.split(',')[0].strip()
-    return request.META.get('REMOTE_ADDR', '')
+        ip = x_forwarded_for.split(',')[0]
+    else:
+        ip = request.META.get('REMOTE_ADDR')
+    return ip
 
 
-def build_error_response(
-    message: str,
-    status_code: int = status.HTTP_400_BAD_REQUEST,
-    errors: Dict = None
-) -> Response:
-    """
-    Build a standardized error response
-    
-    Args:
-        message (str): Error message
-        status_code (int): HTTP status code
-        errors (dict, optional): Additional error details
-        
-    Returns:
-        Response: DRF Response object
-    """
-    response_data = {'detail': message}
-    if errors:
-        response_data['errors'] = errors
-    
-    return Response(response_data, status=status_code)
+def build_error_response(message: str, status_code: int) -> Response:
+    """Build standardized error response"""
+    return Response(
+        {'detail': str(message)},
+        status=status_code
+    )
 
 
 # ==========================================
@@ -422,12 +400,29 @@ class WalletViewSet(viewsets.ModelViewSet):
             "metadata": {}  # Optional
         }
         
-        Args:
-            request (Request): HTTP request
-            pk: Wallet primary key
-            
-        Returns:
-            Response: Transaction data and transfer information
+        Response Success (200):
+        {
+            "status": "success",
+            "message": "Withdrawal initiated successfully",
+            "transaction": {...},
+            "transfer": {
+                "transfer_code": "TRF_xxxxx",
+                "status": "pending|otp|success",
+                "requires_otp": false
+            }
+        }
+        
+        Response OTP Required (200):
+        {
+            "status": "pending_otp",
+            "message": "OTP required to complete withdrawal",
+            "transaction": {...},
+            "transfer": {
+                "transfer_code": "TRF_xxxxx",
+                "status": "otp",
+                "requires_otp": true
+            }
+        }
         """
         wallet = self.get_object()
         serializer = self.get_serializer(data=request.data)
@@ -439,7 +434,10 @@ class WalletViewSet(viewsets.ModelViewSet):
             # Extract validated data
             amount = serializer.validated_data['amount']
             bank_account_id = serializer.validated_data['bank_account_id']
-            description = serializer.validated_data.get('description', 'Withdrawal to bank account')
+            description = serializer.validated_data.get(
+                'description', 
+                'Withdrawal to bank account'
+            )
             reference = serializer.validated_data.get('reference')
             metadata = serializer.validated_data.get('metadata') or {}
             
@@ -456,19 +454,50 @@ class WalletViewSet(viewsets.ModelViewSet):
                 f"amount={amount}, bank_account={bank_account_id}"
             )
             
-            # Get bank account
-            from wallet.models import BankAccount
-            bank_account = get_object_or_404(
-                BankAccount.objects.select_related('bank'),
-                id=bank_account_id,
-                wallet=wallet,
-                is_active=True
-            )
+            # Get and validate bank account
+            try:
+                bank_account = BankAccount.objects.select_related('bank').get(
+                    id=bank_account_id,
+                    wallet=wallet,
+                    is_active=True
+                )
+            except BankAccount.DoesNotExist:
+                logger.warning(
+                    f"Bank account {bank_account_id} not found or inactive for wallet {wallet.id}"
+                )
+                return build_error_response(
+                    _("Bank account not found or inactive"),
+                    status.HTTP_404_NOT_FOUND
+                )
+            
+            # Validate bank account has recipient code
+            if not bank_account.paystack_recipient_code:
+                logger.warning(
+                    f"Bank account {bank_account.id} missing recipient code"
+                )
+                return build_error_response(
+                    _("Bank account is not properly configured for withdrawals"),
+                    status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Convert amount to Decimal if it's not already
+            if not isinstance(amount, Decimal):
+                amount = Decimal(str(amount))
+            
+            # Validate amount is positive
+            if amount <= 0:
+                logger.warning(
+                    f"Invalid withdrawal amount {amount} for wallet {wallet.id}"
+                )
+                return build_error_response(
+                    _("Amount must be greater than zero"),
+                    status.HTTP_400_BAD_REQUEST
+                )
             
             # Process withdrawal
             transaction, transfer_data = wallet_service.withdraw_to_bank(
                 wallet=wallet,
-                amount=amount,  
+                amount=amount,
                 bank_account=bank_account,
                 reason=description,
                 metadata=metadata,
@@ -477,19 +506,36 @@ class WalletViewSet(viewsets.ModelViewSet):
             
             logger.info(
                 f"Withdrawal initiated for wallet {wallet.id}: "
-                f"transaction={transaction.id}, transfer_code={transfer_data.get('transfer_code')}"
+                f"transaction={transaction.id}, "
+                f"transfer_code={transfer_data.get('transfer_code')}, "
+                f"status={transfer_data.get('status')}"
             )
             
             # Prepare response
             from wallet.serializers.transaction_serializer import TransactionSerializer
+            
+            # Check if OTP is required
+            requires_otp = transfer_data.get('requires_otp', False)
+            transfer_status = transfer_data.get('status', 'pending')
+            
             response_data = {
                 'transaction': TransactionSerializer(transaction).data,
                 'transfer': {
                     'transfer_code': transfer_data.get('transfer_code'),
-                    'status': transfer_data.get('status'),
-                    'requires_otp': transfer_data.get('requires_otp', False),
+                    'status': transfer_status,
+                    'requires_otp': requires_otp,
                 }
             }
+            
+            if requires_otp:
+                response_data['status'] = 'pending_otp'
+                response_data['message'] = _(
+                    'OTP required to complete withdrawal. '
+                    'Please check your phone for OTP and call finalize_withdrawal endpoint.'
+                )
+            else:
+                response_data['status'] = 'success'
+                response_data['message'] = _('Withdrawal initiated successfully')
             
             return Response(response_data, status=status.HTTP_200_OK)
         
@@ -517,21 +563,27 @@ class WalletViewSet(viewsets.ModelViewSet):
                 exc_info=True
             )
             return build_error_response(
-                _("Payment gateway error. Please try again."),
+                _("Payment gateway error. Please try again later."),
                 status.HTTP_502_BAD_GATEWAY
             )
         
+        except ValueError as e:
+            logger.warning(
+                f"Validation error during withdrawal for wallet {wallet.id}: {str(e)}"
+            )
+            return build_error_response(str(e), status.HTTP_400_BAD_REQUEST)
+        
         except Exception as e:
             logger.error(
-                f"Error processing withdrawal for wallet {wallet.id}: {str(e)}",
+                f"Unexpected error processing withdrawal for wallet {wallet.id}: {str(e)}",
                 exc_info=True
             )
             return build_error_response(
-                _("Failed to process withdrawal. Please try again."),
+                _("Failed to process withdrawal. Please try again later."),
                 status.HTTP_500_INTERNAL_SERVER_ERROR
             )
     
-    @action(detail=True, methods=['post'])
+    @action(detail=True, methods=['post'], url_path='finalize-withdrawal')
     def finalize_withdrawal(self, request: Request, pk=None) -> Response:
         """
         Finalize a pending bank withdrawal with OTP
@@ -549,24 +601,25 @@ class WalletViewSet(viewsets.ModelViewSet):
             "otp": "123456"  # OTP received by user
         }
         
-        Args:
-            request (Request): HTTP request
-            pk: Wallet primary key
-            
-        Returns:
-            Response: Finalization status and transaction data
-            
-        Response:
+        Response Success (200):
         {
             "status": "success",
             "message": "Transfer completed successfully",
-            "transaction": {
-                "id": "...",
-                "reference": "...",
-                "amount": "5000.00",
-                "status": "success",
-                ...
-            }
+            "transaction": {...}
+        }
+        
+        Response Failed (400):
+        {
+            "status": "failed",
+            "message": "Transfer finalization failed",
+            "transaction": {...}
+        }
+        
+        Response Processing (202):
+        {
+            "status": "processing",
+            "message": "Transfer is being processed",
+            "transaction": {...}
         }
         """
         wallet = self.get_object()
@@ -586,7 +639,6 @@ class WalletViewSet(viewsets.ModelViewSet):
             )
             
             # Find the transaction by transfer code
-            from wallet.models import Transaction
             try:
                 transaction = Transaction.objects.select_related('wallet').get(
                     wallet=wallet,
@@ -624,7 +676,9 @@ class WalletViewSet(viewsets.ModelViewSet):
             
             logger.info(
                 f"Withdrawal finalized for wallet {wallet.id}: "
-                f"transaction={transaction.id}, status={transaction.status}"
+                f"transaction={transaction.id}, "
+                f"status={transaction.status}, "
+                f"paystack_status={finalization_response.get('status')}"
             )
             
             # Serialize the updated transaction
@@ -641,17 +695,18 @@ class WalletViewSet(viewsets.ModelViewSet):
                 response_data = {
                     'status': 'success',
                     'message': _('Transfer completed successfully'),
-                    'transaction': transaction_serializer.data,
-                    'paystack_response': finalization_response
+                    'transaction': transaction_serializer.data
                 }
                 return Response(response_data, status=status.HTTP_200_OK)
             
             elif response_status in ['failed', 'error'] or transaction.status == TRANSACTION_STATUS_FAILED:
                 response_data = {
                     'status': 'failed',
-                    'message': finalization_response.get('message', _('Transfer finalization failed')),
-                    'transaction': transaction_serializer.data,
-                    'paystack_response': finalization_response
+                    'message': finalization_response.get(
+                        'message', 
+                        _('Transfer finalization failed')
+                    ),
+                    'transaction': transaction_serializer.data
                 }
                 return Response(response_data, status=status.HTTP_400_BAD_REQUEST)
             
@@ -660,8 +715,7 @@ class WalletViewSet(viewsets.ModelViewSet):
                 response_data = {
                     'status': 'processing',
                     'message': _('Transfer is being processed'),
-                    'transaction': transaction_serializer.data,
-                    'paystack_response': finalization_response
+                    'transaction': transaction_serializer.data
                 }
                 return Response(response_data, status=status.HTTP_202_ACCEPTED)
         
@@ -686,11 +740,11 @@ class WalletViewSet(viewsets.ModelViewSet):
         
         except Exception as e:
             logger.error(
-                f"Error finalizing withdrawal for wallet {wallet.id}: {str(e)}",
+                f"Unexpected error finalizing withdrawal for wallet {wallet.id}: {str(e)}",
                 exc_info=True
             )
             return build_error_response(
-                _("Failed to finalize withdrawal. Please try again."),
+                _("Failed to finalize withdrawal. Please try again later."),
                 status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
