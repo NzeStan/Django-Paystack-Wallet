@@ -541,6 +541,9 @@ class WalletService:
         if not wallet.is_active:
             raise WalletLocked(_("Wallet is not active"))
         
+        # Ensure metadata is a dict for safe .get() usage
+        metadata = metadata if isinstance(metadata, dict) else {}
+        
         # Generate reference if not provided
         if not reference:
             reference = generate_transaction_reference()
@@ -550,6 +553,10 @@ class WalletService:
         
         # Convert amount to minor units for Paystack
         amount_in_minor_unit = int(Decimal(amount) * 100)
+
+        # Extract IP and User-Agent from metadata (if present)
+        ip_address = metadata.get('ip_address') or None
+        user_agent = metadata.get('user_agent') or None
         
         # Create withdrawal transaction in PENDING status
         # This is created BEFORE the API call so webhooks can find it
@@ -561,7 +568,9 @@ class WalletService:
             description=reason,
             metadata=metadata or {},
             reference=reference,
-            recipient_bank_account=bank_account
+            recipient_bank_account=bank_account,
+            ip_address=ip_address, 
+            user_agent=user_agent
         )
         
         logger.info(
