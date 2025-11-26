@@ -34,10 +34,12 @@ from wallet.serializers.bank_account_serializer import (
     BankAccountSerializer,
     BankAccountDetailSerializer,
     BankAccountCreateSerializer,
+    
 )
 from wallet.serializers.settlement_serializer import (
     SettlementSerializer,
     SettlementDetailSerializer,
+    FinalizeSettlementSerializer,
 )
 
 __all__ = [
@@ -74,4 +76,6 @@ __all__ = [
     # Settlement Serializers
     'SettlementSerializer',
     'SettlementDetailSerializer',
+
+    'FinalizeSettlementSerializer',
 ]

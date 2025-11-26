@@ -469,6 +469,46 @@ class SettlementStatusSerializer(serializers.Serializer):
         
         return attrs
 
+class FinalizeSettlementSerializer(serializers.Serializer):
+    """
+    Serializer for finalizing a settlement with OTP
+    
+    Similar to FinalizeWithdrawalSerializer - validates OTP for settlement completion.
+    """
+    
+    otp = serializers.CharField(
+        required=True,
+        max_length=10,
+        help_text=_('One-Time Password received for settlement verification')
+    )
+    
+    def validate_otp(self, value):
+        """
+        Validate OTP format
+        
+        Args:
+            value: OTP string
+            
+        Returns:
+            str: Validated OTP (digits only)
+            
+        Raises:
+            ValidationError: If OTP is invalid
+        """
+        if not value or not value.strip():
+            raise serializers.ValidationError(
+                _("OTP cannot be empty")
+            )
+        
+        # Remove any spaces or special characters, keep only digits
+        otp = ''.join(filter(str.isdigit, value))
+        
+        if len(otp) < 4:
+            raise serializers.ValidationError(
+                _("OTP must be at least 4 digits")
+            )
+        
+        return otp
 
 # ==========================================
 # SETTLEMENT SCHEDULE SERIALIZERS

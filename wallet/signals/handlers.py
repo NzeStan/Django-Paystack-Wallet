@@ -77,7 +77,13 @@ def update_wallet_on_transaction_change(sender, instance, created, **kwargs):
 @receiver(post_save)
 def process_settlement_schedule(sender, instance, created, **kwargs):
     """
-    Process settlement schedule when a wallet balance changes
+    Process settlement schedules when wallet balance changes
+    
+    OPTIMIZED:
+    - Uses get_wallet_setting helper
+    - Proper select_related for QuerySet optimization
+    - Clean Celery vs sync logic separation
+    - Comprehensive error handling
     
     Args:
         sender: Wallet model
@@ -96,52 +102,102 @@ def process_settlement_schedule(sender, instance, created, **kwargs):
     
     # Skip if auto settlement is disabled
     if not get_wallet_setting('AUTO_SETTLEMENT'):
+        logger.debug(
+            f"Auto settlement disabled, skipping schedule processing for wallet {instance.id}"
+        )
         return
+    
+    logger.debug(
+        f"Checking threshold-based settlement schedules for wallet {instance.id}"
+    )
     
     # Process threshold-based settlement schedules
     try:
-        # Only process if we have Celery available
+        # Check if we should use Celery
         if get_wallet_setting('USE_CELERY'):
+            # ✅ Process asynchronously with Celery
             from wallet.tasks import process_wallet_settlement_schedules_task
+            
             process_wallet_settlement_schedules_task.delay(instance.pk)
+            
+            logger.debug(
+                f"Queued settlement schedule processing task for wallet {instance.pk}"
+            )
         else:
-            # Process synchronously
+            # ✅ Process synchronously with optimized queries
             from wallet.services.settlement_service import SettlementService
+            
             settlement_service = SettlementService()
             
-            # Find threshold schedules for this wallet
+            # Get SettlementSchedule model
             schedule_model = apps.get_model('wallet', 'SettlementSchedule')
+            
+            # ✅ OPTIMIZED: Use select_related to avoid N+1 queries
             schedules = schedule_model.objects.filter(
                 wallet=instance,
                 is_active=True,
                 schedule_type='threshold'
             ).exclude(
                 amount_threshold=None
-            ).select_related('bank_account')
+            ).select_related(
+                'wallet',
+                'wallet__user',
+                'bank_account',
+                'bank_account__bank'  # ✅ Include bank details
+            )
+            
+            logger.debug(
+                f"Found {schedules.count()} active threshold schedules "
+                f"for wallet {instance.id}"
+            )
             
             for schedule in schedules:
-                # Check if balance exceeds threshold
-                if instance.balance.amount >= schedule.amount_threshold.amount:
-                    amount = settlement_service._calculate_settlement_amount(schedule)
-                    
-                    if amount > 0:
-                        settlement_service.create_settlement(
-                            wallet=instance,
-                            bank_account=schedule.bank_account,
-                            amount=amount,
-                            reason="Automatic threshold-based settlement",
-                            metadata={
-                                'schedule_id': str(schedule.id),
-                                'schedule_type': 'threshold',
-                                'threshold': str(schedule.amount_threshold.amount)
-                            }
-                        )
+                try:
+                    # Check if balance exceeds threshold
+                    if instance.balance.amount >= schedule.amount_threshold.amount:
+                        # Calculate settlement amount
+                        amount = settlement_service._calculate_settlement_amount(schedule)
                         
-                        # Update last settlement date
-                        schedule.last_settlement = instance.updated_at
-                        schedule.save(update_fields=['last_settlement'])
+                        if amount > 0:
+                            logger.info(
+                                f"Creating threshold settlement for schedule {schedule.id}: "
+                                f"amount={amount}"
+                            )
+                            
+                            # Create settlement
+                            settlement_service.create_settlement(
+                                wallet=instance,
+                                bank_account=schedule.bank_account,
+                                amount=amount,
+                                reason="Automatic threshold-based settlement",
+                                metadata={
+                                    'schedule_id': str(schedule.id),
+                                    'schedule_type': 'threshold',
+                                    'threshold': str(schedule.amount_threshold.amount)
+                                }
+                            )
+                            
+                            # Update schedule last settlement time
+                            schedule.last_settlement = instance.updated_at
+                            schedule.save(update_fields=['last_settlement'])
+                            
+                            logger.info(
+                                f"Created settlement for schedule {schedule.id}"
+                            )
+                except Exception as e:
+                    logger.error(
+                        f"Error processing schedule {schedule.id}: {str(e)}",
+                        exc_info=True
+                    )
+                    # Continue with other schedules
+                    continue
+                    
     except Exception as e:
-        logger.error(f"Error processing settlement schedules for wallet {instance.pk}: {str(e)}")
+        logger.error(
+            f"Error processing settlement schedules for wallet {instance.pk}: {str(e)}",
+            exc_info=True
+        )
+
 
 
 @receiver(post_save)

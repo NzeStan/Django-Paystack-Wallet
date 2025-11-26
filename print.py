@@ -1,834 +1,1000 @@
 """
-Django Paystack Wallet - Wallet API Views
-Refactored with query optimization, comprehensive error handling, and clean architecture
+Django Paystack Wallet - Settlement Service
+Comprehensive business logic layer with atomic transactions and logging
 """
 import logging
-from typing import Any, Dict
-
-from rest_framework import viewsets, status, permissions
-from rest_framework.decorators import action
-from rest_framework.response import Response
-from rest_framework.request import Request
-from django.utils.translation import gettext_lazy as _
-from django.shortcuts import get_object_or_404
+from decimal import Decimal
+from typing import Optional, Dict, Any
 from django.db import transaction as db_transaction
-from django.db.models import Prefetch
+from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
+from django.core.exceptions import ObjectDoesNotExist
+from djmoney.money import Money
 
-from wallet.models import Wallet, Transaction
-from wallet.serializers.wallet_serializer import (
-    WalletSerializer,
-    WalletDetailSerializer,
-    WalletCreateUpdateSerializer,
-    WalletDepositSerializer,
-    WalletWithdrawSerializer,
-    WalletTransferSerializer,
-    FinalizeWithdrawalSerializer
+from wallet.models import (
+    Settlement,
+    SettlementSchedule,
+    Wallet,
+    BankAccount,
+    Transaction
 )
-from wallet.serializers.transaction_serializer import TransactionListSerializer
-from wallet.services.wallet_service import WalletService
-from wallet.services.transaction_service import TransactionService
-from wallet.utils.id_generators import generate_transaction_reference
+from wallet.constants import (
+    SETTLEMENT_STATUS_PENDING,
+    SETTLEMENT_STATUS_PROCESSING,
+    SETTLEMENT_STATUS_SUCCESS,
+    SETTLEMENT_STATUS_FAILED,
+    TRANSACTION_TYPE_WITHDRAWAL,
+    TRANSACTION_STATUS_SUCCESS,
+    TRANSACTION_STATUS_FAILED
+)
 from wallet.exceptions import (
-    WalletLocked,
+    SettlementError,
     InsufficientFunds,
     InvalidAmount,
-    BankAccountError,
-    PaystackAPIError
+    WalletLocked
 )
+from wallet.services.paystack_service import PaystackService
+from wallet.settings import get_wallet_setting
 
 
 logger = logging.getLogger(__name__)
 
 
-# ==========================================
-# CUSTOM PERMISSIONS
-# ==========================================
-
-class IsWalletOwner(permissions.BasePermission):
+class SettlementService:
     """
-    Permission to check if user is the wallet owner
+    Service for handling wallet settlements
     
-    Ensures that users can only access and modify their own wallets.
-    """
-    
-    message = _("You do not have permission to access this wallet")
-    
-    def has_object_permission(self, request: Request, view: Any, obj: Wallet) -> bool:
-        """
-        Check if user owns the wallet
-        
-        Args:
-            request (Request): HTTP request
-            view: View instance
-            obj (Wallet): Wallet object to check
-            
-        Returns:
-            bool: True if user owns wallet
-        """
-        return obj.user == request.user
-
-
-# ==========================================
-# UTILITY FUNCTIONS
-# ==========================================
-
-def get_client_ip(request: Request) -> str:
-    """
-    Extract client IP address from request
-    
-    Handles proxy headers and direct connections.
-    
-    Args:
-        request (Request): HTTP request
-        
-    Returns:
-        str: Client IP address
-    """
-    x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
-    if x_forwarded_for:
-        # Get first IP from list (client IP)
-        return x_forwarded_for.split(',')[0].strip()
-    return request.META.get('REMOTE_ADDR', '')
-
-
-def build_error_response(
-    message: str,
-    status_code: int = status.HTTP_400_BAD_REQUEST,
-    errors: Dict = None
-) -> Response:
-    """
-    Build a standardized error response
-    
-    Args:
-        message (str): Error message
-        status_code (int): HTTP status code
-        errors (dict, optional): Additional error details
-        
-    Returns:
-        Response: DRF Response object
-    """
-    response_data = {'detail': message}
-    if errors:
-        response_data['errors'] = errors
-    
-    return Response(response_data, status=status_code)
-
-
-# ==========================================
-# WALLET VIEWSET
-# ==========================================
-
-class WalletViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint for wallet operations
-    
-    Provides CRUD operations for wallets plus custom actions for
-    deposits, withdrawals, transfers, and account management.
-    
-    List/Retrieve: GET /api/wallets/
-    Create: POST /api/wallets/
-    Update: PUT/PATCH /api/wallets/{id}/
-    Delete: DELETE /api/wallets/{id}/
-    
-    Custom Actions:
-    - deposit: POST /api/wallets/{id}/deposit/
-    - withdraw: POST /api/wallets/{id}/withdraw/
-    - transfer: POST /api/wallets/{id}/transfer/
-    - balance: GET /api/wallets/{id}/balance/
-    - transactions: GET /api/wallets/{id}/transactions/
-    - dedicated_account: GET /api/wallets/{id}/dedicated_account/
+    This service provides comprehensive settlement management including:
+    - Settlement creation and processing
+    - Paystack integration
+    - Webhook processing
+    - Settlement schedules
+    - Settlement verification
     """
     
-    serializer_class = WalletSerializer
-    permission_classes = [permissions.IsAuthenticated, IsWalletOwner]
-    
-    def get_queryset(self):
-        """
-        Get wallets for the current user with optimized queries
-        
-        Returns:
-            QuerySet: Filtered and optimized wallet queryset
-        """
-        return Wallet.objects.filter(user=self.request.user).select_related('user')
-    
-    def get_serializer_class(self):
-        """
-        Return appropriate serializer based on action
-        
-        Returns:
-            Serializer class: Appropriate serializer for the action
-        """
-        action_serializers = {
-            'retrieve': WalletDetailSerializer,
-            'create': WalletCreateUpdateSerializer,
-            'update': WalletCreateUpdateSerializer,
-            'partial_update': WalletCreateUpdateSerializer,
-            'deposit': WalletDepositSerializer,
-            'withdraw': WalletWithdrawSerializer,
-            'transfer': WalletTransferSerializer,
-        }
-        
-        return action_serializers.get(self.action, self.serializer_class)
-    
-    def get_object(self):
-        """
-        Get wallet object with special handling for 'default' pk
-        
-        Returns:
-            Wallet: Wallet instance
-        """
-        pk = self.kwargs.get('pk')
-        
-        # Handle 'default' as special keyword for user's wallet
-        if pk == 'default':
-            try:
-                wallet = Wallet.objects.select_related('user').get(user=self.request.user)
-                self.check_object_permissions(self.request, wallet)
-                return wallet
-            except Wallet.DoesNotExist:
-                # Create wallet if it doesn't exist
-                wallet_service = WalletService()
-                wallet = wallet_service.get_wallet(self.request.user)
-                self.check_object_permissions(self.request, wallet)
-                return wallet
-        
-        # Standard object retrieval
-        return super().get_object()
+    def __init__(self):
+        """Initialize settlement service with Paystack integration"""
+        self.paystack = PaystackService()
+        logger.debug("SettlementService initialized")
     
     # ==========================================
-    # CRUD OPERATIONS
+    # SETTLEMENT RETRIEVAL
     # ==========================================
     
-    def create(self, request: Request, *args, **kwargs) -> Response:
+    def get_settlement(self, settlement_id: str) -> Settlement:
         """
-        Create a new wallet for the user
+        Get a settlement by ID
         
         Args:
-            request (Request): HTTP request
+            settlement_id: Settlement ID
             
         Returns:
-            Response: Created wallet data
+            Settlement: Settlement object
+            
+        Raises:
+            ObjectDoesNotExist: If settlement not found
         """
-        # Check if user already has a wallet
-        if Wallet.objects.filter(user=request.user).exists():
-            logger.warning(f"User {request.user.id} attempted to create duplicate wallet")
-            return build_error_response(
-                _("User already has a wallet"),
-                status.HTTP_400_BAD_REQUEST
-            )
-        
         try:
-            # Create wallet using service
-            wallet_service = WalletService()
-            wallet = wallet_service.get_wallet(request.user)
-            
-            # Update wallet with provided data
-            serializer = self.get_serializer(wallet, data=request.data, partial=True)
-            serializer.is_valid(raise_exception=True)
-            serializer.save()
-            
-            logger.info(f"Created wallet {wallet.id} for user {request.user.id}")
-            
-            # Return detailed wallet info
-            return Response(
-                WalletDetailSerializer(wallet).data,
-                status=status.HTTP_201_CREATED
-            )
-        
-        except Exception as e:
-            logger.error(
-                f"Error creating wallet for user {request.user.id}: {str(e)}",
-                exc_info=True
-            )
-            return build_error_response(
-                _("Failed to create wallet. Please try again."),
-                status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            settlement = Settlement.objects.with_full_details().get(id=settlement_id)
+            logger.debug(f"Retrieved settlement {settlement_id}")
+            return settlement
+        except ObjectDoesNotExist:
+            logger.error(f"Settlement {settlement_id} not found")
+            raise
     
-    # ==========================================
-    # DEPOSIT ACTION
-    # ==========================================
-    
-    @action(detail=True, methods=['post'])
-    def deposit(self, request: Request, pk=None) -> Response:
+    def get_settlement_by_reference(self, reference: str) -> Settlement:
         """
-        Initialize a deposit to the wallet
-        
-        This creates a Paystack charge transaction and returns
-        the authorization URL for completing the payment.
-        
-        POST /api/wallets/{id}/deposit/
-        
-        Request Body:
-        {
-            "amount": 1000.00,
-            "email": "user@example.com",  # Optional
-            "callback_url": "https://...",  # Optional
-            "description": "Wallet top-up",  # Optional
-            "reference": "REF123",  # Optional
-            "metadata": {}  # Optional
-        }
+        Get a settlement by reference
         
         Args:
-            request (Request): HTTP request
-            pk: Wallet primary key
+            reference: Settlement reference
             
         Returns:
-            Response: Charge initialization data with authorization URL
+            Settlement: Settlement object
+            
+        Raises:
+            ObjectDoesNotExist: If settlement not found
         """
-        wallet = self.get_object()
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        
-        wallet_service = WalletService()
-        
         try:
-            # Extract validated data
-            amount = serializer.validated_data['amount']
-            email = serializer.validated_data.get('email') or request.user.email
-            callback_url = serializer.validated_data.get('callback_url', '')
-            reference = serializer.validated_data.get('reference') or generate_transaction_reference()
-            description = serializer.validated_data.get('description', 'Card deposit to wallet')
-            
-            # Prepare metadata
-            metadata = serializer.validated_data.get('metadata') or {}
-            if not isinstance(metadata, dict):
-                metadata = {}
-            else:
-                metadata = metadata.copy()
-            
-            # Add request context to metadata
-            metadata.update({
-                'ip_address': get_client_ip(request),
-                'user_agent': request.META.get('HTTP_USER_AGENT', ''),
-                'description': description,
-            })
-            
-            logger.info(
-                f"Initializing deposit for wallet {wallet.id}: "
-                f"amount={amount}, reference={reference}"
-            )
-            
-            # Initialize Paystack transaction
-            charge_data = wallet_service.initialize_card_charge(
-                wallet=wallet,
-                amount=amount,
-                email=email,
-                reference=reference,
-                callback_url=callback_url,
-                metadata=metadata
-            )
-            
-            logger.info(
-                f"Deposit initialized for wallet {wallet.id}: "
-                f"reference={reference}, access_code={charge_data.get('access_code')}"
-            )
-            
-            return Response(charge_data, status=status.HTTP_200_OK)
-        
-        except PaystackAPIError as e:
-            logger.error(
-                f"Paystack API error during deposit initialization for wallet {wallet.id}: {str(e)}",
-                exc_info=True
-            )
-            return build_error_response(
-                _("Payment gateway error. Please try again."),
-                status.HTTP_502_BAD_GATEWAY
-            )
-        
-        except Exception as e:
-            logger.error(
-                f"Error initializing deposit for wallet {wallet.id}: {str(e)}",
-                exc_info=True
-            )
-            return build_error_response(
-                _("Failed to initialize deposit. Please try again."),
-                status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            settlement = Settlement.objects.with_full_details().by_reference(reference)
+            logger.debug(f"Retrieved settlement by reference: {reference}")
+            return settlement
+        except ObjectDoesNotExist:
+            logger.error(f"Settlement with reference {reference} not found")
+            raise
     
-    # ==========================================
-    # WITHDRAWAL ACTION
-    # ==========================================
-    
-    @action(detail=True, methods=['post'])
-    def withdraw(self, request: Request, pk=None) -> Response:
+    def list_settlements(
+        self,
+        wallet: Optional[Wallet] = None,
+        status: Optional[str] = None,
+        start_date: Optional[Any] = None,
+        end_date: Optional[Any] = None,
+        min_amount: Optional[Decimal] = None,
+        max_amount: Optional[Decimal] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None
+    ):
         """
-        Withdraw funds from wallet to a bank account
-        
-        POST /api/wallets/{id}/withdraw/
-        
-        Request Body:
-        {
-            "amount": 5000.00,
-            "bank_account_id": "uuid-here",
-            "description": "Withdrawal",  # Optional
-            "reference": "REF123",  # Optional
-            "metadata": {}  # Optional
-        }
+        List settlements with optional filtering
         
         Args:
-            request (Request): HTTP request
-            pk: Wallet primary key
+            wallet: Filter by wallet (optional)
+            status: Filter by status (optional)
+            start_date: Filter by start date (optional)
+            end_date: Filter by end date (optional)
+            min_amount: Filter by minimum amount (optional)
+            max_amount: Filter by maximum amount (optional)
+            limit: Limit number of results (optional)
+            offset: Offset for pagination (optional)
             
         Returns:
-            Response: Transaction data and transfer information
+            QuerySet: Filtered settlements
         """
-        wallet = self.get_object()
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+        queryset = Settlement.objects.with_full_details()
         
-        wallet_service = WalletService()
+        if wallet:
+            queryset = queryset.by_wallet(wallet)
+            logger.debug(f"Filtering settlements for wallet {wallet.id}")
         
-        try:
-            # Extract validated data
-            amount = serializer.validated_data['amount']
-            bank_account_id = serializer.validated_data['bank_account_id']
-            description = serializer.validated_data.get('description', 'Withdrawal to bank account')
-            reference = serializer.validated_data.get('reference')
-            metadata = serializer.validated_data.get('metadata') or {}
+        if status:
+            queryset = queryset.filter(status=status)
+            logger.debug(f"Filtering settlements by status: {status}")
+        
+        if start_date or end_date:
+            queryset = queryset.in_date_range(start_date, end_date)
+            logger.debug(f"Filtering settlements by date range: {start_date} to {end_date}")
+        
+        if min_amount is not None or max_amount is not None:
+            queryset = queryset.by_amount_range(min_amount, max_amount)
+            logger.debug(f"Filtering settlements by amount range: {min_amount} to {max_amount}")
+        
+        # Order by most recent first
+        queryset = queryset.order_by('-created_at')
+        
+        # Apply pagination
+        if offset is not None:
+            queryset = queryset[offset:]
+        if limit is not None:
+            queryset = queryset[:limit]
+        
+        return queryset
+    
+    # ==========================================
+    # SETTLEMENT CREATION
+    # ==========================================
+    
+    @db_transaction.atomic
+    def create_settlement(
+        self,
+        wallet: Wallet,
+        bank_account: BankAccount,
+        amount: Money,
+        reason: Optional[str] = None,
+        metadata: Optional[Dict] = None,
+        auto_process: bool = True
+    ) -> Settlement:
+        """
+        Create a new settlement
+        
+        Args:
+            wallet: Wallet to settle from
+            bank_account: Bank account to settle to
+            amount: Amount to settle (Money object)
+            reason: Reason for settlement (optional)
+            metadata: Additional metadata (optional)
+            auto_process: Automatically process the settlement (default: True)
             
-            # Add request context to metadata
-            if isinstance(metadata, dict):
-                metadata = metadata.copy()
-                metadata.update({
-                    'ip_address': get_client_ip(request),
-                    'user_agent': request.META.get('HTTP_USER_AGENT', ''),
-                })
+        Returns:
+            Settlement: Created settlement object
             
-            logger.info(
-                f"Initiating withdrawal for wallet {wallet.id}: "
-                f"amount={amount}, bank_account={bank_account_id}"
+        Raises:
+            WalletLocked: If wallet is locked
+            InsufficientFunds: If wallet has insufficient funds
+            InvalidAmount: If amount is invalid
+            SettlementError: If settlement creation fails
+        """
+        logger.info(
+            f"Creating settlement: wallet={wallet.id}, "
+            f"bank_account={bank_account.id}, amount={amount}"
+        )
+        
+        # Validate wallet is not locked
+        if wallet.is_locked:
+            logger.error(f"Wallet {wallet.id} is locked")
+            raise WalletLocked(wallet)
+        
+        # Validate amount is positive
+        if amount.amount <= 0:
+            logger.error(f"Invalid amount: {amount}")
+            raise InvalidAmount(_("Amount must be greater than zero"))
+        
+        # Validate sufficient funds
+        if wallet.balance.amount < amount.amount:
+            logger.error(
+                f"Insufficient funds in wallet {wallet.id}: "
+                f"balance={wallet.balance.amount}, required={amount.amount}"
             )
-            
-            # Get bank account
-            from wallet.models import BankAccount
-            bank_account = get_object_or_404(
-                BankAccount.objects.select_related('bank'),
-                id=bank_account_id,
-                wallet=wallet,
-                is_active=True
+            raise InsufficientFunds(wallet, amount.amount)
+        
+        # Validate minimum balance requirement
+        minimum_balance = Money(
+            get_wallet_setting('MINIMUM_BALANCE'),
+            wallet.balance.currency
+        )
+        
+        if wallet.balance.amount - amount.amount < minimum_balance.amount:
+            logger.error(
+                f"Settlement would leave wallet {wallet.id} below minimum balance"
             )
-            
-            # Process withdrawal
-            transaction, transfer_data = wallet_service.withdraw_to_bank(
-                wallet=wallet,
-                amount=amount,
-                bank_account=bank_account,
-                reason=description,
-                metadata=metadata,
-                reference=reference
-            )
-            
-            logger.info(
-                f"Withdrawal initiated for wallet {wallet.id}: "
-                f"transaction={transaction.id}, transfer_code={transfer_data.get('transfer_code')}"
-            )
-            
-            # Prepare response
-            from wallet.serializers.transaction_serializer import TransactionSerializer
-            response_data = {
-                'transaction': TransactionSerializer(transaction).data,
-                'transfer': {
-                    'transfer_code': transfer_data.get('transfer_code'),
-                    'status': transfer_data.get('status'),
-                    'requires_otp': transfer_data.get('requires_otp', False),
+            raise SettlementError(
+                _("Settlement would leave wallet below minimum balance of %(min)s") % {
+                    'min': minimum_balance
                 }
-            }
-            
-            return Response(response_data, status=status.HTTP_200_OK)
-        
-        except BankAccountError as e:
-            logger.warning(
-                f"Bank account error during withdrawal for wallet {wallet.id}: {str(e)}"
-            )
-            return build_error_response(str(e), status.HTTP_400_BAD_REQUEST)
-        
-        except InsufficientFunds as e:
-            logger.warning(
-                f"Insufficient funds for withdrawal from wallet {wallet.id}: {str(e)}"
-            )
-            return build_error_response(str(e), status.HTTP_400_BAD_REQUEST)
-        
-        except WalletLocked as e:
-            logger.warning(
-                f"Wallet {wallet.id} is locked, withdrawal denied"
-            )
-            return build_error_response(str(e), status.HTTP_403_FORBIDDEN)
-        
-        except PaystackAPIError as e:
-            logger.error(
-                f"Paystack API error during withdrawal for wallet {wallet.id}: {str(e)}",
-                exc_info=True
-            )
-            return build_error_response(
-                _("Payment gateway error. Please try again."),
-                status.HTTP_502_BAD_GATEWAY
             )
         
-        except Exception as e:
-            logger.error(
-                f"Error processing withdrawal for wallet {wallet.id}: {str(e)}",
-                exc_info=True
-            )
-            return build_error_response(
-                _("Failed to process withdrawal. Please try again."),
-                status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-    
-    # ==========================================
-    # TRANSFER ACTION
-    # ==========================================
-    
-    @action(detail=True, methods=['post'])
-    def transfer(self, request: Request, pk=None) -> Response:
-        """
-        Transfer funds to another wallet
+        # Generate reference
+        from wallet.utils.id_generators import generate_settlement_reference
+        reference = generate_settlement_reference()
         
-        POST /api/wallets/{id}/transfer/
-        
-        Request Body:
-        {
-            "amount": 1000.00,
-            "destination_wallet_id": "uuid-here",
-            "description": "Payment",  # Optional
-            "reference": "REF123",  # Optional
-            "metadata": {}  # Optional
-        }
-        
-        Args:
-            request (Request): HTTP request
-            pk: Wallet primary key
-            
-        Returns:
-            Response: Transaction data
-        """
-        source_wallet = self.get_object()
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+        logger.debug(f"Generated settlement reference: {reference}")
         
         try:
-            # Extract validated data
-            amount = serializer.validated_data['amount']
-            destination_wallet_id = serializer.validated_data['destination_wallet_id']
-            description = serializer.validated_data.get('description', 'Wallet transfer')
-            reference = serializer.validated_data.get('reference')
-            metadata = serializer.validated_data.get('metadata') or {}
+            # Deduct amount from wallet first
+            wallet.withdraw(amount.amount)
+            logger.info(f"Deducted {amount} from wallet {wallet.id}")
             
-            # Validate amount
-            if amount <= 0:
-                logger.warning(
-                    f"Invalid transfer amount {amount} for wallet {source_wallet.id}"
-                )
-                return build_error_response(
-                    _("Transfer amount must be greater than zero"),
-                    status.HTTP_400_BAD_REQUEST
-                )
-            
-            # Check for self-transfer
-            if str(destination_wallet_id) == str(source_wallet.id):
-                logger.warning(
-                    f"Self-transfer attempted for wallet {source_wallet.id}"
-                )
-                return build_error_response(
-                    _("Cannot transfer to the same wallet"),
-                    status.HTTP_400_BAD_REQUEST
-                )
-            
-            logger.info(
-                f"Initiating transfer from wallet {source_wallet.id}: "
-                f"amount={amount}, destination={destination_wallet_id}"
-            )
-            
-            # Get destination wallet
-            destination_wallet = get_object_or_404(
-                Wallet.objects.select_related('user'),
-                id=destination_wallet_id,
-                is_active=True
-            )
-            
-            # Add request context to metadata
-            if isinstance(metadata, dict):
-                metadata = metadata.copy()
-                metadata.update({
-                    'ip_address': get_client_ip(request),
-                    'user_agent': request.META.get('HTTP_USER_AGENT', ''),
-                })
-            
-            # Process transfer using transaction service
-            transaction_service = TransactionService()
-            transaction = transaction_service.transfer_between_wallets(
-                source_wallet=source_wallet,
-                destination_wallet=destination_wallet,
+            # Create settlement record
+            settlement = Settlement.objects.create(
+                wallet=wallet,
+                bank_account=bank_account,
                 amount=amount,
-                description=description,
-                metadata=metadata,
-                reference=reference
+                status=SETTLEMENT_STATUS_PENDING,
+                reference=reference,
+                reason=reason or _("Settlement to bank account"),
+                metadata=metadata or {}
+            )
+            
+            logger.info(f"Created settlement {settlement.id} with reference {reference}")
+            
+            # Create transaction for the settlement
+            transaction_obj = Transaction.objects.create(
+                wallet=wallet,
+                amount=amount,
+                transaction_type=TRANSACTION_TYPE_WITHDRAWAL,
+                status=TRANSACTION_STATUS_SUCCESS,
+                description=reason or _("Settlement to bank account"),
+                reference=f"STL-{settlement.reference}",
+                recipient_bank_account=bank_account,
+                metadata={
+                    'settlement_id': str(settlement.id),
+                    'settlement_reference': settlement.reference
+                }
             )
             
             logger.info(
-                f"Transfer completed: transaction={transaction.id}, "
-                f"from={source_wallet.id}, to={destination_wallet.id}"
+                f"Created transaction {transaction_obj.id} for settlement {settlement.id}"
             )
             
-            # Return transaction data
-            from wallet.serializers.transaction_serializer import TransactionSerializer
-            return Response(
-                TransactionSerializer(transaction).data,
-                status=status.HTTP_200_OK
-            )
-        
-        except InsufficientFunds as e:
-            logger.warning(
-                f"Insufficient funds for transfer from wallet {source_wallet.id}: {str(e)}"
-            )
-            return build_error_response(str(e), status.HTTP_400_BAD_REQUEST)
-        
-        except WalletLocked as e:
-            logger.warning(
-                f"Wallet locked during transfer attempt: {str(e)}"
-            )
-            return build_error_response(str(e), status.HTTP_403_FORBIDDEN)
-        
-        except Wallet.DoesNotExist:
-            logger.warning(
-                f"Invalid destination wallet for transfer from {source_wallet.id}"
-            )
-            return build_error_response(
-                _("Invalid or inactive destination wallet"),
-                status.HTTP_400_BAD_REQUEST
-            )
-        
+            # Link transaction to settlement
+            settlement.transaction = transaction_obj
+            settlement.save(update_fields=['transaction'])
+            
+            # Process the settlement if auto_process is True
+            if auto_process:
+                logger.debug(f"Auto-processing settlement {settlement.id}")
+                self.process_settlement(settlement)
+            
+            return settlement
+            
         except Exception as e:
             logger.error(
-                f"Error processing transfer from wallet {source_wallet.id}: {str(e)}",
+                f"Error creating settlement: {str(e)}",
                 exc_info=True
             )
-            return build_error_response(
-                _("Failed to process transfer. Please try again."),
-                status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            
+            # Refund wallet if settlement creation failed
+            try:
+                wallet.deposit(amount.amount)
+                logger.info(f"Refunded {amount} to wallet {wallet.id} after failed settlement")
+            except Exception as refund_error:
+                logger.error(
+                    f"Error refunding wallet after failed settlement: {str(refund_error)}",
+                    exc_info=True
+                )
+            
+            raise SettlementError(str(e)) from e
     
     # ==========================================
-    # BALANCE ACTION
+    # SETTLEMENT PROCESSING
     # ==========================================
     
-    @action(detail=True, methods=['get'])
-    def balance(self, request: Request, pk=None) -> Response:
+    @db_transaction.atomic
+    def process_settlement(self, settlement: Settlement) -> Settlement:
         """
-        Get current wallet balance
-        
-        GET /api/wallets/{id}/balance/
+        Process a pending settlement
         
         Args:
-            request (Request): HTTP request
-            pk: Wallet primary key
+            settlement: Settlement to process
             
         Returns:
-            Response: Balance information
+            Settlement: Updated settlement
+            
+        Raises:
+            SettlementError: If settlement processing fails
         """
-        wallet = self.get_object()
-        wallet_service = WalletService()
+        logger.info(f"Processing settlement {settlement.id}")
+        
+        # Verify settlement is in pending status
+        if settlement.status != SETTLEMENT_STATUS_PENDING:
+            logger.warning(
+                f"Settlement {settlement.id} is not pending (status: {settlement.status})"
+            )
+            raise SettlementError(
+                _("Only pending settlements can be processed")
+            )
+        
+        # Mark as processing
+        settlement.mark_as_processing()
+        logger.info(f"Settlement {settlement.id} marked as processing")
         
         try:
-            # Get current balance
-            balance = wallet_service.get_balance(wallet)
-            
-            logger.debug(f"Balance retrieved for wallet {wallet.id}: {balance}")
-            
-            response_data = {
-                'balance_amount': balance.amount,
-                'balance_currency': balance.currency.code,
-                'available_balance': balance.amount,
-                'is_operational': wallet.is_operational,
-                'last_updated': wallet.updated_at,
-            }
-            
-            return Response(response_data, status=status.HTTP_200_OK)
-        
-        except Exception as e:
-            logger.error(
-                f"Error retrieving balance for wallet {wallet.id}: {str(e)}",
-                exc_info=True
-            )
-            return build_error_response(
-                _("Failed to retrieve balance"),
-                status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-    
-    # ==========================================
-    # TRANSACTIONS ACTION
-    # ==========================================
-    
-    @action(detail=True, methods=['get'])
-    def transactions(self, request: Request, pk=None) -> Response:
-        """
-        Get wallet transaction history
-        
-        GET /api/wallets/{id}/transactions/?limit=20&offset=0
-        
-        Query Parameters:
-        - limit: Number of transactions to return (default: 20)
-        - offset: Offset for pagination (default: 0)
-        
-        Args:
-            request (Request): HTTP request
-            pk: Wallet primary key
-            
-        Returns:
-            Response: Paginated transaction list
-        """
-        wallet = self.get_object()
-        
-        try:
-            # Get pagination parameters
-            limit = int(request.query_params.get('limit', 20))
-            offset = int(request.query_params.get('offset', 0))
-            
-            # Validate pagination parameters
-            limit = min(max(1, limit), 100)  # Between 1 and 100
-            offset = max(0, offset)  # Non-negative
+            # Convert amount to kobo/cents (Paystack uses minor currency units)
+            amount_in_minor_unit = int(settlement.amount.amount * 100)
             
             logger.debug(
-                f"Fetching transactions for wallet {wallet.id}: "
-                f"limit={limit}, offset={offset}"
+                f"Initiating Paystack transfer: amount={amount_in_minor_unit}, "
+                f"recipient={settlement.bank_account.paystack_recipient_code}"
             )
             
-            # Get transactions with optimized query
-            transactions = Transaction.objects.filter(
-                wallet=wallet
-            ).select_related(
-                'recipient_wallet__user',
-                'recipient_bank_account__bank',
-                'card'
-            ).order_by('-created_at')[offset:offset + limit]
-            
-            # Get total count
-            total_count = Transaction.objects.filter(wallet=wallet).count()
-            
-            # Serialize transactions
-            transaction_data = TransactionListSerializer(transactions, many=True).data
-            
-            # Prepare pagination info
-            next_offset = offset + limit if offset + limit < total_count else None
-            previous_offset = offset - limit if offset > 0 else None
-            
-            response_data = {
-                'count': total_count,
-                'next': next_offset,
-                'previous': previous_offset,
-                'results': transaction_data
-            }
+            # Create bank transfer using Paystack
+            transfer_data = self.paystack.initiate_transfer(
+                amount=amount_in_minor_unit,
+                recipient_code=settlement.bank_account.paystack_recipient_code,
+                reference=settlement.reference,
+                reason=settlement.reason or _("Settlement to bank account")
+            )
             
             logger.info(
-                f"Retrieved {len(transaction_data)} transactions for wallet {wallet.id}"
+                f"Paystack transfer initiated for settlement {settlement.id}: "
+                f"transfer_code={transfer_data.get('transfer_code')}"
             )
             
-            return Response(response_data, status=status.HTTP_200_OK)
-        
-        except ValueError as e:
-            logger.warning(
-                f"Invalid pagination parameters for wallet {wallet.id}: {str(e)}"
-            )
-            return build_error_response(
-                _("Invalid pagination parameters"),
-                status.HTTP_400_BAD_REQUEST
-            )
-        
+            # Update settlement with Paystack data
+            settlement.paystack_transfer_code = transfer_data.get('transfer_code')
+            settlement.paystack_transfer_data = transfer_data
+            
+            # Update status based on Paystack response
+            paystack_status = transfer_data.get('status')
+            
+            if paystack_status == 'success':
+                settlement.mark_as_success(transfer_data)
+                logger.info(f"Settlement {settlement.id} marked as successful")
+            else:
+                # Still pending, will be updated by webhook
+                settlement.status = SETTLEMENT_STATUS_PENDING
+                settlement.save(update_fields=['paystack_transfer_code', 'paystack_transfer_data', 'status'])
+                logger.info(
+                    f"Settlement {settlement.id} pending Paystack confirmation"
+                )
+            
+            return settlement
+            
         except Exception as e:
             logger.error(
-                f"Error fetching transactions for wallet {wallet.id}: {str(e)}",
+                f"Error processing settlement {settlement.id}: {str(e)}",
                 exc_info=True
             )
-            return build_error_response(
-                _("Failed to retrieve transactions"),
-                status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            
+            # Mark settlement as failed
+            settlement.mark_as_failed(str(e))
+            
+            # Refund wallet
+            try:
+                settlement.wallet.deposit(settlement.amount.amount)
+                logger.info(
+                    f"Refunded {settlement.amount} to wallet {settlement.wallet.id} "
+                    f"after failed settlement"
+                )
+            except Exception as refund_error:
+                logger.error(
+                    f"Error refunding wallet after failed settlement: {str(refund_error)}",
+                    exc_info=True
+                )
+            
+            # Re-raise with more context
+            raise SettlementError(
+                f"Settlement processing failed: {str(e)}",
+                settlement.reference
+            ) from e
     
     # ==========================================
-    # DEDICATED ACCOUNT ACTION
+    # SETTLEMENT VERIFICATION
     # ==========================================
     
-    @action(detail=True, methods=['get'])
-    def dedicated_account(self, request: Request, pk=None) -> Response:
+    def verify_settlement(self, settlement: Settlement) -> Settlement:
         """
-        Get or create dedicated virtual account
-        
-        GET /api/wallets/{id}/dedicated_account/
+        Verify a settlement's status with Paystack
         
         Args:
-            request (Request): HTTP request
-            pk: Wallet primary key
+            settlement: Settlement to verify
             
         Returns:
-            Response: Dedicated account details
+            Settlement: Updated settlement
+            
+        Raises:
+            SettlementError: If settlement doesn't have transfer code
         """
-        wallet = self.get_object()
-        wallet_service = WalletService()
+        logger.info(f"Verifying settlement {settlement.id}")
+        
+        if not settlement.paystack_transfer_code:
+            logger.error(
+                f"Settlement {settlement.id} does not have a Paystack transfer code"
+            )
+            raise SettlementError(
+                _("Settlement does not have a Paystack transfer code")
+            )
         
         try:
-            logger.info(f"Dedicated account requested for wallet {wallet.id}")
+            # Get settlement status from Paystack
+            transfer_data = self.paystack.verify_transfer(settlement.reference)
             
-            # Check if wallet already has a dedicated account
-            if wallet.dedicated_account_number:
-                logger.info(
-                    f"Existing dedicated account found for wallet {wallet.id}: "
-                    f"{wallet.dedicated_account_number}"
-                )
-                
-                # Get account name
-                if hasattr(wallet.user, 'get_full_name'):
-                    account_name = wallet.user.get_full_name()
-                else:
-                    account_name = str(wallet.user)
-                
-                response_data = {
-                    'account_number': wallet.dedicated_account_number,
-                    'bank_name': wallet.dedicated_account_bank or 'N/A',
-                    'account_name': account_name
-                }
-                
-                return Response(response_data, status=status.HTTP_200_OK)
-            
-            # Create dedicated account
-            logger.info(f"Creating new dedicated account for wallet {wallet.id}")
-            
-            success = wallet_service.create_dedicated_account(wallet)
-            
-            if success:
-                logger.info(
-                    f"Dedicated account created successfully for wallet {wallet.id}"
-                )
-                
-                # Refresh wallet to get updated account details
-                wallet.refresh_from_db()
-                
-                # Get account name
-                if hasattr(wallet.user, 'get_full_name'):
-                    account_name = wallet.user.get_full_name()
-                else:
-                    account_name = str(wallet.user)
-                
-                response_data = {
-                    'account_number': wallet.dedicated_account_number,
-                    'bank_name': wallet.dedicated_account_bank or 'N/A',
-                    'account_name': account_name
-                }
-                
-                return Response(response_data, status=status.HTTP_201_CREATED)
-            
-            # Failed to create account
-            logger.error(f"Failed to create dedicated account for wallet {wallet.id}")
-            return build_error_response(
-                _("Failed to create dedicated account. Please try again later."),
-                status.HTTP_502_BAD_GATEWAY
+            logger.debug(
+                f"Paystack verification response for settlement {settlement.id}: "
+                f"status={transfer_data.get('status')}"
             )
-        
+            
+            # Update settlement with latest data
+            settlement.paystack_transfer_data = transfer_data
+            
+            # Update status based on Paystack status
+            paystack_status = transfer_data.get('status')
+            
+            if paystack_status == 'success':
+                settlement.mark_as_success(transfer_data)
+                logger.info(f"Settlement {settlement.id} verified as successful")
+            elif paystack_status == 'failed':
+                settlement.mark_as_failed(
+                    transfer_data.get('reason'),
+                    transfer_data
+                )
+                logger.warning(
+                    f"Settlement {settlement.id} verified as failed: "
+                    f"{transfer_data.get('reason')}"
+                )
+            else:
+                settlement.save(update_fields=['paystack_transfer_data'])
+                logger.info(
+                    f"Settlement {settlement.id} still in status: {paystack_status}"
+                )
+            
+            return settlement
+            
         except Exception as e:
             logger.error(
-                f"Error processing dedicated account for wallet {wallet.id}: {str(e)}",
+                f"Error verifying settlement {settlement.id}: {str(e)}",
                 exc_info=True
             )
-            return build_error_response(
-                _("An unexpected error occurred. Please try again later."),
-                status.HTTP_500_INTERNAL_SERVER_ERROR
+            # Don't change settlement status based on verification error
+            return settlement
+    
+    # ==========================================
+    # SETTLEMENT RETRY
+    # ==========================================
+    
+    @db_transaction.atomic
+    def retry_settlement(self, settlement: Settlement) -> Settlement:
+        """
+        Retry a failed settlement
+        
+        Args:
+            settlement: Settlement to retry
+            
+        Returns:
+            Settlement: Updated settlement
+            
+        Raises:
+            SettlementError: If settlement cannot be retried
+        """
+        logger.info(f"Retrying settlement {settlement.id}")
+        
+        # Verify settlement is in failed status
+        if settlement.status != SETTLEMENT_STATUS_FAILED:
+            logger.warning(
+                f"Settlement {settlement.id} is not failed (status: {settlement.status})"
             )
+            raise SettlementError(
+                _("Only failed settlements can be retried")
+            )
+        
+        # Check if wallet has sufficient funds (in case it was refunded)
+        if settlement.wallet.balance.amount < settlement.amount.amount:
+            logger.error(
+                f"Insufficient funds in wallet {settlement.wallet.id} for retry"
+            )
+            raise InsufficientFunds(settlement.wallet, settlement.amount.amount)
+        
+        # Reset settlement status to pending
+        settlement.status = SETTLEMENT_STATUS_PENDING
+        settlement.failure_reason = None
+        settlement.save(update_fields=['status', 'failure_reason'])
+        
+        logger.info(f"Settlement {settlement.id} reset to pending status")
+        
+        # Process the settlement again
+        return self.process_settlement(settlement)
+    
+    # ==========================================
+    # WEBHOOK PROCESSING
+    # ==========================================
+    
+    def process_paystack_webhook(self, event_type: str, data: Dict) -> bool:
+        """
+        Process a Paystack webhook event related to settlements
+        
+        Args:
+            event_type: Webhook event type
+            data: Webhook event data
+            
+        Returns:
+            bool: True if processed successfully
+        """
+        logger.info(f"Processing webhook event: {event_type}")
+        
+        # Handle transfer.success event
+        if event_type == 'transfer.success':
+            return self._process_transfer_success(data)
+        
+        # Handle transfer.failed event
+        elif event_type == 'transfer.failed':
+            return self._process_transfer_failed(data)
+        
+        # Handle transfer.reversed event
+        elif event_type == 'transfer.reversed':
+            return self._process_transfer_reversed(data)
+        
+        # Not a relevant event
+        logger.debug(f"Event type {event_type} not relevant to settlements")
+        return False
+    
+    @db_transaction.atomic
+    def _process_transfer_success(self, data: Dict) -> bool:
+        """
+        Process transfer.success webhook event for settlements
+        
+        Args:
+            data: Webhook event data
+            
+        Returns:
+            bool: True if processed successfully
+        """
+        reference = data.get('reference')
+        transfer_code = data.get('transfer_code')
+        
+        logger.info(
+            f"Processing transfer.success: reference={reference}, "
+            f"transfer_code={transfer_code}"
+        )
+        
+        # Find settlement by reference or transfer code
+        settlement = None
+        
+        try:
+            if reference:
+                settlement = Settlement.objects.filter(reference=reference).first()
+            
+            if not settlement and transfer_code:
+                settlement = Settlement.objects.filter(
+                    paystack_transfer_code=transfer_code
+                ).first()
+        except Exception as e:
+            logger.error(f"Error finding settlement: {str(e)}", exc_info=True)
+            return False
+        
+        if settlement:
+            logger.info(f"Found settlement {settlement.id} for successful transfer")
+            
+            # Update settlement status
+            settlement.mark_as_success(data)
+            
+            logger.info(f"Settlement {settlement.id} marked as successful via webhook")
+            return True
+        else:
+            logger.warning(
+                f"No settlement found for reference={reference}, "
+                f"transfer_code={transfer_code}"
+            )
+        
+        return False
+    
+    @db_transaction.atomic
+    def _process_transfer_failed(self, data: Dict) -> bool:
+        """
+        Process transfer.failed webhook event for settlements
+        
+        Args:
+            data: Webhook event data
+            
+        Returns:
+            bool: True if processed successfully
+        """
+        reference = data.get('reference')
+        transfer_code = data.get('transfer_code')
+        reason = data.get('reason', _("Transfer failed"))
+        
+        logger.info(
+            f"Processing transfer.failed: reference={reference}, "
+            f"transfer_code={transfer_code}, reason={reason}"
+        )
+        
+        # Find settlement by reference or transfer code
+        settlement = None
+        
+        try:
+            if reference:
+                settlement = Settlement.objects.filter(reference=reference).first()
+            
+            if not settlement and transfer_code:
+                settlement = Settlement.objects.filter(
+                    paystack_transfer_code=transfer_code
+                ).first()
+        except Exception as e:
+            logger.error(f"Error finding settlement: {str(e)}", exc_info=True)
+            return False
+        
+        if settlement:
+            logger.info(f"Found settlement {settlement.id} for failed transfer")
+            
+            # Update settlement status
+            settlement.mark_as_failed(reason, data)
+            
+            # Refund the wallet
+            try:
+                settlement.wallet.deposit(settlement.amount.amount)
+                logger.info(
+                    f"Refunded {settlement.amount} to wallet {settlement.wallet.id} "
+                    f"after failed transfer"
+                )
+                
+                # Update transaction status
+                if settlement.transaction:
+                    settlement.transaction.status = TRANSACTION_STATUS_FAILED
+                    settlement.transaction.failed_reason = reason
+                    settlement.transaction.save(
+                        update_fields=['status', 'failed_reason']
+                    )
+                    logger.info(
+                        f"Transaction {settlement.transaction.id} marked as failed"
+                    )
+            except Exception as e:
+                logger.error(
+                    f"Error refunding wallet after failed settlement {settlement.reference}: "
+                    f"{str(e)}",
+                    exc_info=True
+                )
+            
+            logger.info(f"Settlement {settlement.id} marked as failed via webhook")
+            return True
+        else:
+            logger.warning(
+                f"No settlement found for reference={reference}, "
+                f"transfer_code={transfer_code}"
+            )
+        
+        return False
+    
+    @db_transaction.atomic
+    def _process_transfer_reversed(self, data: Dict) -> bool:
+        """
+        Process transfer.reversed webhook event for settlements
+        
+        Args:
+            data: Webhook event data
+            
+        Returns:
+            bool: True if processed successfully
+        """
+        reference = data.get('reference')
+        transfer_code = data.get('transfer_code')
+        reason = data.get('reason', _("Transfer reversed"))
+        
+        logger.info(
+            f"Processing transfer.reversed: reference={reference}, "
+            f"transfer_code={transfer_code}, reason={reason}"
+        )
+        
+        # Find settlement by reference or transfer code
+        settlement = None
+        
+        try:
+            if reference:
+                settlement = Settlement.objects.filter(reference=reference).first()
+            
+            if not settlement and transfer_code:
+                settlement = Settlement.objects.filter(
+                    paystack_transfer_code=transfer_code
+                ).first()
+        except Exception as e:
+            logger.error(f"Error finding settlement: {str(e)}", exc_info=True)
+            return False
+        
+        if settlement:
+            logger.info(f"Found settlement {settlement.id} for reversed transfer")
+            
+            # Update settlement status
+            settlement.mark_as_failed(reason, data)
+            
+            # Refund the wallet
+            try:
+                settlement.wallet.deposit(settlement.amount.amount)
+                logger.info(
+                    f"Refunded {settlement.amount} to wallet {settlement.wallet.id} "
+                    f"after reversed transfer"
+                )
+                
+                # Update transaction status
+                if settlement.transaction:
+                    settlement.transaction.status = 'reversed'
+                    settlement.transaction.failed_reason = reason
+                    settlement.transaction.save(
+                        update_fields=['status', 'failed_reason']
+                    )
+                    logger.info(
+                        f"Transaction {settlement.transaction.id} marked as reversed"
+                    )
+            except Exception as e:
+                logger.error(
+                    f"Error refunding wallet after reversed settlement {settlement.reference}: "
+                    f"{str(e)}",
+                    exc_info=True
+                )
+            
+            logger.info(f"Settlement {settlement.id} marked as reversed via webhook")
+            return True
+        else:
+            logger.warning(
+                f"No settlement found for reference={reference}, "
+                f"transfer_code={transfer_code}"
+            )
+        
+        return False
+    
+    # ==========================================
+    # SETTLEMENT SCHEDULES
+    # ==========================================
+    
+    @db_transaction.atomic
+    def create_settlement_schedule(
+        self,
+        wallet: Wallet,
+        bank_account: BankAccount,
+        schedule_type: str,
+        amount_threshold: Optional[Money] = None,
+        minimum_amount: Optional[Money] = None,
+        maximum_amount: Optional[Money] = None,
+        day_of_week: Optional[int] = None,
+        day_of_month: Optional[int] = None,
+        time_of_day: Optional[Any] = None
+    ) -> SettlementSchedule:
+        """
+        Create a new settlement schedule
+        
+        Args:
+            wallet: Wallet to schedule settlements for
+            bank_account: Bank account to settle to
+            schedule_type: Type of schedule (daily/weekly/monthly/threshold)
+            amount_threshold: Threshold amount (for threshold schedules)
+            minimum_amount: Minimum amount to settle
+            maximum_amount: Maximum amount to settle
+            day_of_week: Day of week (for weekly schedules)
+            day_of_month: Day of month (for monthly schedules)
+            time_of_day: Time of day for scheduled settlements
+            
+        Returns:
+            SettlementSchedule: Created schedule object
+        """
+        logger.info(
+            f"Creating settlement schedule: wallet={wallet.id}, "
+            f"bank_account={bank_account.id}, type={schedule_type}"
+        )
+        
+        # Create schedule
+        schedule = SettlementSchedule.objects.create(
+            wallet=wallet,
+            bank_account=bank_account,
+            schedule_type=schedule_type,
+            amount_threshold=amount_threshold,
+            minimum_amount=minimum_amount or Money(0, wallet.balance.currency),
+            maximum_amount=maximum_amount,
+            day_of_week=day_of_week,
+            day_of_month=day_of_month,
+            time_of_day=time_of_day
+        )
+        
+        logger.info(f"Created settlement schedule {schedule.id}")
+        
+        return schedule
+    
+    def process_due_settlements(self) -> int:
+        """
+        Process all due scheduled settlements
+        
+        Returns:
+            int: Number of settlements processed
+        """
+        logger.info("Processing due settlement schedules")
+        
+        now = timezone.now()
+        count = 0
+        
+        # Get all active schedules with due next_settlement date
+        due_schedules = SettlementSchedule.objects.due_now().with_full_details()
+        
+        logger.info(f"Found {due_schedules.count()} due schedules")
+        
+        for schedule in due_schedules:
+            try:
+                # Determine settlement amount
+                amount = self._calculate_settlement_amount(schedule)
+                
+                # Check if amount is positive
+                if amount.amount > 0:
+                    logger.info(
+                        f"Creating settlement for schedule {schedule.id}: "
+                        f"amount={amount}"
+                    )
+                    
+                    # Create settlement
+                    self.create_settlement(
+                        wallet=schedule.wallet,
+                        bank_account=schedule.bank_account,
+                        amount=amount,
+                        reason=f"Scheduled {schedule.get_schedule_type_display()} settlement",
+                        metadata={
+                            'schedule_id': str(schedule.id),
+                            'schedule_type': schedule.schedule_type
+                        }
+                    )
+                    count += 1
+                else:
+                    logger.debug(
+                        f"Schedule {schedule.id} skipped: calculated amount is {amount}"
+                    )
+                
+                # Update schedule
+                schedule.last_settlement = now
+                schedule.calculate_next_settlement()
+                schedule.save(update_fields=['last_settlement', 'next_settlement'])
+                
+            except Exception as e:
+                logger.error(
+                    f"Error processing scheduled settlement for {schedule.id}: {str(e)}",
+                    exc_info=True
+                )
+        
+        # Handle threshold-based schedules
+        threshold_schedules = SettlementSchedule.objects.threshold_based().with_full_details()
+        
+        logger.info(f"Found {threshold_schedules.count()} threshold-based schedules")
+        
+        for schedule in threshold_schedules:
+            try:
+                # Check if balance exceeds threshold
+                if schedule.wallet.balance >= schedule.amount_threshold:
+                    logger.info(
+                        f"Wallet {schedule.wallet.id} balance ({schedule.wallet.balance}) "
+                        f"exceeds threshold ({schedule.amount_threshold})"
+                    )
+                    
+                    # Determine settlement amount
+                    amount = self._calculate_settlement_amount(schedule)
+                    
+                    # Check if amount is positive
+                    if amount.amount > 0:
+                        logger.info(
+                            f"Creating threshold settlement for schedule {schedule.id}: "
+                            f"amount={amount}"
+                        )
+                        
+                        # Create settlement
+                        self.create_settlement(
+                            wallet=schedule.wallet,
+                            bank_account=schedule.bank_account,
+                            amount=amount,
+                            reason=_("Threshold-based settlement"),
+                            metadata={
+                                'schedule_id': str(schedule.id),
+                                'schedule_type': schedule.schedule_type,
+                                'threshold': str(schedule.amount_threshold.amount)
+                            }
+                        )
+                        count += 1
+                        
+                        # Update last settlement date
+                        schedule.last_settlement = now
+                        schedule.save(update_fields=['last_settlement'])
+                    else:
+                        logger.debug(
+                            f"Schedule {schedule.id} skipped: calculated amount is {amount}"
+                        )
+            except Exception as e:
+                logger.error(
+                    f"Error processing threshold settlement for {schedule.id}: {str(e)}",
+                    exc_info=True
+                )
+        
+        logger.info(f"Processed {count} scheduled settlements")
+        return count
+    
+    def _calculate_settlement_amount(self, schedule: SettlementSchedule) -> Money:
+        """
+        Calculate the settlement amount for a given schedule
+        
+        Args:
+            schedule: The settlement schedule
+            
+        Returns:
+            Money: The amount to settle
+        """
+        wallet_balance = schedule.wallet.balance
+        
+        # Apply minimum balance retention if configured
+        minimum_balance = Money(
+            get_wallet_setting('MINIMUM_BALANCE'),
+            wallet_balance.currency
+        )
+        
+        available_balance = max(
+            Money(0, wallet_balance.currency),
+            wallet_balance - minimum_balance
+        )
+        
+        logger.debug(
+            f"Calculating settlement amount for schedule {schedule.id}: "
+            f"wallet_balance={wallet_balance}, available={available_balance}"
+        )
+        
+        # Apply minimum settlement amount
+        if available_balance < schedule.minimum_amount:
+            logger.debug(
+                f"Available balance ({available_balance}) below minimum ({schedule.minimum_amount})"
+            )
+            return Money(0, wallet_balance.currency)
+        
+        # Apply maximum settlement amount if configured
+        if schedule.maximum_amount is not None and available_balance > schedule.maximum_amount:
+            logger.debug(
+                f"Available balance ({available_balance}) capped at maximum ({schedule.maximum_amount})"
+            )
+            return schedule.maximum_amount
+        
+        logger.debug(f"Settlement amount calculated: {available_balance}")
+        return available_balance
+    
+    # ==========================================
+    # SETTLEMENT STATISTICS
+    # ==========================================
+    
+    def get_settlement_statistics(
+        self,
+        wallet: Optional[Wallet] = None,
+        start_date: Optional[Any] = None,
+        end_date: Optional[Any] = None
+    ) -> Dict:
+        """
+        Get settlement statistics
+        
+        Args:
+            wallet: Filter by wallet (optional)
+            start_date: Start date (optional)
+            end_date: End date (optional)
+            
+        Returns:
+            dict: Settlement statistics
+        """
+        logger.debug("Calculating settlement statistics")
+        
+        stats = Settlement.objects.statistics(wallet, start_date, end_date)
+        
+        logger.info(f"Settlement statistics: {stats}")
+        
+        return stats
