@@ -20,7 +20,8 @@ from django.db.models import Q
 from django.utils import timezone
 from datetime import timedelta
 from djmoney.money import Money
-
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework import filters
 from wallet.models import (
     Settlement,
     SettlementSchedule,
@@ -33,7 +34,6 @@ from wallet.serializers.settlement_serializer import (
     SettlementListSerializer,
     SettlementCreateSerializer,
     SettlementUpdateSerializer,
-    SettlementStatusSerializer,
     FinalizeSettlementSerializer,
     SettlementScheduleSerializer,
     SettlementScheduleCreateSerializer,
@@ -105,7 +105,11 @@ class SettlementViewSet(viewsets.ReadOnlyModelViewSet):
     Summary: GET /api/settlements/summary/
     Top Destinations: GET /api/settlements/top-destinations/
     """
-    
+    filter_backends = [
+        DjangoFilterBackend,
+        filters.SearchFilter,
+        filters.OrderingFilter
+    ]
     serializer_class = SettlementSerializer
     permission_classes = [permissions.IsAuthenticated, IsSettlementOwner]
     filterset_fields = ['status', 'bank_account']
@@ -113,15 +117,10 @@ class SettlementViewSet(viewsets.ReadOnlyModelViewSet):
     ordering_fields = ['created_at', 'settled_at', 'amount']
     
     def get_queryset(self):
-        """
-        Get settlements for the current user's wallets with optimized queries
-        """
         user = self.request.user
-        
-        # Get user's wallets
         user_wallets = Wallet.objects.filter(user=user)
         
-        # Build optimized queryset
+        # ✅ Just return base queryset - filters handle the rest
         queryset = Settlement.objects.filter(
             wallet__in=user_wallets
         ).select_related(
@@ -132,25 +131,15 @@ class SettlementViewSet(viewsets.ReadOnlyModelViewSet):
             'transaction'
         ).order_by('-created_at')
         
-        # Apply additional filters from query parameters
-        status_filter = self.request.query_params.get('status')
-        if status_filter:
-            queryset = queryset.filter(status=status_filter)
+        # ✅ Remove manual filter handling - DjangoFilterBackend does it
+        # No longer need status_filter, bank_account_filter manually
         
-        bank_account_filter = self.request.query_params.get('bank_account')
-        if bank_account_filter:
-            queryset = queryset.filter(bank_account_id=bank_account_filter)
-        
-        # Date range filters
+        # ✅ Keep date range filters (custom logic)
         start_date = self.request.query_params.get('start_date')
         end_date = self.request.query_params.get('end_date')
         
         if start_date or end_date:
             queryset = queryset.in_date_range(start_date, end_date)
-        
-        logger.debug(
-            f"Settlement queryset for user {user.id}: {queryset.count()} settlements"
-        )
         
         return queryset
     
@@ -695,24 +684,188 @@ class SettlementViewSet(viewsets.ReadOnlyModelViewSet):
 # ==========================================
 
 
+# class SettlementScheduleViewSet(viewsets.ModelViewSet):
+#     """
+#     API endpoint for settlement schedules
+    
+#     Provides CRUD operations for settlement schedules with custom actions
+#     for activating and deactivating schedules.
+    
+#     Endpoints:
+#     List/Retrieve: GET /api/settlement-schedules/
+#     Create: POST /api/settlement-schedules/create_schedule/
+#     Update: PUT/PATCH /api/settlement-schedules/{id}/
+#     Delete: DELETE /api/settlement-schedules/{id}/
+#     Activate: POST /api/settlement-schedules/{id}/activate/
+#     Deactivate: POST /api/settlement-schedules/{id}/deactivate/
+#     """
+    
+#     serializer_class = SettlementScheduleSerializer
+#     permission_classes = [permissions.IsAuthenticated, IsScheduleOwner]
+#     filterset_fields = ['is_active', 'schedule_type', 'bank_account']
+#     search_fields = ['schedule_type']
+#     ordering_fields = ['created_at', 'next_settlement']
+    
+#     def get_queryset(self):
+#         """Get settlement schedules for the current user's wallets"""
+#         user = self.request.user
+#         user_wallets = Wallet.objects.filter(user=user)
+        
+#         queryset = SettlementSchedule.objects.filter(
+#             wallet__in=user_wallets
+#         ).select_related(
+#             'wallet',
+#             'wallet__user',
+#             'bank_account',
+#             'bank_account__bank'
+#         ).order_by('-created_at')
+        
+#         return queryset
+    
+#     def get_serializer_class(self):
+#         """Return appropriate serializer based on action"""
+#         action_serializers = {
+#             'list': SettlementScheduleListSerializer,
+#             'retrieve': SettlementScheduleSerializer,
+#             'create_schedule': SettlementScheduleCreateSerializer,
+#             'update': SettlementScheduleUpdateSerializer,
+#             'partial_update': SettlementScheduleUpdateSerializer,
+#         }
+        
+#         return action_serializers.get(self.action, self.serializer_class)
+    
+#     @action(detail=False, methods=['post'])
+#     def create_schedule(self, request):
+#         """Create a new settlement schedule"""
+#         logger.info(f"Creating settlement schedule for user {request.user.id}")
+        
+#         # Get wallet
+#         wallet_id = request.query_params.get('wallet_id')
+        
+#         if wallet_id:
+#             wallet = get_object_or_404(Wallet, id=wallet_id, user=request.user)
+#         else:
+#             wallet = Wallet.objects.filter(user=request.user).first()
+#             if not wallet:
+#                 return Response(
+#                     {"detail": _("No wallet found")},
+#                     status=status.HTTP_400_BAD_REQUEST
+#                 )
+        
+#         # Validate request data
+#         serializer = self.get_serializer(data=request.data, wallet=wallet)
+#         serializer.is_valid(raise_exception=True)
+        
+#         validated_data = serializer.validated_data
+        
+#         # Get bank account
+#         bank_account = get_object_or_404(
+#             BankAccount,
+#             id=validated_data['bank_account_id'],
+#             wallet=wallet
+#         )
+        
+#         # Convert amounts to Money objects
+#         amount_threshold = None
+#         if validated_data.get('amount_threshold'):
+#             amount_threshold = Money(
+#                 validated_data['amount_threshold'],
+#                 wallet.balance.currency
+#             )
+        
+#         minimum_amount = Money(
+#             validated_data.get('minimum_amount', 0),
+#             wallet.balance.currency
+#         )
+        
+#         maximum_amount = None
+#         if validated_data.get('maximum_amount'):
+#             maximum_amount = Money(
+#                 validated_data['maximum_amount'],
+#                 wallet.balance.currency
+#             )
+        
+#         settlement_service = SettlementService()
+        
+#         try:
+#             schedule = settlement_service.create_settlement_schedule(
+#                 wallet=wallet,
+#                 bank_account=bank_account,
+#                 schedule_type=validated_data['schedule_type'],
+#                 amount_threshold=amount_threshold,
+#                 minimum_amount=minimum_amount,
+#                 maximum_amount=maximum_amount,
+#                 day_of_week=validated_data.get('day_of_week'),
+#                 day_of_month=validated_data.get('day_of_month'),
+#                 time_of_day=validated_data.get('time_of_day')
+#             )
+            
+#             return Response(
+#                 SettlementScheduleSerializer(schedule).data,
+#                 status=status.HTTP_201_CREATED
+#             )
+            
+#         except Exception as e:
+#             logger.error(f"Error creating schedule: {str(e)}", exc_info=True)
+#             return Response(
+#                 {"detail": str(e)},
+#                 status=status.HTTP_400_BAD_REQUEST
+#             )
+    
+#     @action(detail=True, methods=['post'])
+#     def activate(self, request, pk=None):
+#         """Activate a settlement schedule"""
+#         schedule = self.get_object()
+        
+#         try:
+#             schedule.activate()
+#             return Response(
+#                 SettlementScheduleSerializer(schedule).data,
+#                 status=status.HTTP_200_OK
+#             )
+#         except Exception as e:
+#             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+    
+#     @action(detail=True, methods=['post'])
+#     def deactivate(self, request, pk=None):
+#         """Deactivate a settlement schedule"""
+#         schedule = self.get_object()
+        
+#         try:
+#             schedule.deactivate()
+#             return Response(
+#                 SettlementScheduleSerializer(schedule).data,
+#                 status=status.HTTP_200_OK
+#             )
+#         except Exception as e:
+#             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
 class SettlementScheduleViewSet(viewsets.ModelViewSet):
     """
     API endpoint for settlement schedules
     
-    Provides CRUD operations for settlement schedules with custom actions
-    for activating and deactivating schedules.
+    Standard REST Endpoints:
+        POST /api/settlement-schedules/ - Create schedule
+        GET /api/settlement-schedules/ - List schedules
+        GET /api/settlement-schedules/{id}/ - Retrieve schedule
+        PUT/PATCH /api/settlement-schedules/{id}/ - Update schedule
+        DELETE /api/settlement-schedules/{id}/ - Delete schedule
     
-    Endpoints:
-    List/Retrieve: GET /api/settlement-schedules/
-    Create: POST /api/settlement-schedules/create_schedule/
-    Update: PUT/PATCH /api/settlement-schedules/{id}/
-    Delete: DELETE /api/settlement-schedules/{id}/
-    Activate: POST /api/settlement-schedules/{id}/activate/
-    Deactivate: POST /api/settlement-schedules/{id}/deactivate/
+    Custom Actions:
+        POST /api/settlement-schedules/{id}/activate/ - Activate schedule
+        POST /api/settlement-schedules/{id}/deactivate/ - Deactivate schedule
     """
     
     serializer_class = SettlementScheduleSerializer
     permission_classes = [permissions.IsAuthenticated, IsScheduleOwner]
+    
+    # ✅ Add filter backends
+    filter_backends = [
+        DjangoFilterBackend,
+        filters.SearchFilter,
+        filters.OrderingFilter
+    ]
+    
     filterset_fields = ['is_active', 'schedule_type', 'bank_account']
     search_fields = ['schedule_type']
     ordering_fields = ['created_at', 'next_settlement']
@@ -738,67 +891,57 @@ class SettlementScheduleViewSet(viewsets.ModelViewSet):
         action_serializers = {
             'list': SettlementScheduleListSerializer,
             'retrieve': SettlementScheduleSerializer,
-            'create_schedule': SettlementScheduleCreateSerializer,
+            'create': SettlementScheduleCreateSerializer,  # ✅ Standard create
             'update': SettlementScheduleUpdateSerializer,
             'partial_update': SettlementScheduleUpdateSerializer,
         }
         
         return action_serializers.get(self.action, self.serializer_class)
     
-    @action(detail=False, methods=['post'])
-    def create_schedule(self, request):
-        """Create a new settlement schedule"""
+    # ==========================================
+    # STANDARD REST METHODS (✅ FIXED)
+    # ==========================================
+    
+    def create(self, request, *args, **kwargs):
+        """
+        Create a new settlement schedule
+        
+        POST /api/settlement-schedules/
+        """
         logger.info(f"Creating settlement schedule for user {request.user.id}")
         
-        # Get wallet
-        wallet_id = request.query_params.get('wallet_id')
-        
-        if wallet_id:
-            wallet = get_object_or_404(Wallet, id=wallet_id, user=request.user)
-        else:
-            wallet = Wallet.objects.filter(user=request.user).first()
-            if not wallet:
-                return Response(
-                    {"detail": _("No wallet found")},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-        
-        # Validate request data
-        serializer = self.get_serializer(data=request.data, wallet=wallet)
+        serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
-        validated_data = serializer.validated_data
-        
-        # Get bank account
-        bank_account = get_object_or_404(
-            BankAccount,
-            id=validated_data['bank_account_id'],
-            wallet=wallet
-        )
-        
-        # Convert amounts to Money objects
-        amount_threshold = None
-        if validated_data.get('amount_threshold'):
-            amount_threshold = Money(
-                validated_data['amount_threshold'],
-                wallet.balance.currency
-            )
-        
-        minimum_amount = Money(
-            validated_data.get('minimum_amount', 0),
-            wallet.balance.currency
-        )
-        
-        maximum_amount = None
-        if validated_data.get('maximum_amount'):
-            maximum_amount = Money(
-                validated_data['maximum_amount'],
-                wallet.balance.currency
-            )
-        
-        settlement_service = SettlementService()
-        
         try:
+            from wallet.services.settlement_service import SettlementService
+            
+            settlement_service = SettlementService()
+            validated_data = serializer.validated_data
+            
+            # Get wallet and bank account
+            wallet = get_object_or_404(Wallet, id=validated_data['wallet_id'], user=request.user)
+            bank_account = get_object_or_404(
+                BankAccount,
+                id=validated_data['bank_account_id'],
+                wallet=wallet
+            )
+            
+            # Convert amounts to Money
+            amount_threshold = None
+            if validated_data.get('amount_threshold'):
+                amount_threshold = Money(validated_data['amount_threshold'], wallet.balance.currency)
+            
+            minimum_amount = Money(
+                validated_data.get('minimum_amount', 0),
+                wallet.balance.currency
+            )
+            
+            maximum_amount = None
+            if validated_data.get('maximum_amount'):
+                maximum_amount = Money(validated_data['maximum_amount'], wallet.balance.currency)
+            
+            # Create schedule via service
             schedule = settlement_service.create_settlement_schedule(
                 wallet=wallet,
                 bank_account=bank_account,
@@ -810,6 +953,8 @@ class SettlementScheduleViewSet(viewsets.ModelViewSet):
                 day_of_month=validated_data.get('day_of_month'),
                 time_of_day=validated_data.get('time_of_day')
             )
+            
+            logger.info(f"Created settlement schedule {schedule.id}")
             
             return Response(
                 SettlementScheduleSerializer(schedule).data,
@@ -823,6 +968,51 @@ class SettlementScheduleViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
     
+    def update(self, request, *args, **kwargs):
+        """
+        Update a settlement schedule (full update)
+        
+        PUT /api/settlement-schedules/{id}/
+        """
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        
+        # Perform update
+        self.perform_update(serializer)
+        
+        logger.info(f"Updated settlement schedule {instance.id}")
+        
+        return Response(serializer.data)
+    
+    def partial_update(self, request, *args, **kwargs):
+        """
+        Partially update a settlement schedule
+        
+        PATCH /api/settlement-schedules/{id}/
+        """
+        kwargs['partial'] = True
+        return self.update(request, *args, **kwargs)
+    
+    def destroy(self, request, *args, **kwargs):
+        """
+        Delete a settlement schedule
+        
+        DELETE /api/settlement-schedules/{id}/
+        """
+        instance = self.get_object()
+        schedule_id = instance.id
+        self.perform_destroy(instance)
+        
+        logger.info(f"Deleted settlement schedule {schedule_id}")
+        
+        return Response(status=status.HTTP_204_NO_CONTENT)
+    
+    # ==========================================
+    # CUSTOM ACTIONS
+    # ==========================================
+    
     @action(detail=True, methods=['post'])
     def activate(self, request, pk=None):
         """Activate a settlement schedule"""
@@ -830,11 +1020,13 @@ class SettlementScheduleViewSet(viewsets.ModelViewSet):
         
         try:
             schedule.activate()
+            logger.info(f"Activated settlement schedule {schedule.id}")
             return Response(
                 SettlementScheduleSerializer(schedule).data,
                 status=status.HTTP_200_OK
             )
         except Exception as e:
+            logger.error(f"Error activating schedule: {str(e)}")
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
     
     @action(detail=True, methods=['post'])
@@ -844,9 +1036,11 @@ class SettlementScheduleViewSet(viewsets.ModelViewSet):
         
         try:
             schedule.deactivate()
+            logger.info(f"Deactivated settlement schedule {schedule.id}")
             return Response(
                 SettlementScheduleSerializer(schedule).data,
                 status=status.HTTP_200_OK
             )
         except Exception as e:
+            logger.error(f"Error deactivating schedule: {str(e)}")
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)

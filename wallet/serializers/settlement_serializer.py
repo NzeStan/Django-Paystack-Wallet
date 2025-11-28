@@ -552,27 +552,10 @@ class SettlementScheduleSerializer(serializers.ModelSerializer):
         read_only=True
     )
     
-    # Money field decomposition
-    amount_threshold_value = serializers.DecimalField(
-        source='amount_threshold.amount',
-        decimal_places=2,
-        max_digits=19,
-        read_only=True,
-        allow_null=True
-    )
-    minimum_amount_value = serializers.DecimalField(
-        source='minimum_amount.amount',
-        decimal_places=2,
-        max_digits=19,
-        read_only=True
-    )
-    maximum_amount_value = serializers.DecimalField(
-        source='maximum_amount.amount',
-        decimal_places=2,
-        max_digits=19,
-        read_only=True,
-        allow_null=True
-    )
+    # ✅ FIX: Use SerializerMethodField instead of direct source access
+    amount_threshold_value = serializers.SerializerMethodField()
+    minimum_amount_value = serializers.SerializerMethodField()
+    maximum_amount_value = serializers.SerializerMethodField()
     
     # Day of week display
     day_of_week_display = serializers.SerializerMethodField(read_only=True)
@@ -634,6 +617,49 @@ class SettlementScheduleSerializer(serializers.ModelSerializer):
             'next_settlement',
         ]
     
+    # ✅ ADD THESE METHODS
+    def get_amount_threshold_value(self, obj):
+        """
+        Get amount threshold value safely
+        
+        Args:
+            obj: SettlementSchedule instance
+            
+        Returns:
+            Decimal or None: Amount threshold value
+        """
+        if obj.amount_threshold:
+            return obj.amount_threshold.amount
+        return None
+    
+    def get_minimum_amount_value(self, obj):
+        """
+        Get minimum amount value safely
+        
+        Args:
+            obj: SettlementSchedule instance
+            
+        Returns:
+            Decimal: Minimum amount value
+        """
+        if obj.minimum_amount:
+            return obj.minimum_amount.amount
+        return 0
+    
+    def get_maximum_amount_value(self, obj):
+        """
+        Get maximum amount value safely
+        
+        Args:
+            obj: SettlementSchedule instance
+            
+        Returns:
+            Decimal or None: Maximum amount value
+        """
+        if obj.maximum_amount:
+            return obj.maximum_amount.amount
+        return None
+    
     def get_day_of_week_display(self, obj):
         """
         Get display value for day of week
@@ -667,6 +693,13 @@ class SettlementScheduleCreateSerializer(serializers.ModelSerializer):
     Validates input and prepares data for schedule creation.
     """
     
+    # ✅ ADD THIS
+    wallet_id = serializers.CharField(
+        write_only=True,
+        required=True,
+        help_text=_('ID of the wallet for this schedule')
+    )
+    
     bank_account_id = serializers.CharField(
         write_only=True,
         required=True,
@@ -699,6 +732,7 @@ class SettlementScheduleCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = SettlementSchedule
         fields = [
+            'wallet_id',  # ✅ ADD THIS
             'bank_account_id',
             'schedule_type',
             'is_active',
@@ -709,6 +743,41 @@ class SettlementScheduleCreateSerializer(serializers.ModelSerializer):
             'day_of_month',
             'time_of_day',
         ]
+    
+    # ✅ ADD THIS VALIDATION
+    def validate_wallet_id(self, value):
+        """
+        Validate wallet exists and belongs to user
+        
+        Args:
+            value: Wallet ID
+            
+        Returns:
+            str: Validated wallet ID
+            
+        Raises:
+            ValidationError: If wallet is invalid
+        """
+        from wallet.models import Wallet
+        
+        try:
+            # Get request user from context
+            user = self.context.get('request').user if self.context.get('request') else None
+            
+            if not user:
+                raise serializers.ValidationError(_("Authentication required"))
+            
+            # Check wallet exists and belongs to user
+            wallet = Wallet.objects.get(id=value, user=user)
+            
+            # Check if wallet is active
+            if not wallet.is_active:
+                raise serializers.ValidationError(_("Wallet is not active"))
+            
+            return value
+            
+        except Wallet.DoesNotExist:
+            raise serializers.ValidationError(_("Wallet not found"))
     
     def validate_bank_account_id(self, value):
         """
@@ -723,67 +792,26 @@ class SettlementScheduleCreateSerializer(serializers.ModelSerializer):
         Raises:
             ValidationError: If bank account is invalid
         """
+        from wallet.models import BankAccount
+        
         try:
             bank_account = BankAccount.objects.get(id=value)
             
+            # Get wallet_id from validated_data to check ownership
+            # Note: This will be available after wallet_id is validated
+            
             # Check if bank account is active
             if not bank_account.is_active:
-                raise serializers.ValidationError(
-                    _("Bank account is inactive")
-                )
+                raise serializers.ValidationError(_("Bank account is not active"))
             
             # Check if bank account is verified
             if not bank_account.is_verified:
-                raise serializers.ValidationError(
-                    _("Bank account is not verified")
-                )
+                raise serializers.ValidationError(_("Bank account is not verified"))
             
             return value
             
         except BankAccount.DoesNotExist:
-            raise serializers.ValidationError(
-                _("Bank account not found")
-            )
-    
-    def validate_day_of_week(self, value):
-        """
-        Validate day of week is in valid range
-        
-        Args:
-            value: Day of week
-            
-        Returns:
-            int: Validated day of week
-            
-        Raises:
-            ValidationError: If day of week is invalid
-        """
-        if value is not None and not (0 <= value <= 6):
-            raise serializers.ValidationError(
-                _("Day of week must be between 0 (Monday) and 6 (Sunday)")
-            )
-        
-        return value
-    
-    def validate_day_of_month(self, value):
-        """
-        Validate day of month is in valid range
-        
-        Args:
-            value: Day of month
-            
-        Returns:
-            int: Validated day of month
-            
-        Raises:
-            ValidationError: If day of month is invalid
-        """
-        if value is not None and not (1 <= value <= 31):
-            raise serializers.ValidationError(
-                _("Day of month must be between 1 and 31")
-            )
-        
-        return value
+            raise serializers.ValidationError(_("Bank account not found"))
     
     def validate(self, attrs):
         """
@@ -798,6 +826,27 @@ class SettlementScheduleCreateSerializer(serializers.ModelSerializer):
         Raises:
             ValidationError: If validation fails
         """
+        from wallet.models import Wallet, BankAccount
+        
+        # Validate wallet and bank account belong together
+        wallet_id = attrs.get('wallet_id')
+        bank_account_id = attrs.get('bank_account_id')
+        
+        if wallet_id and bank_account_id:
+            try:
+                wallet = Wallet.objects.get(id=wallet_id)
+                bank_account = BankAccount.objects.get(id=bank_account_id)
+                
+                # ✅ CRITICAL: Check bank account belongs to wallet
+                if bank_account.wallet_id != wallet.id:
+                    raise serializers.ValidationError({
+                        'bank_account_id': _("Bank account does not belong to the specified wallet")
+                    })
+                    
+            except (Wallet.DoesNotExist, BankAccount.DoesNotExist):
+                # Already handled by individual field validators
+                pass
+        
         schedule_type = attrs.get('schedule_type')
         
         # Validate weekly schedule has day_of_week
