@@ -1,11 +1,6 @@
-"""
-Django Paystack Wallet - Card Serializers
-Comprehensive serializers with validation and optimization
-PROPERLY ARCHITECTED: Following project patterns with security-first approach
-"""
 from rest_framework import serializers
 from django.utils.translation import gettext_lazy as _
-from django.db.models import Count, Sum, Avg, Q
+from django.db.models import Sum, Avg
 from decimal import Decimal
 
 from wallet.models import Card
@@ -74,10 +69,10 @@ class CardSerializer(serializers.ModelSerializer):
             'expiry_year',
             'expiry',
             'bin',
-            'card_holder_name',  # READ-ONLY: Auto-filled from wallet.user
-            'email',  # READ-ONLY: Auto-filled from wallet.user
-            'is_default',  # Use set_default action
-            'is_active',  # Use activate/deactivate actions
+            'card_holder_name',  
+            'email',  
+            'is_default',  
+            'is_active', 
             'is_expired',
             'is_valid',
             'masked_pan',

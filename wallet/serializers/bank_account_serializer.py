@@ -1,10 +1,6 @@
-"""
-Django Paystack Wallet - Bank Account Serializers
-Comprehensive serializers with validation and optimization
-"""
 from rest_framework import serializers
 from django.utils.translation import gettext_lazy as _
-from django.db.models import Count, Sum, Q
+from django.db.models import Sum
 
 from wallet.models import BankAccount, Bank
 from wallet.constants import BANK_ACCOUNT_TYPES, TRANSACTION_STATUS_SUCCESS, SETTLEMENT_STATUS_SUCCESS

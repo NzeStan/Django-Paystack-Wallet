@@ -1,7 +1,3 @@
-"""
-Django Paystack Wallet - Transaction Model
-Refactored with Django best practices and query optimizations
-"""
 from decimal import Decimal
 from django.db import models
 from django.utils.translation import gettext_lazy as _

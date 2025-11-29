@@ -1,19 +1,10 @@
-"""
-Webhook API for Django Paystack Wallet
-
-This module provides API endpoints for handling Paystack webhooks
-and managing custom webhook endpoints.
-"""
-
 import logging
 from rest_framework import status, viewsets, permissions
 from rest_framework.decorators import api_view, permission_classes, action
 from rest_framework.response import Response
 from django.utils.translation import gettext_lazy as _
 from django.views.decorators.csrf import csrf_exempt
-from django.utils.decorators import method_decorator
 from django.db.models import Q
-
 from wallet.models import WebhookEvent, WebhookEndpoint, WebhookDeliveryAttempt
 from wallet.serializers.webhook_serializer import (
     WebhookEventSerializer,
@@ -32,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 @csrf_exempt
 @api_view(['POST'])
-@permission_classes([])  # No authentication required for webhooks
+@permission_classes([])
 def paystack_webhook(request):
     """
     Handle webhook events from Paystack.

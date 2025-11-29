@@ -1,9 +1,5 @@
-"""
-Django Paystack Wallet - Wallet API Views
-Refactored with query optimization, comprehensive error handling, and clean architecture
-"""
 import logging
-from typing import Any, Dict
+from typing import Any
 from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -11,7 +7,6 @@ from rest_framework.request import Request
 from django.utils.translation import gettext_lazy as _
 from django.shortcuts import get_object_or_404
 from django.db import transaction as db_transaction
-from django.db.models import Prefetch
 from wallet.models import Wallet, Transaction, BankAccount
 from decimal import Decimal
 
@@ -149,7 +144,7 @@ class WalletViewSet(viewsets.ModelViewSet):
             'deposit': WalletDepositSerializer,
             'withdraw': WalletWithdrawSerializer,
             'transfer': WalletTransferSerializer,
-            'finalize_withdrawal': FinalizeWithdrawalSerializer,  # <-- Added
+            'finalize_withdrawal': FinalizeWithdrawalSerializer, 
         }
 
         return action_serializers.get(self.action, self.serializer_class)
@@ -177,7 +172,6 @@ class WalletViewSet(viewsets.ModelViewSet):
                 self.check_object_permissions(self.request, wallet)
                 return wallet
         
-        # Standard object retrieval
         return super().get_object()
     
     # ==========================================

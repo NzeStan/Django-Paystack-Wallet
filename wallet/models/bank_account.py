@@ -1,11 +1,5 @@
-"""
-Django Paystack Wallet - Bank Account Model
-Refactored with Django best practices and query optimizations
-"""
 from django.db import models, transaction
 from django.utils.translation import gettext_lazy as _
-from django.utils import timezone
-
 from wallet.models.base import BaseModel
 from wallet.constants import BANK_ACCOUNT_TYPES, BANK_ACCOUNT_TYPE_SAVINGS
 

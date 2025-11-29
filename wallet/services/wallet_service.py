@@ -1,9 +1,3 @@
-"""
-Django Paystack Wallet - Wallet Service Layer (FIXED VERSION)
-Fixed issues:
-1. Added validation to prevent transfers to the same wallet
-2. Modified transaction handling to persist failed transaction records
-"""
 import logging
 from decimal import Decimal
 from typing import Optional, Dict, Any, Tuple
@@ -11,7 +5,6 @@ from django.db import transaction
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from djmoney.money import Money
-
 from wallet.models import Wallet, Transaction, Card, BankAccount, TransferRecipient, Bank
 from wallet.exceptions import (
     BankAccountError,
@@ -43,8 +36,6 @@ class WalletService:
     This service encapsulates all business logic related to wallet operations,
     including deposits, withdrawals, transfers, and Paystack integrations.
     
-    All monetary operations are wrapped in database transactions to ensure
-    data consistency and integrity.
     """
     
     def __init__(self):
@@ -230,7 +221,6 @@ class WalletService:
         if not transaction_reference:
             transaction_reference = generate_transaction_reference()
         
-        # Create pending transaction (outside the atomic block to persist even on failure)
         txn = Transaction.objects.create(
             wallet=wallet,
             amount=amount,
@@ -307,8 +297,6 @@ class WalletService:
         Raises:
             PaystackAPIError: If Paystack API call fails
         """
-        from wallet.models import Transaction
-        from wallet.constants import TRANSACTION_TYPE_DEPOSIT, TRANSACTION_STATUS_PENDING
         
         # Ensure we have the customer's email
         email = email or wallet.user.email
@@ -336,7 +324,6 @@ class WalletService:
             f"amount={amount}, reference={reference}"
         )
         
-        # CREATE PENDING TRANSACTION FIRST (this is the critical fix!)
         # This ensures the transaction exists when the webhook arrives
         transaction = Transaction.objects.create(
             wallet=wallet,
@@ -470,7 +457,7 @@ class WalletService:
             # Re-raise the exception
             raise
 
-    def withdraw_to_bank(
+    def withdraw_to_bank(   
         self,
         wallet: Wallet,
         amount: Decimal,
@@ -541,7 +528,6 @@ class WalletService:
         if not wallet.is_active:
             raise WalletLocked(_("Wallet is not active"))
         
-        # Ensure metadata is a dict for safe .get() usage
         metadata = metadata if isinstance(metadata, dict) else {}
         
         # Generate reference if not provided
@@ -599,7 +585,6 @@ class WalletService:
             )
             
             # Store the transfer code in paystack_reference
-            # This is what we'll use to finalize with OTP if needed
             transfer_code = transfer_data.get('transfer_code')
             if not transfer_code:
                 raise PaystackAPIError(
@@ -637,7 +622,7 @@ class WalletService:
                 # Withdraw from wallet
                 locked_wallet.withdraw(amount)
             
-            # Update transaction as successful (outside atomic block)
+            # Update transaction as successful 
             txn.paystack_reference = transfer_code
             txn.paystack_response = transfer_data
             txn.status = TRANSACTION_STATUS_SUCCESS
@@ -906,7 +891,6 @@ class WalletService:
             InsufficientFunds: If source wallet has insufficient funds
             ValueError: If source and destination wallets are the same
         """
-        # FIX #1: Validate that source and destination are different
         if source_wallet.id == destination_wallet.id:
             raise ValueError(_("Cannot transfer to the same wallet"))
         

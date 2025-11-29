@@ -1,7 +1,3 @@
-"""
-Django Paystack Wallet - Settlement Model
-Refactored with Django best practices and query optimizations
-"""
 from decimal import Decimal
 from django.db import models
 from django.db import transaction as db_transaction

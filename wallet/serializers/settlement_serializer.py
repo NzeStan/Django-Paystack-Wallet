@@ -1,7 +1,3 @@
-"""
-Django Paystack Wallet - Settlement Serializers
-Comprehensive serializers with validation and optimization
-"""
 from decimal import Decimal
 from rest_framework import serializers
 from django.utils.translation import gettext_lazy as _
@@ -10,14 +6,7 @@ from djmoney.money import Money
 from wallet.models import (
     Settlement,
     SettlementSchedule,
-    BankAccount,
-    Wallet
-)
-from wallet.constants import (
-    SETTLEMENT_STATUS_PENDING,
-    SETTLEMENT_STATUS_PROCESSING,
-    SETTLEMENT_STATUS_SUCCESS,
-    SETTLEMENT_STATUS_FAILED
+    BankAccount
 )
 
 
@@ -551,8 +540,6 @@ class SettlementScheduleSerializer(serializers.ModelSerializer):
         source='get_schedule_type_display',
         read_only=True
     )
-    
-    # ✅ FIX: Use SerializerMethodField instead of direct source access
     amount_threshold_value = serializers.SerializerMethodField()
     minimum_amount_value = serializers.SerializerMethodField()
     maximum_amount_value = serializers.SerializerMethodField()
@@ -617,21 +604,22 @@ class SettlementScheduleSerializer(serializers.ModelSerializer):
             'next_settlement',
         ]
     
-    # ✅ ADD THESE METHODS
     def get_amount_threshold_value(self, obj):
         """
-        Get amount threshold value safely
-        
+        Safely return the amount threshold value.
+
         Args:
-            obj: SettlementSchedule instance
-            
+            obj (SettlementSchedule): The settlement schedule instance.
+
         Returns:
-            Decimal or None: Amount threshold value
+            Decimal or None: The numeric value of the amount threshold,
+            or None if no threshold is set.
         """
-        if obj.amount_threshold:
+        if obj.amount_threshold is not None:
             return obj.amount_threshold.amount
         return None
-    
+
+        
     def get_minimum_amount_value(self, obj):
         """
         Get minimum amount value safely
@@ -642,9 +630,9 @@ class SettlementScheduleSerializer(serializers.ModelSerializer):
         Returns:
             Decimal: Minimum amount value
         """
-        if obj.minimum_amount:
+        if obj.minimum_amount is not None:
             return obj.minimum_amount.amount
-        return 0
+        return Decimal('0')
     
     def get_maximum_amount_value(self, obj):
         """
@@ -656,7 +644,8 @@ class SettlementScheduleSerializer(serializers.ModelSerializer):
         Returns:
             Decimal or None: Maximum amount value
         """
-        if obj.maximum_amount:
+        # Check if attribute exists and is not None
+        if obj.maximum_amount is not None:
             return obj.maximum_amount.amount
         return None
     
@@ -686,14 +675,13 @@ class SettlementScheduleSerializer(serializers.ModelSerializer):
         return days[obj.day_of_week]
 
 
+
 class SettlementScheduleCreateSerializer(serializers.ModelSerializer):
     """
     Serializer for creating a settlement schedule
     
     Validates input and prepares data for schedule creation.
     """
-    
-    # ✅ ADD THIS
     wallet_id = serializers.CharField(
         write_only=True,
         required=True,
@@ -732,7 +720,7 @@ class SettlementScheduleCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = SettlementSchedule
         fields = [
-            'wallet_id',  # ✅ ADD THIS
+            'wallet_id',
             'bank_account_id',
             'schedule_type',
             'is_active',
@@ -744,7 +732,6 @@ class SettlementScheduleCreateSerializer(serializers.ModelSerializer):
             'time_of_day',
         ]
     
-    # ✅ ADD THIS VALIDATION
     def validate_wallet_id(self, value):
         """
         Validate wallet exists and belongs to user

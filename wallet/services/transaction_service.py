@@ -1,7 +1,3 @@
-"""
-Django Paystack Wallet - Transaction Service Layer
-Refactored with improved organization, error handling, and comprehensive operations
-"""
 import logging
 from decimal import Decimal
 from typing import Optional, Dict, Any, List
@@ -20,6 +16,7 @@ from wallet.constants import (
     TRANSACTION_TYPE_REFUND, TRANSACTION_TYPE_REVERSAL,
     TRANSACTION_TYPES, TRANSACTION_STATUSES,
     WEBHOOK_EVENT_CHARGE_SUCCESS, WEBHOOK_EVENT_CHARGE_FAILED,
+    PAYMENT_METHOD_WALLET
 )
 from wallet.exceptions import (
     TransactionFailed,
@@ -27,7 +24,6 @@ from wallet.exceptions import (
     InvalidAmount,
     WalletLocked
 )
-from wallet.settings import get_wallet_setting
 from wallet.utils.id_generators import generate_transaction_reference
 
 
@@ -552,7 +548,7 @@ class TransactionService:
             )
             
         except Exception as e:
-            # Mark refund as failed (outside atomic block, so it persists)
+            # Mark refund as failed
             refund_transaction.status = TRANSACTION_STATUS_FAILED
             refund_transaction.failed_reason = str(e)
             refund_transaction.save(update_fields=[
@@ -751,6 +747,7 @@ class TransactionService:
             amount=amount,
             transaction_type=TRANSACTION_TYPE_TRANSFER,
             status=TRANSACTION_STATUS_PENDING,
+            payment_method=PAYMENT_METHOD_WALLET,
             description=description,
             metadata=metadata or {},
             reference=reference
@@ -958,6 +955,10 @@ class TransactionService:
         
         return updated_count
     
+   # ==========================================
+    # WEBHOOK PROCESSING
+    # ==========================================
+   
     def process_paystack_webhook(self, event_type: str, data: dict, webhook_event=None) -> bool:
         """
         Process a Paystack webhook event related to transactions.

@@ -1,7 +1,3 @@
-"""
-Django Paystack Wallet - Wallet Serializers
-Refactored with improved validation, field organization, and documentation
-"""
 import datetime
 from decimal import Decimal
 from rest_framework import serializers
@@ -514,98 +510,37 @@ class WalletDepositSerializer(WalletTransactionSerializer):
         return value
 
 
-# class WalletWithdrawSerializer(WalletTransactionSerializer):
-#     """
-#     Serializer for wallet withdrawal operations
-    
-#     Extends base transaction serializer with withdrawal-specific fields.
-#     """
-    
-#     bank_account_id = serializers.CharField(
-#         required=True,
-#         help_text=_('ID of the bank account to withdraw to')
-#     )
-    
-#     def validate_bank_account_id(self, value: str) -> str:
-#         """
-#         Validate bank account ID
-        
-#         Args:
-#             value (str): Bank account ID
-            
-#         Returns:
-#             str: Validated bank account ID
-            
-#         Raises:
-#             ValidationError: If bank account ID is invalid
-#         """
-#         if not value or not value.strip():
-#             raise serializers.ValidationError(
-#                 _("Bank account ID is required")
-#             )
-        
-#         return value.strip()
-
-class WalletWithdrawSerializer(serializers.Serializer):
+class WalletWithdrawSerializer(WalletTransactionSerializer):
     """
-    Serializer for withdrawal requests
+    Serializer for wallet withdrawal operations
     
-    Validates withdrawal data before processing
+    Extends base transaction serializer with withdrawal-specific fields.
     """
-    amount = serializers.DecimalField(
-        max_digits=12,
-        decimal_places=2,
-        min_value=Decimal('0.01'),
-        help_text=_("Amount to withdraw (e.g., 5000.00)")
+    
+    bank_account_id = serializers.CharField(
+        required=True,
+        help_text=_('ID of the bank account to withdraw to')
     )
     
-    bank_account_id = serializers.UUIDField(
-        help_text=_("UUID of the bank account to withdraw to")
-    )
-    
-    description = serializers.CharField(
-        max_length=255,
-        required=False,
-        allow_blank=True,
-        help_text=_("Optional description for the withdrawal")
-    )
-    
-    reference = serializers.CharField(
-        max_length=100,
-        required=False,
-        allow_blank=True,
-        help_text=_("Optional custom reference")
-    )
-    
-    metadata = serializers.JSONField(
-        required=False,
-        allow_null=True,
-        help_text=_("Optional metadata as JSON object")
-    )
-    
-    def validate_amount(self, value):
-        """Validate withdrawal amount"""
-        if value <= 0:
+    def validate_bank_account_id(self, value: str) -> str:
+        """
+        Validate bank account ID
+        
+        Args:
+            value (str): Bank account ID
+            
+        Returns:
+            str: Validated bank account ID
+            
+        Raises:
+            ValidationError: If bank account ID is invalid
+        """
+        if not value or not value.strip():
             raise serializers.ValidationError(
-                _("Amount must be greater than zero")
+                _("Bank account ID is required")
             )
         
-        # Check if amount is too large (optional - adjust based on your needs)
-        max_amount = Decimal('10000000.00')  # 10 million max
-        if value > max_amount:
-            raise serializers.ValidationError(
-                _("Amount exceeds maximum withdrawal limit of {}").format(max_amount)
-            )
-        
-        return value
-    
-    def validate_metadata(self, value):
-        """Validate metadata is a dict"""
-        if value is not None and not isinstance(value, dict):
-            raise serializers.ValidationError(
-                _("Metadata must be a JSON object")
-            )
-        return value
+        return value.strip()
 
 
 class WalletTransferSerializer(WalletTransactionSerializer):

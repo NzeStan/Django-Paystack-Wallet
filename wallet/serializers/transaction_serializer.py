@@ -1,7 +1,3 @@
-"""
-Django Paystack Wallet - Transaction Serializers
-Refactored with multiple specialized serializers and comprehensive field handling
-"""
 from rest_framework import serializers
 from django.utils.translation import gettext_lazy as _
 from decimal import Decimal

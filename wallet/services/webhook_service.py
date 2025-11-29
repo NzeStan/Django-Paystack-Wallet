@@ -1,16 +1,9 @@
-"""
-Webhook Service for Django Paystack Wallet
-
-This module handles webhook events from Paystack and custom webhook endpoints.
-It verifies webhook signatures, processes events, and forwards them to registered endpoints.
-"""
-
 import json
 import logging
 import hmac
 import hashlib
 import requests
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from django.db import transaction as db_transaction

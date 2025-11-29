@@ -1,12 +1,6 @@
-"""
-Django Paystack Wallet - Card Model
-Refactored with Django best practices and query optimizations
-"""
 from datetime import datetime
 from django.db import models, transaction
 from django.utils.translation import gettext_lazy as _
-from django.utils import timezone
-
 from wallet.models.base import BaseModel
 from wallet.constants import CARD_TYPES, CARD_TYPE_VISA
 

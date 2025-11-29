@@ -1,10 +1,5 @@
-"""
-Django Paystack Wallet - Transaction API Views
-Refactored with comprehensive ViewSet, query optimization, error handling, and clean architecture
-"""
 import logging
 from typing import Any, Dict
-
 from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -12,9 +7,7 @@ from rest_framework.request import Request
 from django.utils.translation import gettext_lazy as _
 from django.shortcuts import get_object_or_404
 from django.db import transaction as db_transaction
-from django.db.models import Prefetch
 from django.http import HttpResponse
-
 from wallet.models import Transaction, Wallet
 from wallet.serializers.transaction_serializer import (
     TransactionSerializer,
@@ -30,13 +23,6 @@ from wallet.serializers.transaction_serializer import (
     TransactionExportSerializer
 )
 from wallet.services.transaction_service import TransactionService
-from wallet.exceptions import (
-    TransactionFailed,
-    InsufficientFunds,
-    InvalidAmount,
-    WalletLocked
-)
-
 
 logger = logging.getLogger(__name__)
 

@@ -1,9 +1,3 @@
-"""
-Webhook Serializers for Django Paystack Wallet
-
-This module provides serializers for webhook-related models.
-"""
-
 from rest_framework import serializers
 from django.utils.translation import gettext_lazy as _
 
