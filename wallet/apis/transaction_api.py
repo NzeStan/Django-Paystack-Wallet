@@ -598,10 +598,10 @@ class TransactionViewSet(viewsets.ReadOnlyModelViewSet):
     @action(detail=False, methods=['get'])
     def export(self, request: Request):
         """
-        Export transactions to CSV or Excel
+        Export transactions to CSV, Excel, or PDF
         
         Query Parameters:
-            - format: Export format ('csv' or 'xlsx', default: 'csv')
+            - format: Export format ('csv', 'xlsx', or 'pdf', default: 'csv')
             - wallet_id: Filter by wallet ID (optional)
             - transaction_type: Filter by type (optional)
             - status: Filter by status (optional)
@@ -609,7 +609,12 @@ class TransactionViewSet(viewsets.ReadOnlyModelViewSet):
             - end_date: End date (optional)
         
         Returns:
-            HttpResponse: File download response
+            HttpResponse: File download response (CSV, Excel, or PDF)
+        
+        Example Usage:
+            GET /api/transactions/export/?format=csv
+            GET /api/transactions/export/?format=xlsx&wallet_id=123
+            GET /api/transactions/export/?format=pdf&status=success&start_date=2024-01-01
         """
         try:
             # Parse parameters
@@ -634,18 +639,29 @@ class TransactionViewSet(viewsets.ReadOnlyModelViewSet):
             
             queryset = queryset.order_by('-created_at')
             
+            # Define fields to export (DRY - defined once, used three times)
+            export_fields = [
+                'id',
+                'reference',
+                'wallet.tag',
+                'wallet.user.email',
+                'amount.amount',
+                'amount.currency.code',
+                'fees.amount',
+                'transaction_type',
+                'status',
+                'description',
+                'created_at',
+                'completed_at'
+            ]
+            
             # Export based on format
             if export_format == 'csv':
                 from wallet.utils.exporters import export_queryset_to_csv
                 
                 response = export_queryset_to_csv(
                     queryset=queryset,
-                    fields=[
-                        'id', 'reference', 'wallet.tag', 'wallet.user.email',
-                        'amount.amount', 'amount.currency.code', 'fees.amount',
-                        'transaction_type', 'status', 'description',
-                        'created_at', 'completed_at'
-                    ],
+                    fields=export_fields,
                     filename_prefix='transactions'
                 )
             elif export_format == 'xlsx':
@@ -653,17 +669,22 @@ class TransactionViewSet(viewsets.ReadOnlyModelViewSet):
                 
                 response = export_queryset_to_excel(
                     queryset=queryset,
-                    fields=[
-                        'id', 'reference', 'wallet.tag', 'wallet.user.email',
-                        'amount.amount', 'amount.currency.code', 'fees.amount',
-                        'transaction_type', 'status', 'description',
-                        'created_at', 'completed_at'
-                    ],
-                    filename_prefix='transactions'
+                    fields=export_fields,
+                    filename_prefix='transactions',
+                    sheet_name='Transactions'
+                )
+            elif export_format == 'pdf':
+                from wallet.utils.exporters import export_queryset_to_pdf
+                
+                response = export_queryset_to_pdf(
+                    queryset=queryset,
+                    fields=export_fields,
+                    filename_prefix='transactions',
+                    title='Transaction Records'
                 )
             else:
                 return Response(
-                    {'error': _("Invalid export format. Use 'csv' or 'xlsx'")},
+                    {'error': _("Invalid export format. Use 'csv', 'xlsx', or 'pdf'")},
                     status=status.HTTP_400_BAD_REQUEST
                 )
             
@@ -683,6 +704,7 @@ class TransactionViewSet(viewsets.ReadOnlyModelViewSet):
                 {'error': _("Export failed")},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
         
     #admin oly bulk operations
     @action(

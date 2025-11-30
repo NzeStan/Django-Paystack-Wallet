@@ -668,6 +668,135 @@ class SettlementViewSet(viewsets.ReadOnlyModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
+    @action(detail=False, methods=['get'])
+    def export(self, request):
+        """
+        Export settlements to CSV, Excel, or PDF
+        
+        GET /api/settlements/export/?format=<format>&wallet_id=<id>&status=<status>&start_date=<date>&end_date=<date>
+        
+        Query Parameters:
+            - format: Export format ('csv', 'xlsx', or 'pdf', default: 'csv')
+            - wallet_id: Filter by wallet ID (optional)
+            - status: Filter by status (optional)
+            - start_date: Start date for filtering (optional, ISO format)
+            - end_date: End date for filtering (optional, ISO format)
+            - bank_account_id: Filter by bank account (optional)
+        
+        Returns:
+            HttpResponse: File download response (CSV, Excel, or PDF)
+        
+        Response (200):
+            File download with Content-Disposition header
+        
+        Response Error (400):
+            {
+                "error": "Invalid export format. Use 'csv', 'xlsx', or 'pdf'"
+            }
+        
+        Example Usage:
+            GET /api/settlements/export/?format=csv&wallet_id=123&status=success
+            GET /api/settlements/export/?format=xlsx&start_date=2024-01-01&end_date=2024-12-31
+            GET /api/settlements/export/?format=pdf&status=success
+        """
+        try:
+            # Parse parameters
+            export_format = request.query_params.get('format', 'csv')
+            wallet_id = request.query_params.get('wallet_id')
+            status_param = request.query_params.get('status')
+            start_date = request.query_params.get('start_date')
+            end_date = request.query_params.get('end_date')
+            bank_account_id = request.query_params.get('bank_account_id')
+            
+            # Build queryset - start with user's settlements
+            queryset = self.get_queryset()
+            
+            # Apply filters
+            if wallet_id:
+                # Verify wallet belongs to user
+                wallet = get_object_or_404(Wallet, id=wallet_id, user=request.user)
+                queryset = queryset.filter(wallet=wallet)
+            
+            if status_param:
+                queryset = queryset.filter(status=status_param)
+            
+            if bank_account_id:
+                queryset = queryset.filter(bank_account__id=bank_account_id)
+            
+            if start_date or end_date:
+                queryset = queryset.in_date_range(start_date, end_date)
+            
+            # Order by creation date (most recent first)
+            queryset = queryset.order_by('-created_at')
+            
+            # Define fields to export
+            export_fields = [
+                'id',
+                'reference',
+                'wallet.tag',
+                'wallet.user.email',
+                'bank_account.account_number',
+                'bank_account.bank.name',
+                'amount.amount',
+                'amount.currency.code',
+                'fees.amount',
+                'status',
+                'paystack_transfer_code',
+                'reason',
+                'created_at',
+                'settled_at',
+                'failure_reason',
+            ]
+            
+            # Export based on format
+            if export_format == 'csv':
+                from wallet.utils.exporters import export_queryset_to_csv
+                
+                response = export_queryset_to_csv(
+                    queryset=queryset,
+                    fields=export_fields,
+                    filename_prefix='settlements'
+                )
+            elif export_format == 'xlsx':
+                from wallet.utils.exporters import export_queryset_to_excel
+                
+                response = export_queryset_to_excel(
+                    queryset=queryset,
+                    fields=export_fields,
+                    filename_prefix='settlements',
+                    sheet_name='Settlements'
+                )
+            elif export_format == 'pdf':
+                from wallet.utils.exporters import export_queryset_to_pdf
+                
+                response = export_queryset_to_pdf(
+                    queryset=queryset,
+                    fields=export_fields,
+                    filename_prefix='settlements',
+                    title='Settlement Records'
+                )
+            else:
+                return Response(
+                    {'error': _("Invalid export format. Use 'csv', 'xlsx', or 'pdf'")},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            logger.info(
+                f"Exported {queryset.count()} settlements to {export_format} "
+                f"for user {request.user.id}"
+            )
+            
+            return response
+        
+        except Exception as e:
+            logger.error(
+                f"Export failed for user {request.user.id}: {str(e)}",
+                exc_info=True
+            )
+            return Response(
+                {'error': _("Export failed")},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
 # ==========================================
 # SETTLEMENT SCHEDULE VIEWSET
