@@ -22,6 +22,10 @@ from wallet.utils.exporters import (
 )
 from django.urls import reverse
 
+import logging
+logger = logging.getLogger(__name__)
+
+
 class ExportMixin:
     """Mixin to add export actions to admin"""
     

@@ -224,6 +224,18 @@ class SettlementManager(models.Manager):
         """Get recent settlements"""
         return self.get_queryset().recent(days)
     
+    def by_wallet(self, wallet):
+        """Filter settlements by wallet"""
+        return self.get_queryset().by_wallet(wallet)
+
+    def in_date_range(self, start_date=None, end_date=None):
+        """Filter settlements within a date range"""
+        return self.get_queryset().in_date_range(start_date, end_date)
+
+    def with_full_details(self):
+        """Prefetch all related data"""
+        return self.get_queryset().with_full_details()
+    
     def statistics(self, wallet=None, start_date=None, end_date=None):
         """
         Get settlement statistics
