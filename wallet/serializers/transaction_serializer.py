@@ -600,3 +600,24 @@ class TransactionExportSerializer(serializers.ModelSerializer):
             'description', 'created_at', 'completed_at', 'failed_reason'
         ]
         read_only_fields = fields
+
+#admin only bulk operations serializers
+class BulkTransactionCreateSerializer(serializers.Serializer):
+    """Serializer for bulk transaction creation (admin-only)"""
+    
+    transactions = serializers.ListField(
+        child=serializers.DictField(),
+        min_length=1,
+        max_length=100  # Reasonable limit
+    )    
+
+class BulkTransactionUpdateSerializer(serializers.Serializer):
+    """Serializer for bulk transaction status update (admin-only)"""
+    
+    transaction_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        min_length=1,
+        max_length=100
+    )
+    status = serializers.ChoiceField(choices=TRANSACTION_STATUSES)
+    reason = serializers.CharField(max_length=500, required=False, allow_blank=True)

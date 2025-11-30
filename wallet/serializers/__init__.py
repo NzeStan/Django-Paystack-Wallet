@@ -23,6 +23,8 @@ from wallet.serializers.transaction_serializer import (
     TransactionStatisticsSerializer,
     TransactionSummarySerializer,
     TransactionExportSerializer,
+    BulkTransactionCreateSerializer,
+    BulkTransactionUpdateSerializer,
 )
 from wallet.serializers.card_serializer import (
     CardSerializer,
@@ -75,6 +77,8 @@ __all__ = [
     'TransactionStatisticsSerializer',
     'TransactionSummarySerializer',
     'TransactionExportSerializer',
+    'BulkTransactionCreateSerializer',
+    'BulkTransactionUpdateSerializer',
     
     # Card Serializers
     'CardSerializer',

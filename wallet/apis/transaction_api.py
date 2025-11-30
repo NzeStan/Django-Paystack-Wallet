@@ -9,6 +9,8 @@ from django.shortcuts import get_object_or_404
 from django.db import transaction as db_transaction
 from django.http import HttpResponse
 from wallet.models import Transaction, Wallet
+from wallet.services.transaction_service import TransactionService
+from wallet.constants import TRANSACTION_STATUS_PENDING
 from wallet.serializers.transaction_serializer import (
     TransactionSerializer,
     TransactionDetailSerializer,
@@ -20,9 +22,10 @@ from wallet.serializers.transaction_serializer import (
     TransactionFilterSerializer,
     TransactionStatisticsSerializer,
     TransactionSummarySerializer,
-    TransactionExportSerializer
+    TransactionExportSerializer,
+    BulkTransactionCreateSerializer,
+    BulkTransactionUpdateSerializer
 )
-from wallet.services.transaction_service import TransactionService
 
 logger = logging.getLogger(__name__)
 
@@ -679,4 +682,129 @@ class TransactionViewSet(viewsets.ReadOnlyModelViewSet):
             return Response(
                 {'error': _("Export failed")},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+    #admin oly bulk operations
+    @action(
+        detail=False, 
+        methods=['post'], 
+        permission_classes=[permissions.IsAdminUser],
+        url_path='bulk-create'
+    )
+    def bulk_create(self, request):
+        """
+        Admin-only: Bulk create transactions
+        
+        POST /api/transactions/bulk-create/
+        
+        Body: {
+            "transactions": [
+                {
+                    "wallet_id": "uuid",
+                    "amount": "100.00",
+                    "transaction_type": "deposit",
+                    "description": "Bulk import",
+                    "status": "success"  // optional
+                },
+                ...
+            ]
+        }
+        
+        Returns: {
+            "created": 10,
+            "transactions": [...]
+        }
+        """
+        serializer = BulkTransactionCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        try:
+            # Build transactions data
+            transactions_data = []
+            for txn_data in serializer.validated_data['transactions']:
+                wallet = get_object_or_404(Wallet, id=txn_data['wallet_id'])
+                
+                transactions_data.append({
+                    'wallet': wallet,
+                    'amount': txn_data['amount'],
+                    'transaction_type': txn_data['transaction_type'],
+                    'description': txn_data.get('description', ''),
+                    'status': txn_data.get('status', TRANSACTION_STATUS_PENDING),
+                    'metadata': txn_data.get('metadata', {})
+                })
+            
+            # Bulk create
+            created_transactions = self.transaction_service.bulk_create_transactions(
+                transactions_data
+            )
+            
+            logger.info(
+                f"Admin {request.user.id} bulk created {len(created_transactions)} transactions"
+            )
+            
+            return Response(
+                {
+                    'created': len(created_transactions),
+                    'transactions': TransactionSerializer(
+                        created_transactions, 
+                        many=True
+                    ).data
+                },
+                status=status.HTTP_201_CREATED
+            )
+            
+        except Exception as e:
+            logger.error(f"Bulk create failed: {str(e)}", exc_info=True)
+            return Response(
+                {'detail': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+    
+    @action(
+        detail=False,
+        methods=['post'],
+        permission_classes=[permissions.IsAdminUser],
+        url_path='bulk-update-status'
+    )
+    def bulk_update_status(self, request):
+        """
+        Admin-only: Bulk update transaction statuses
+        
+        POST /api/transactions/bulk-update-status/
+        
+        Body: {
+            "transaction_ids": ["uuid1", "uuid2", ...],
+            "status": "success",
+            "reason": "Bulk reconciliation"  // optional
+        }
+        
+        Returns: {
+            "updated": 10
+        }
+        """
+        serializer = BulkTransactionUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        try:
+            updated_count = self.transaction_service.bulk_update_status(
+                transaction_ids=serializer.validated_data['transaction_ids'],
+                status=serializer.validated_data['status'],
+                reason=serializer.validated_data.get('reason')
+            )
+            
+            logger.info(
+                f"Admin {request.user.id} bulk updated {updated_count} transactions "
+                f"to status {serializer.validated_data['status']}"
+            )
+            
+            return Response(
+                {'updated': updated_count},
+                status=status.HTTP_200_OK
+            )
+            
+        except Exception as e:
+            logger.error(f"Bulk update failed: {str(e)}", exc_info=True)
+            return Response(
+                {'detail': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
             )

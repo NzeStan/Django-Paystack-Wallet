@@ -175,15 +175,18 @@ class WalletAdmin(ExportMixin, AnalyticsMixin, admin.ModelAdmin):
     
     def analytics_view(self, request):
         """Analytics view for wallets"""
+        from django.db.models import Sum, Count, Q, F, DecimalField
+        from django.db.models.functions import Cast, TruncDate
+        
         # Get aggregate metrics
         total_wallets = Wallet.objects.count()
-        active_wallets = Wallet.objects.filter(is_active=True).count()
+        active_wallets = Wallet.objects.filter(is_active=True, is_locked=False).count()
         locked_wallets = Wallet.objects.filter(is_locked=True).count()
+        inactive_wallets = Wallet.objects.filter(is_active=False).count()
         
-        # Get balance metrics (using the first balance currency found)
-        from django.db.models import F
-        balance_sum = Wallet.objects.filter(is_active=True).aggregate(
-            total=Sum(F('balance'))
+        # Get balance metrics
+        total_balance = Wallet.objects.aggregate(
+            total=Sum(Cast(F('balance'), output_field=DecimalField()))
         )['total'] or 0
         
         # Get wallet creation trend
@@ -200,7 +203,8 @@ class WalletAdmin(ExportMixin, AnalyticsMixin, admin.ModelAdmin):
             'total_wallets': total_wallets,
             'active_wallets': active_wallets,
             'locked_wallets': locked_wallets,
-            'balance_sum': balance_sum,
+            'inactive_wallets': inactive_wallets,
+            'total_balance': total_balance,
             'wallets_by_date': wallets_by_date,
             'opts': self.model._meta,
         }
