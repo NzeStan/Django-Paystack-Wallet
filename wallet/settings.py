@@ -7,7 +7,7 @@ WALLET_SETTINGS = {
     'USE_UUID': getattr(settings, 'WALLET_USE_UUID', True),
     
     # Use celery for asynchronous tasks
-    'USE_CELERY': getattr(settings, 'WALLET_USE_CELERY', False),     #still switch to true
+    'USE_CELERY': getattr(settings, 'WALLET_USE_CELERY', True),     #still switch to true
     # Auto-sync banks from Paystack on first migration (optional)
     'AUTO_SYNC_BANKS': getattr(settings, 'WALLET_AUTO_SYNC_BANKS', False),
     # Paystack Configuration

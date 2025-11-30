@@ -905,6 +905,7 @@ class SettlementScheduleUpdateSerializer(serializers.ModelSerializer):
             'time_of_day',
         ]
     
+    
     def validate(self, attrs):
         """
         Perform cross-field validation

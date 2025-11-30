@@ -5,6 +5,8 @@ from django.conf import settings
 from django.apps import apps
 from wallet.settings import get_wallet_setting
 from wallet.services.wallet_service import WalletService
+from django.db import transaction
+
 
 
 logger = logging.getLogger(__name__)
@@ -12,34 +14,24 @@ logger = logging.getLogger(__name__)
 
 @receiver(post_save, sender=get_wallet_setting('USER_MODEL'))
 def create_wallet_for_user(sender, instance, created, **kwargs):
-    """
-    Create a wallet for a new user
-    
-    Args:
-        sender: User model
-        instance: User instance
-        created: Whether the user was just created
-        **kwargs: Additional arguments
-    """
-    # Only create wallet for newly created users
+    """Create a wallet for a new user"""
     if not created:
         return
     
-    # Check if auto-create is enabled in settings
     if not get_wallet_setting('AUTO_CREATE_WALLET'):
         return
     
     try:
-        # Create wallet asynchronously if Celery is available
         if get_wallet_setting('USE_CELERY'):
             from wallet.tasks import create_wallet_for_user_task
-            create_wallet_for_user_task.delay(instance.pk)
+            # ✅ FIX: Wait for transaction to commit before queuing task
+            transaction.on_commit(lambda: create_wallet_for_user_task.delay(instance.pk))
         else:
-            # Create wallet synchronously
             wallet_service = WalletService()
             wallet_service.get_wallet(instance)
     except Exception as e:
         logger.error(f"Error creating wallet for user {instance.pk}: {str(e)}")
+
 
 
 @receiver(post_save)
@@ -202,35 +194,23 @@ def process_settlement_schedule(sender, instance, created, **kwargs):
 
 @receiver(post_save)
 def create_dedicated_account(sender, instance, created, **kwargs):
-    """
-    Create a dedicated virtual account for a wallet
-    
-    Args:
-        sender: Wallet model
-        instance: Wallet instance
-        created: Whether the wallet was just created
-        **kwargs: Additional arguments
-    """
-    # Check if this is a Wallet model
+    """Create a dedicated virtual account for a wallet"""
     wallet_model = apps.get_model('wallet', 'Wallet')
     if sender != wallet_model:
         return
     
-    # Only process for existing wallets without a dedicated account
     if created or instance.dedicated_account_number:
         return
     
-    # Skip if Paystack customer code is not set
     if not instance.paystack_customer_code:
         return
     
     try:
-        # Create dedicated account asynchronously if Celery is available
         if get_wallet_setting('USE_CELERY'):
             from wallet.tasks import create_dedicated_account_task
-            create_dedicated_account_task.delay(instance.pk)
+            # ✅ FIX: Wait for transaction to commit
+            transaction.on_commit(lambda: create_dedicated_account_task.delay(instance.pk))
         else:
-            # Create dedicated account synchronously
             wallet_service = WalletService()
             wallet_service.create_dedicated_account(instance)
     except Exception as e:

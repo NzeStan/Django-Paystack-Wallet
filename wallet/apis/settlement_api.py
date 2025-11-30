@@ -37,7 +37,7 @@ from wallet.exceptions import (
     WalletLocked,
     PaystackAPIError
 )
-
+from rest_framework.renderers import JSONRenderer
 
 logger = logging.getLogger(__name__)
 
@@ -703,7 +703,7 @@ class SettlementScheduleViewSet(viewsets.ModelViewSet):
     filterset_fields = ['is_active', 'schedule_type', 'bank_account']
     search_fields = ['schedule_type']
     ordering_fields = ['created_at', 'next_settlement']
-    
+    renderer_classes = [JSONRenderer]
     def get_queryset(self):
         """Get settlement schedules for the current user's wallets"""
         user = self.request.user
