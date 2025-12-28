@@ -482,6 +482,139 @@ class BankAccountViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+@action(detail=False, methods=['get'])
+def export(self, request):
+    """
+    Export bank accounts to CSV, Excel, or PDF
+    
+    GET /api/bank-accounts/export/?format=<format>&wallet_id=<id>&bank_id=<id>&is_active=<bool>
+    
+    Query Parameters:
+        - format: Export format ('csv', 'xlsx', or 'pdf', default: 'csv')
+        - wallet_id: Filter by wallet ID (optional)
+        - bank_id: Filter by bank ID (optional)
+        - is_active: Filter by active status (optional)
+        - is_verified: Filter by verification status (optional)
+        - is_default: Filter by default status (optional)
+        - account_type: Filter by account type (optional)
+    
+    Returns:
+        HttpResponse: File download response (CSV, Excel, or PDF)
+    
+    Response (200):
+        File download with Content-Disposition header
+    
+    Response Error (400):
+        {
+            "error": "Invalid export format. Use 'csv', 'xlsx', or 'pdf'"
+        }
+    
+    Example Usage:
+        GET /api/bank-accounts/export/?format=csv
+        GET /api/bank-accounts/export/?format=xlsx&wallet_id=123&is_verified=true
+        GET /api/bank-accounts/export/?format=pdf&is_active=true
+    """
+    try:
+        # Parse parameters
+        export_format = request.query_params.get('format', 'csv')
+        wallet_id = request.query_params.get('wallet_id')
+        bank_id = request.query_params.get('bank_id')
+        is_active = request.query_params.get('is_active')
+        is_verified = request.query_params.get('is_verified')
+        is_default = request.query_params.get('is_default')
+        account_type = request.query_params.get('account_type')
+        
+        # Build queryset - start with user's bank accounts
+        queryset = self.get_queryset()
+        
+        # Apply filters
+        if wallet_id:
+            queryset = queryset.filter(wallet_id=wallet_id)
+        
+        if bank_id:
+            queryset = queryset.filter(bank_id=bank_id)
+        
+        if is_active is not None:
+            queryset = queryset.filter(is_active=is_active.lower() == 'true')
+        
+        if is_verified is not None:
+            queryset = queryset.filter(is_verified=is_verified.lower() == 'true')
+        
+        if is_default is not None:
+            queryset = queryset.filter(is_default=is_default.lower() == 'true')
+        
+        if account_type:
+            queryset = queryset.filter(account_type=account_type)
+        
+        # Order by creation date (most recent first)
+        queryset = queryset.order_by('-created_at')
+        
+        # Define fields to export
+        export_fields = [
+            'id',
+            'wallet.tag',
+            'wallet.user.email',
+            'bank.name',
+            'bank.code',
+            'account_number',
+            'account_name',
+            'account_type',
+            'is_verified',
+            'is_default',
+            'is_active',
+            'paystack_recipient_code',
+            'created_at',
+        ]
+        
+        # Export based on format
+        if export_format == 'csv':
+            from wallet.utils.exporters import export_queryset_to_csv
+            
+            response = export_queryset_to_csv(
+                queryset=queryset,
+                fields=export_fields,
+                filename_prefix='bank_accounts'
+            )
+        elif export_format == 'xlsx':
+            from wallet.utils.exporters import export_queryset_to_excel
+            
+            response = export_queryset_to_excel(
+                queryset=queryset,
+                fields=export_fields,
+                filename_prefix='bank_accounts',
+                sheet_name='Bank Accounts'
+            )
+        elif export_format == 'pdf':
+            from wallet.utils.exporters import export_queryset_to_pdf
+            
+            response = export_queryset_to_pdf(
+                queryset=queryset,
+                fields=export_fields,
+                filename_prefix='bank_accounts',
+                title='Bank Account Records'
+            )
+        else:
+            return Response(
+                {'error': _("Invalid export format. Use 'csv', 'xlsx', or 'pdf'")},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        logger.info(
+            f"Exported {queryset.count()} bank accounts to {export_format} "
+            f"for user {request.user.id}"
+        )
+        
+        return response
+    
+    except Exception as e:
+        logger.error(
+            f"Export failed for user {request.user.id}: {str(e)}",
+            exc_info=True
+        )
+        return Response(
+            {'error': _("Export failed")},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
 # ==========================================
 # BANK VIEWSET

@@ -702,3 +702,134 @@ class CardViewSet(viewsets.ModelViewSet):
                 {"detail": str(e)},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        
+@action(detail=False, methods=['get'])
+def export(self, request):
+    """
+    Export cards to CSV, Excel, or PDF
+    
+    GET /api/cards/export/?format=<format>&wallet_id=<id>&card_type=<type>&is_active=<bool>
+    
+    Query Parameters:
+        - format: Export format ('csv', 'xlsx', or 'pdf', default: 'csv')
+        - wallet_id: Filter by wallet ID (optional)
+        - card_type: Filter by card type (optional)
+        - is_active: Filter by active status (optional)
+        - is_default: Filter by default status (optional)
+        - is_expired: Filter by expiration status (optional)
+    
+    Returns:
+        HttpResponse: File download response (CSV, Excel, or PDF)
+    
+    Response (200):
+        File download with Content-Disposition header
+    
+    Response Error (400):
+        {
+            "error": "Invalid export format. Use 'csv', 'xlsx', or 'pdf'"
+        }
+    
+    Example Usage:
+        GET /api/cards/export/?format=csv
+        GET /api/cards/export/?format=xlsx&wallet_id=123&is_active=true
+        GET /api/cards/export/?format=pdf&card_type=visa
+    """
+    try:
+        # Parse parameters
+        export_format = request.query_params.get('format', 'csv')
+        wallet_id = request.query_params.get('wallet_id')
+        card_type = request.query_params.get('card_type')
+        is_active = request.query_params.get('is_active')
+        is_default = request.query_params.get('is_default')
+        is_expired = request.query_params.get('is_expired')
+        
+        # Build queryset - start with user's cards
+        queryset = self.get_queryset()
+        
+        # Apply filters
+        if wallet_id:
+            queryset = queryset.filter(wallet_id=wallet_id)
+        
+        if card_type:
+            queryset = queryset.by_card_type(card_type)
+        
+        if is_active is not None:
+            queryset = queryset.filter(is_active=is_active.lower() == 'true')
+        
+        if is_default is not None:
+            queryset = queryset.filter(is_default=is_default.lower() == 'true')
+        
+        if is_expired is not None:
+            if is_expired.lower() == 'true':
+                queryset = queryset.expired()
+            else:
+                queryset = queryset.not_expired()
+        
+        # Order by creation date (most recent first)
+        queryset = queryset.order_by('-created_at')
+        
+        # Define fields to export
+        export_fields = [
+            'id',
+            'wallet.tag',
+            'wallet.user.email',
+            'card_type',
+            'last_four',
+            'expiry_month',
+            'expiry_year',
+            'bank',
+            'country_code',
+            'is_default',
+            'is_active',
+            'created_at',
+        ]
+        
+        # Export based on format
+        if export_format == 'csv':
+            from wallet.utils.exporters import export_queryset_to_csv
+            
+            response = export_queryset_to_csv(
+                queryset=queryset,
+                fields=export_fields,
+                filename_prefix='cards'
+            )
+        elif export_format == 'xlsx':
+            from wallet.utils.exporters import export_queryset_to_excel
+            
+            response = export_queryset_to_excel(
+                queryset=queryset,
+                fields=export_fields,
+                filename_prefix='cards',
+                sheet_name='Cards'
+            )
+        elif export_format == 'pdf':
+            from wallet.utils.exporters import export_queryset_to_pdf
+            
+            response = export_queryset_to_pdf(
+                queryset=queryset,
+                fields=export_fields,
+                filename_prefix='cards',
+                title='Card Records'
+            )
+        else:
+            return Response(
+                {'error': _("Invalid export format. Use 'csv', 'xlsx', or 'pdf'")},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        logger.info(
+            f"Exported {queryset.count()} cards to {export_format} "
+            f"for user {request.user.id}"
+        )
+        
+        return response
+    
+    except Exception as e:
+        logger.error(
+            f"Export failed for user {request.user.id}: {str(e)}",
+            exc_info=True
+        )
+        return Response(
+            {'error': _("Export failed")},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )

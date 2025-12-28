@@ -1099,3 +1099,124 @@ class WalletViewSet(viewsets.ModelViewSet):
                 _("An unexpected error occurred. Please try again later."),
                 status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+        
+@action(detail=False, methods=['get'])
+def export(self, request: Request):
+    """
+    Export wallets to CSV, Excel, or PDF
+    
+    GET /api/wallets/export/?format=<format>&is_active=<bool>&is_locked=<bool>
+    
+    Query Parameters:
+        - format: Export format ('csv', 'xlsx', or 'pdf', default: 'csv')
+        - is_active: Filter by active status (optional)
+        - is_locked: Filter by locked status (optional)
+        - search: Search by tag or user email (optional)
+    
+    Returns:
+        HttpResponse: File download response (CSV, Excel, or PDF)
+    
+    Response (200):
+        File download with Content-Disposition header
+    
+    Response Error (400):
+        {
+            "error": "Invalid export format. Use 'csv', 'xlsx', or 'pdf'"
+        }
+    
+    Example Usage:
+        GET /api/wallets/export/?format=csv
+        GET /api/wallets/export/?format=xlsx&is_active=true
+        GET /api/wallets/export/?format=pdf&is_locked=false
+    """
+    try:
+        # Parse parameters
+        export_format = request.query_params.get('format', 'csv')
+        is_active = request.query_params.get('is_active')
+        is_locked = request.query_params.get('is_locked')
+        search = request.query_params.get('search')
+        
+        # Build queryset - start with user's wallets
+        queryset = self.get_queryset()
+        
+        # Apply filters
+        if is_active is not None:
+            queryset = queryset.filter(is_active=is_active.lower() == 'true')
+        
+        if is_locked is not None:
+            queryset = queryset.filter(is_locked=is_locked.lower() == 'true')
+        
+        if search:
+            from django.db.models import Q
+            queryset = queryset.filter(
+                Q(tag__icontains=search) |
+                Q(user__email__icontains=search) |
+                Q(user__username__icontains=search)
+            )
+        
+        # Order by creation date (most recent first)
+        queryset = queryset.order_by('-created_at')
+        
+        # Define fields to export
+        export_fields = [
+            'id',
+            'tag',
+            'user.email',
+            'user.username',
+            'balance.amount',
+            'balance.currency.code',
+            'is_active',
+            'is_locked',
+            'created_at',
+            'updated_at',
+        ]
+        
+        # Export based on format
+        if export_format == 'csv':
+            from wallet.utils.exporters import export_queryset_to_csv
+            
+            response = export_queryset_to_csv(
+                queryset=queryset,
+                fields=export_fields,
+                filename_prefix='wallets'
+            )
+        elif export_format == 'xlsx':
+            from wallet.utils.exporters import export_queryset_to_excel
+            
+            response = export_queryset_to_excel(
+                queryset=queryset,
+                fields=export_fields,
+                filename_prefix='wallets',
+                sheet_name='Wallets'
+            )
+        elif export_format == 'pdf':
+            from wallet.utils.exporters import export_queryset_to_pdf
+            
+            response = export_queryset_to_pdf(
+                queryset=queryset,
+                fields=export_fields,
+                filename_prefix='wallets',
+                title='Wallet Records'
+            )
+        else:
+            return Response(
+                {'error': _("Invalid export format. Use 'csv', 'xlsx', or 'pdf'")},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        logger.info(
+            f"Exported {queryset.count()} wallets to {export_format} "
+            f"for user {request.user.id}"
+        )
+        
+        return response
+    
+    except Exception as e:
+        logger.error(
+            f"Export failed for user {request.user.id}: {str(e)}",
+            exc_info=True
+        )
+        return Response(
+            {'error': _("Export failed")},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
