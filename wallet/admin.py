@@ -737,11 +737,19 @@ class WebhookEventAdmin(ExportMixin, admin.ModelAdmin):
                 event_type = event.event_type
                 data = event.payload.get('data', {})
                 
-                # Try to process with transaction service
-                transaction_processed = webhook_service.transaction_service.process_paystack_webhook(event_type, data)
+                # ✅ FIX: Try to process with transaction service - PASS webhook event!
+                transaction_processed = webhook_service.transaction_service.process_paystack_webhook(
+                    event_type, 
+                    data,
+                    event  # ✅ Pass the webhook event
+                )
                 
-                # Try to process with settlement service
-                settlement_processed = webhook_service.settlement_service.process_paystack_webhook(event_type, data)
+                # ✅ FIX: Try to process with settlement service - PASS webhook event!
+                settlement_processed = webhook_service.settlement_service.process_paystack_webhook(
+                    event_type, 
+                    data,
+                    event  # ✅ Pass the webhook event
+                )
                 
                 # Mark as processed if either service handled it
                 success = transaction_processed or settlement_processed
@@ -762,7 +770,9 @@ class WebhookEventAdmin(ExportMixin, admin.ModelAdmin):
             messages.success(request, _("Processed {} webhook events").format(processed))
         else:
             messages.info(request, _("No webhook events were processed"))
+
     process_events.short_description = _("Process selected webhook events")
+
 
 
 class WebhookEndpointAdmin(ExportMixin, admin.ModelAdmin):

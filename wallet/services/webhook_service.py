@@ -180,7 +180,8 @@ class WebhookService:
         try:
             transaction_processed = self.transaction_service.process_paystack_webhook(
                 event_type, 
-                data
+                data,
+                webhook_event  # ✅ FIX: Now passing webhook_event!
             )
             if transaction_processed:
                 processed = True
@@ -197,7 +198,8 @@ class WebhookService:
         try:
             settlement_processed = self.settlement_service.process_paystack_webhook(
                 event_type, 
-                data
+                data,
+                webhook_event  # ✅ FIX: Now passing webhook_event!
             )
             if settlement_processed:
                 processed = True
@@ -232,7 +234,7 @@ class WebhookService:
             )
         
         return processed
-    
+
     # ==================== Webhook Forwarding ====================
     
     def _forward_to_endpoints(self, webhook_event: WebhookEvent) -> None:

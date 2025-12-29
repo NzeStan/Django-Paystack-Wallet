@@ -755,22 +755,41 @@ class SettlementService:
     # WEBHOOK PROCESSING
     # ==========================================
     
-    def process_paystack_webhook(self, event_type: str, data: Dict) -> bool:
-        """Process a Paystack webhook event related to settlements"""
+    def process_paystack_webhook(self, event_type: str, data: Dict, webhook_event=None) -> bool:
+        """
+        Process a Paystack webhook event related to settlements
+        
+        Args:
+            event_type (str): Webhook event type
+            data (Dict): Webhook event data
+            webhook_event (WebhookEvent, optional): The webhook event record to link
+            
+        Returns:
+            bool: True if processed successfully, False if not a relevant event
+        """
         logger.info(f"Processing webhook event: {event_type}")
         
         if event_type == 'transfer.success':
-            return self._process_transfer_success(data)
+            return self._process_transfer_success(data, webhook_event)
         elif event_type == 'transfer.failed':
-            return self._process_transfer_failed(data)
+            return self._process_transfer_failed(data, webhook_event)
         elif event_type == 'transfer.reversed':
-            return self._process_transfer_reversed(data)
+            return self._process_transfer_reversed(data, webhook_event)
         
         return False
     
     @db_transaction.atomic
-    def _process_transfer_success(self, data: Dict) -> bool:
-        """Process transfer.success webhook"""
+    def _process_transfer_success(self, data: Dict, webhook_event=None) -> bool:
+        """
+        Process transfer.success webhook
+        
+        Args:
+            data (Dict): Webhook event data
+            webhook_event (WebhookEvent, optional): The webhook event record to link
+            
+        Returns:
+            bool: True if processed successfully
+        """
         reference = data.get('reference')
         transfer_code = data.get('transfer_code')
         
@@ -795,6 +814,15 @@ class SettlementService:
             
             settlement.mark_as_success(data)
             
+            # ✅ FIX: Link webhook event to settlement transaction
+            if webhook_event and settlement.transaction:
+                webhook_event.transaction = settlement.transaction
+                webhook_event.save(update_fields=['transaction'])
+                logger.debug(
+                    f"Linked webhook event {webhook_event.id} to "
+                    f"settlement transaction {settlement.transaction.id}"
+                )
+            
             if settlement.transaction:
                 settlement.transaction.status = TRANSACTION_STATUS_SUCCESS
                 settlement.transaction.paystack_reference = transfer_code
@@ -807,8 +835,17 @@ class SettlementService:
         return False
     
     @db_transaction.atomic
-    def _process_transfer_failed(self, data: Dict) -> bool:
-        """Process transfer.failed webhook"""
+    def _process_transfer_failed(self, data: Dict, webhook_event=None) -> bool:
+        """
+        Process transfer.failed webhook
+        
+        Args:
+            data (Dict): Webhook event data
+            webhook_event (WebhookEvent, optional): The webhook event record to link
+            
+        Returns:
+            bool: True if processed successfully
+        """
         reference = data.get('reference')
         transfer_code = data.get('transfer_code')
         reason = data.get('reason', _("Transfer failed"))
@@ -818,6 +855,15 @@ class SettlementService:
         if settlement:
             settlement.mark_as_failed(reason, data)
             
+            # ✅ FIX: Link webhook event to settlement transaction
+            if webhook_event and settlement.transaction:
+                webhook_event.transaction = settlement.transaction
+                webhook_event.save(update_fields=['transaction'])
+                logger.debug(
+                    f"Linked webhook event {webhook_event.id} to "
+                    f"settlement transaction {settlement.transaction.id}"
+                )
+            
             if settlement.transaction:
                 settlement.transaction.status = TRANSACTION_STATUS_FAILED
                 settlement.transaction.failed_reason = reason
@@ -826,10 +872,20 @@ class SettlementService:
             return True
         
         return False
+
     
     @db_transaction.atomic
-    def _process_transfer_reversed(self, data: Dict) -> bool:
-        """Process transfer.reversed webhook"""
+    def _process_transfer_reversed(self, data: Dict, webhook_event=None) -> bool:
+        """
+        Process transfer.reversed webhook
+        
+        Args:
+            data (Dict): Webhook event data
+            webhook_event (WebhookEvent, optional): The webhook event record to link
+            
+        Returns:
+            bool: True if processed successfully
+        """
         reference = data.get('reference')
         transfer_code = data.get('transfer_code')
         reason = data.get('reason', _("Transfer reversed"))
@@ -842,6 +898,15 @@ class SettlementService:
             settlement.paystack_transfer_data = data
             settlement.save()
             
+            # ✅ FIX: Link webhook event to settlement transaction
+            if webhook_event and settlement.transaction:
+                webhook_event.transaction = settlement.transaction
+                webhook_event.save(update_fields=['transaction'])
+                logger.debug(
+                    f"Linked webhook event {webhook_event.id} to "
+                    f"settlement transaction {settlement.transaction.id}"
+                )
+            
             if settlement.is_completed:
                 try:
                     settlement.wallet.deposit(settlement.amount.amount)
@@ -851,12 +916,13 @@ class SettlementService:
                         settlement.transaction.failed_reason = reason
                         settlement.transaction.save()
                 except Exception as e:
-                    logger.error(f"Error refunding after reversal: {str(e)}")
+                    logger.error(f"Error reversing settlement: {str(e)}")
+                    return False
             
             return True
         
         return False
-    
+
     def _find_settlement(
         self,
         reference: Optional[str],
