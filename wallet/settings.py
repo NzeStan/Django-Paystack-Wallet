@@ -25,7 +25,6 @@ WALLET_SETTINGS = {
     # Transaction Limits
     'MINIMUM_BALANCE': getattr(settings, 'WALLET_MINIMUM_BALANCE', 0),
     'MAXIMUM_DAILY_TRANSACTION': getattr(settings, 'WALLET_MAXIMUM_DAILY_TRANSACTION', 1000000),
-    'TRANSACTION_CHARGE_PERCENT': getattr(settings, 'WALLET_TRANSACTION_CHARGE_PERCENT', 1.5),  # ✅ IMPLEMENT
     
     # Settlement
     'AUTO_SETTLEMENT': getattr(settings, 'WALLET_AUTO_SETTLEMENT', False),
