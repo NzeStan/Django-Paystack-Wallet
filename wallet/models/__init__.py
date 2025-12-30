@@ -16,6 +16,11 @@ from wallet.models.settlement import (
     SettlementScheduleQuerySet,
     SettlementScheduleManager
 )
+from wallet.models.fee_config import (
+    FeeConfiguration,
+    FeeTier,
+    FeeHistory
+)
 
 
 __all__ = [
@@ -44,6 +49,10 @@ __all__ = [
     'SettlementSchedule',
     'SettlementScheduleQuerySet',
     'SettlementScheduleManager',
+    # Fee models 
+    'FeeConfiguration',
+    'FeeTier',
+    'FeeHistory',
 ]
 
 

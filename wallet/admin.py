@@ -14,6 +14,7 @@ from wallet.models import (
     WebhookEvent, WebhookEndpoint, WebhookDeliveryAttempt,
     TransferRecipient, Settlement, SettlementSchedule
 )
+from wallet.models.fee_config import FeeConfiguration, FeeTier, FeeHistory
 from wallet.services.wallet_service import WalletService
 from wallet.services.transaction_service import TransactionService
 from wallet.services.settlement_service import SettlementService
@@ -214,60 +215,106 @@ class WalletAdmin(ExportMixin, AnalyticsMixin, admin.ModelAdmin):
 
 class TransactionAdmin(ExportMixin, AnalyticsMixin, admin.ModelAdmin):
     """Admin for the Transaction model"""
-    
     list_display = (
-        'id', 'reference', 'wallet_link', 'formatted_amount',
-        'transaction_type', 'status', 'created_at', 'completed_at'
+        'id',
+        'reference',
+        'wallet_link',
+        'amount_display',
+        'fees_display',
+        'fee_bearer_display',
+        'net_amount_display',
+        'transaction_type',
+        'status',
+        'created_at',
+        'completed_at',
     )
     list_filter = (
-        'transaction_type', 'status', 'payment_method',
-        'created_at', 'completed_at'
+        'transaction_type',
+        'status',
+        'payment_method',
+        'fee_bearer',
+        'created_at',
+        'completed_at',
     )
     search_fields = (
         'id', 'wallet__id', 'wallet__user__email', 'reference',
         'paystack_reference', 'description'
     )
     readonly_fields = (
-        'id', 'wallet', 'reference', 'amount', 'transaction_type',
-        'status', 'payment_method', 'description', 'metadata',
-        'paystack_reference', 'paystack_response', 'recipient_wallet',
-        'recipient_bank_account', 'card', 'related_transaction',
-        'fees', 'ip_address', 'user_agent', 'completed_at',
-        'failed_reason', 'created_at', 'updated_at'
+        'id',
+        'wallet',
+        'reference',
+        'amount',
+        'fees',
+        'fee_bearer',
+        'net_amount_display',
+        'transaction_type',
+        'status',
+        'payment_method',
+        'description',
+        'metadata',
+        'paystack_reference',
+        'paystack_response',
+        'recipient_wallet',
+        'recipient_bank_account',
+        'card',
+        'related_transaction',
+        'ip_address',
+        'user_agent',
+        'completed_at',
+        'failed_reason',
+        'created_at',
+        'updated_at',
     )
     actions = ExportMixin.actions + ['mark_as_successful', 'mark_as_failed', 'refresh_from_paystack']
     fieldsets = (
         (None, {
-            'fields': ('id', 'reference', 'wallet', 'amount')
+            'fields': ('id', 'reference', 'wallet')
+        }),
+        (_('Amount Details'), {
+            'fields': (
+                'amount',
+                'fees',
+                'fee_bearer',
+                'net_amount_display',
+            )
         }),
         (_('Transaction Details'), {
             'fields': (
-                'transaction_type', 'status', 'payment_method',
-                'description', 'metadata'
+                'transaction_type',
+                'status',
+                'payment_method',
+                'description',
+                'metadata',
             )
         }),
         (_('Related Entities'), {
             'fields': (
-                'recipient_wallet', 'recipient_bank_account',
-                'card', 'related_transaction'
+                'recipient_wallet',
+                'recipient_bank_account',
+                'card',
+                'related_transaction',
             )
         }),
         (_('Paystack Integration'), {
-            'fields': ('paystack_reference', 'paystack_response')
-        }),
-        (_('Financial Details'), {
-            'fields': ('fees',)
+            'fields': (
+                'paystack_reference',
+                'paystack_response',
+            )
         }),
         (_('Additional Information'), {
             'fields': (
-                'ip_address', 'user_agent', 'completed_at',
-                'failed_reason'
+                'ip_address',
+                'user_agent',
+                'completed_at',
+                'failed_reason',
             )
         }),
         (_('Timestamps'), {
             'fields': ('created_at', 'updated_at')
         }),
     )
+
     
     def wallet_link(self, obj):
         """Link to the wallet admin"""
@@ -346,6 +393,39 @@ class TransactionAdmin(ExportMixin, AnalyticsMixin, admin.ModelAdmin):
         else:
             messages.info(request, _("No transactions were updated"))
     refresh_from_paystack.short_description = _("Refresh status from Paystack")
+
+    def fees_display(self, obj):
+        """Display fee amount"""
+        if obj.fees and obj.fees.amount > 0:
+            return f"{obj.fees.amount} {obj.fees.currency.code}"
+        return "-"
+    fees_display.short_description = _("Fees")
+    
+    def fee_bearer_display(self, obj):
+        """Display fee bearer with color coding"""
+        if not obj.fee_bearer:
+            return "-"
+        
+        colors = {
+            'customer': '#28a745',  # Green
+            'merchant': '#ffc107',  # Yellow
+            'platform': '#dc3545',  # Red
+            'split': '#17a2b8',  # Blue
+        }
+        
+        color = colors.get(obj.fee_bearer, '#6c757d')
+        return format_html(
+            '<span style="color: {}; font-weight: bold;">{}</span>',
+            color,
+            obj.get_fee_bearer_display() if obj.fee_bearer else '-'
+        )
+    fee_bearer_display.short_description = _("Fee Bearer")
+    
+    def net_amount_display(self, obj):
+        """Display net amount (amount - fees)"""
+        net = obj.net_amount
+        return f"{net.amount} {net.currency.code}"
+    net_amount_display.short_description = _("Net Amount")
 
     def get_queryset(self, request):
 
@@ -1095,6 +1175,200 @@ class SettlementScheduleAdmin(ExportMixin, admin.ModelAdmin):
         else:
             messages.info(request, _("No schedules were updated"))
     recalculate_next_settlement.short_description = _("Recalculate next settlement date")
+
+@admin.register(FeeConfiguration)
+class FeeConfigurationAdmin(admin.ModelAdmin):
+    """Admin for Fee Configuration"""
+    
+    list_display = [
+        'name', 'scope_display', 'transaction_type', 'payment_channel',
+        'fee_type_display', 'fee_bearer', 'is_active', 'priority'
+    ]
+    
+    list_filter = [
+        'transaction_type', 'payment_channel', 'fee_type',
+        'fee_bearer', 'is_active', 'created_at'
+    ]
+    
+    search_fields = [
+        'name', 'description', 'wallet__id', 'wallet__user__email'
+    ]
+    
+    readonly_fields = [
+        'id', 'created_at', 'updated_at'
+    ]
+    
+    fieldsets = (
+        (_('Basic Information'), {
+            'fields': ('name', 'description', 'wallet', 'is_active', 'priority')
+        }),
+        (_('Transaction Scope'), {
+            'fields': ('transaction_type', 'payment_channel')
+        }),
+        (_('Fee Structure'), {
+            'fields': (
+                'fee_type', 'percentage_fee', 'flat_fee',
+                'fee_cap', 'minimum_fee', 'waiver_threshold'
+            )
+        }),
+        (_('Bearer Configuration'), {
+            'fields': (
+                'fee_bearer', 'customer_percentage', 'merchant_percentage'
+            )
+        }),
+        (_('Validity Period'), {
+            'fields': ('valid_from', 'valid_until')
+        }),
+        (_('Metadata'), {
+            'fields': ('metadata',),
+            'classes': ('collapse',)
+        }),
+        (_('System Info'), {
+            'fields': ('id', 'created_at', 'updated_at'),
+            'classes': ('collapse',)
+        }),
+    )
+    
+    actions = ['activate_configurations', 'deactivate_configurations']
+    
+    def scope_display(self, obj):
+        """Display configuration scope"""
+        if obj.wallet:
+            return format_html(
+                '<a href="/admin/wallet/wallet/{}/change/">{}</a>',
+                obj.wallet.id,
+                f"Wallet {obj.wallet.id}"
+            )
+        return format_html('<strong>Global</strong>')
+    scope_display.short_description = _("Scope")
+    
+    def fee_type_display(self, obj):
+        """Display fee structure summary"""
+        if obj.fee_type == 'percentage':
+            return f"{obj.percentage_fee}%"
+        elif obj.fee_type == 'flat':
+            return f"{obj.flat_fee.amount} {obj.flat_fee.currency.code}"
+        else:  # hybrid
+            parts = []
+            if obj.percentage_fee:
+                parts.append(f"{obj.percentage_fee}%")
+            if obj.flat_fee.amount:
+                parts.append(f"{obj.flat_fee.amount} {obj.flat_fee.currency.code}")
+            return " + ".join(parts)
+    fee_type_display.short_description = _("Fee Structure")
+    
+    def activate_configurations(self, request, queryset):
+        """Activate selected configurations"""
+        updated = queryset.update(is_active=True)
+        self.message_user(
+            request,
+            f"{updated} configuration(s) activated successfully."
+        )
+    activate_configurations.short_description = _("Activate selected configurations")
+    
+    def deactivate_configurations(self, request, queryset):
+        """Deactivate selected configurations"""
+        updated = queryset.update(is_active=False)
+        self.message_user(
+            request,
+            f"{updated} configuration(s) deactivated successfully."
+        )
+    deactivate_configurations.short_description = _("Deactivate selected configurations")
+
+
+class FeeTierInline(admin.TabularInline):
+    """Inline admin for fee tiers"""
+    model = FeeTier
+    extra = 1
+    fields = ['min_amount', 'max_amount', 'fee_amount']
+
+
+@admin.register(FeeTier)
+class FeeTierAdmin(admin.ModelAdmin):
+    """Admin for Fee Tier"""
+    
+    list_display = [
+        'configuration', 'range_display', 'fee_amount', 'created_at'
+    ]
+    
+    list_filter = [
+        'configuration__transaction_type', 'created_at'
+    ]
+    
+    search_fields = [
+        'configuration__name'
+    ]
+    
+    readonly_fields = [
+        'id', 'created_at', 'updated_at'
+    ]
+    
+    def range_display(self, obj):
+        """Display amount range"""
+        max_display = f"{obj.max_amount.amount}" if obj.max_amount else "∞"
+        return f"{obj.min_amount.amount} - {max_display}"
+    range_display.short_description = _("Amount Range")
+
+
+@admin.register(FeeHistory)
+class FeeHistoryAdmin(admin.ModelAdmin):
+    """Admin for Fee History"""
+    
+    list_display = [
+        'transaction_link', 'calculation_method', 'original_amount',
+        'calculated_fee', 'fee_bearer', 'created_at'
+    ]
+    
+    list_filter = [
+        'calculation_method', 'fee_bearer', 'created_at'
+    ]
+    
+    search_fields = [
+        'transaction__reference', 'transaction__wallet__id'
+    ]
+    
+    readonly_fields = [
+        'id', 'transaction', 'configuration_used', 'calculation_method',
+        'original_amount', 'calculated_fee', 'fee_bearer',
+        'calculation_details', 'created_at', 'updated_at'
+    ]
+    
+    fieldsets = (
+        (_('Transaction Info'), {
+            'fields': ('transaction', 'configuration_used')
+        }),
+        (_('Calculation Details'), {
+            'fields': (
+                'calculation_method', 'original_amount',
+                'calculated_fee', 'fee_bearer'
+            )
+        }),
+        (_('Breakdown'), {
+            'fields': ('calculation_details',),
+            'classes': ('collapse',)
+        }),
+        (_('System Info'), {
+            'fields': ('id', 'created_at', 'updated_at'),
+            'classes': ('collapse',)
+        }),
+    )
+    
+    def transaction_link(self, obj):
+        """Link to transaction"""
+        return format_html(
+            '<a href="/admin/wallet/transaction/{}/change/">{}</a>',
+            obj.transaction.id,
+            obj.transaction.reference
+        )
+    transaction_link.short_description = _("Transaction")
+    
+    def has_add_permission(self, request):
+        """Fee history is automatically created, don't allow manual creation"""
+        return False
+    
+    def has_change_permission(self, request, obj=None):
+        """Fee history is read-only"""
+        return False
 
 
 # Register admin classes

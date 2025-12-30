@@ -46,6 +46,7 @@ PAYMENT_METHOD_QR = 'qr'
 PAYMENT_METHOD_MOBILE_MONEY = 'mobile_money'
 PAYMENT_METHOD_BANK_TRANSFER = 'bank_transfer'
 PAYMENT_METHOD_WALLET = 'wallet'
+PAYMENT_METHOD_DVA = 'dva'  # Dedicated Virtual Account
 
 PAYMENT_METHODS = (
     (PAYMENT_METHOD_CARD, _('Card')),
@@ -55,6 +56,59 @@ PAYMENT_METHODS = (
     (PAYMENT_METHOD_MOBILE_MONEY, _('Mobile Money')),
     (PAYMENT_METHOD_BANK_TRANSFER, _('Bank Transfer')),
     (PAYMENT_METHOD_WALLET, _('Wallet')),
+    (PAYMENT_METHOD_DVA, _('Dedicated Virtual Account')),
+)
+
+# ==========================================
+# FEE BEARER OPTIONS
+# ==========================================
+
+FEE_BEARER_CUSTOMER = 'customer'
+FEE_BEARER_MERCHANT = 'merchant'
+FEE_BEARER_PLATFORM = 'platform'
+FEE_BEARER_SPLIT = 'split'
+
+FEE_BEARERS = (
+    (FEE_BEARER_CUSTOMER, _('Customer')),
+    (FEE_BEARER_MERCHANT, _('Merchant')),
+    (FEE_BEARER_PLATFORM, _('Platform')),
+    (FEE_BEARER_SPLIT, _('Split')),
+)
+
+# ==========================================
+# FEE TYPES
+# ==========================================
+
+FEE_TYPE_PERCENTAGE = 'percentage'
+FEE_TYPE_FLAT = 'flat'
+FEE_TYPE_HYBRID = 'hybrid'  # Percentage + Flat
+
+FEE_TYPES = (
+    (FEE_TYPE_PERCENTAGE, _('Percentage')),
+    (FEE_TYPE_FLAT, _('Flat')),
+    (FEE_TYPE_HYBRID, _('Hybrid')),
+)
+
+# ==========================================
+# PAYMENT CHANNELS (for fee differentiation)
+# ==========================================
+
+PAYMENT_CHANNEL_LOCAL_CARD = 'local_card'
+PAYMENT_CHANNEL_INTL_CARD = 'intl_card'
+PAYMENT_CHANNEL_DVA = 'dva'
+PAYMENT_CHANNEL_BANK_TRANSFER = 'bank_transfer'
+PAYMENT_CHANNEL_USSD = 'ussd'
+PAYMENT_CHANNEL_QR = 'qr'
+PAYMENT_CHANNEL_MOBILE_MONEY = 'mobile_money'
+
+PAYMENT_CHANNELS = (
+    (PAYMENT_CHANNEL_LOCAL_CARD, _('Local Card')),
+    (PAYMENT_CHANNEL_INTL_CARD, _('International Card')),
+    (PAYMENT_CHANNEL_DVA, _('Dedicated Virtual Account')),
+    (PAYMENT_CHANNEL_BANK_TRANSFER, _('Bank Transfer')),
+    (PAYMENT_CHANNEL_USSD, _('USSD')),
+    (PAYMENT_CHANNEL_QR, _('QR Code')),
+    (PAYMENT_CHANNEL_MOBILE_MONEY, _('Mobile Money')),
 )
 
 # Bank Account Types

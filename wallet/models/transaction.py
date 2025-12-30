@@ -10,7 +10,7 @@ from wallet.constants import (
     TRANSACTION_TYPES, TRANSACTION_STATUSES, PAYMENT_METHODS,
     TRANSACTION_TYPE_DEPOSIT, TRANSACTION_STATUS_PENDING,
     TRANSACTION_STATUS_SUCCESS, TRANSACTION_STATUS_FAILED,
-    TRANSACTION_STATUS_CANCELLED
+    TRANSACTION_STATUS_CANCELLED, FEE_BEARERS, FEE_BEARER_PLATFORM
 )
 
 
@@ -347,6 +347,18 @@ class Transaction(BaseModel):
         default=0,
         default_currency=get_wallet_setting('CURRENCY'),
         verbose_name=_('Fees')
+    )
+
+    # ✅ ADD THIS NEW FIELD:
+    fee_bearer = models.CharField(
+        max_length=20,
+        choices=FEE_BEARERS,
+        default=FEE_BEARER_PLATFORM,
+        blank=True,
+        null=True,
+        db_index=True,
+        verbose_name=_('Fee Bearer'),
+        help_text=_('Who bears the transaction fee')
     )
     
     # ==========================================

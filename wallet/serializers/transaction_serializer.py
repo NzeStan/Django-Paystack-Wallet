@@ -13,17 +13,22 @@ from wallet.constants import TRANSACTION_TYPES, TRANSACTION_STATUSES, PAYMENT_ME
 class TransactionSerializer(serializers.ModelSerializer):
     """
     Full serializer for the Transaction model
-    
-    Provides complete transaction data including all fields and relationships.
-    Used for detailed transaction views and comprehensive data exports.
+    Includes wallet, amount, fees, and net calculations
     """
-    
+
+    # ───────────────────────────
     # Wallet fields
+    # ───────────────────────────
     wallet_id = serializers.UUIDField(source='wallet.id', read_only=True)
     wallet_tag = serializers.CharField(source='wallet.tag', read_only=True)
-    wallet_user_email = serializers.EmailField(source='wallet.user.email', read_only=True)
-    
+    wallet_user_email = serializers.EmailField(
+        source='wallet.user.email',
+        read_only=True
+    )
+
+    # ───────────────────────────
     # Amount fields
+    # ───────────────────────────
     amount_value = serializers.DecimalField(
         source='amount.amount',
         decimal_places=2,
@@ -34,8 +39,39 @@ class TransactionSerializer(serializers.ModelSerializer):
         source='amount.currency.code',
         read_only=True
     )
-    
+
+    # ───────────────────────────
+    # Fee fields ✅ NEW / UPGRADED
+    # ───────────────────────────
+    fees_value = serializers.DecimalField(
+        source='fees.amount',
+        decimal_places=2,
+        max_digits=19,
+        read_only=True
+    )
+    fees_currency = serializers.CharField(
+        source='fees.currency.code',
+        read_only=True
+    )
+    fee_bearer = serializers.CharField(read_only=True)
+
+    # ───────────────────────────
+    # Net amount (amount - fees)
+    # ───────────────────────────
+    net_amount_value = serializers.DecimalField(
+        source='net_amount.amount',
+        decimal_places=2,
+        max_digits=19,
+        read_only=True
+    )
+    net_amount_currency = serializers.CharField(
+        source='net_amount.currency.code',
+        read_only=True
+    )
+
+    # ───────────────────────────
     # Display fields
+    # ───────────────────────────
     transaction_type_display = serializers.CharField(
         source='get_transaction_type_display',
         read_only=True
@@ -48,8 +84,10 @@ class TransactionSerializer(serializers.ModelSerializer):
         source='get_payment_method_display',
         read_only=True
     )
-    
+
+    # ───────────────────────────
     # Relationship fields
+    # ───────────────────────────
     recipient_wallet_id = serializers.UUIDField(
         source='recipient_wallet.id',
         read_only=True,
@@ -75,43 +113,48 @@ class TransactionSerializer(serializers.ModelSerializer):
         read_only=True,
         allow_null=True
     )
-    
-    # Fees field
-    fees_value = serializers.DecimalField(
-        source='fees.amount',
-        decimal_places=2,
-        max_digits=19,
-        read_only=True
-    )
-    
-    # Computed fields
-    net_amount = serializers.DecimalField(
-        source='net_amount.amount',
-        decimal_places=2,
-        max_digits=19,
-        read_only=True
-    )
+
+    # ───────────────────────────
+    # Computed flags
+    # ───────────────────────────
     is_successful = serializers.BooleanField(read_only=True)
     is_failed = serializers.BooleanField(read_only=True)
     is_pending = serializers.BooleanField(read_only=True)
-    
+
     class Meta:
         model = Transaction
         fields = [
-            'id', 'wallet_id', 'wallet_tag', 'wallet_user_email',
-            'amount_value', 'amount_currency', 'reference',
+            # Core
+            'id', 'reference', 'paystack_reference',
             'transaction_type', 'transaction_type_display',
             'status', 'status_display',
             'payment_method', 'payment_method_display',
             'description', 'metadata',
+
+            # Wallet
+            'wallet_id', 'wallet_tag', 'wallet_user_email',
+
+            # Amounts
+            'amount_value', 'amount_currency',
+            'fees_value', 'fees_currency', 'fee_bearer',
+            'net_amount_value', 'net_amount_currency',
+
+            # Relationships
             'recipient_wallet_id', 'recipient_wallet_tag',
-            'recipient_bank_account_id', 'card_id', 'related_transaction_id',
-            'fees_value', 'net_amount',
+            'recipient_bank_account_id',
+            'card_id', 'related_transaction_id',
+
+            # Meta
             'ip_address', 'user_agent',
             'is_successful', 'is_failed', 'is_pending',
-            'created_at', 'updated_at', 'completed_at', 'failed_reason'
+
+            # Timestamps
+            'created_at', 'updated_at', 'completed_at',
+            'failed_reason',
         ]
+
         read_only_fields = fields
+
 
 
 class TransactionDetailSerializer(TransactionSerializer):

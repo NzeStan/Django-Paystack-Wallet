@@ -13,13 +13,17 @@ from wallet.exceptions import (
     InsufficientFunds,
     WalletLocked
 )
+from wallet.services.fee_service import FeeCalculator
 from wallet.constants import (
     TRANSACTION_TYPE_DEPOSIT,
     TRANSACTION_TYPE_WITHDRAWAL,
     TRANSACTION_TYPE_TRANSFER,
     TRANSACTION_STATUS_PENDING,
     TRANSACTION_STATUS_SUCCESS,
-    TRANSACTION_STATUS_FAILED
+    TRANSACTION_STATUS_FAILED,
+    FEE_BEARER_CUSTOMER, 
+    FEE_BEARER_MERCHANT,
+    PAYMENT_CHANNEL_LOCAL_CARD
 )
 from django.db import transaction as db_transaction
 from wallet.settings import get_wallet_setting
@@ -273,75 +277,80 @@ class WalletService:
         email: Optional[str] = None,
         reference: Optional[str] = None,
         callback_url: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        payment_channel: str = PAYMENT_CHANNEL_LOCAL_CARD,  # ✅ NEW
+        is_international: bool = False,  # ✅ NEW
+        fee_bearer: Optional[str] = None  # ✅ NEW
     ) -> Dict[str, Any]:
         """
         Initialize a Paystack card charge
-        
-        This generates a payment link that users can use to fund their wallet
-        via card payment through Paystack's payment gateway.
-        
-        IMPORTANT: Creates a PENDING transaction FIRST, then initializes with Paystack.
-        This ensures the transaction exists when the webhook arrives.
-        
-        Args:
-            wallet (Wallet): Wallet to deposit into
-            amount (Decimal): Amount to charge
-            email (str, optional): Customer email (defaults to user's email)
-            reference (str, optional): Transaction reference
-            callback_url (str, optional): URL to redirect after payment
-            metadata (dict, optional): Additional metadata
-            
-        Returns:
-            dict: Charge initialization data with authorization URL
-            
-        Raises:
-            PaystackAPIError: If Paystack API call fails
+
+        Creates a PENDING transaction first, then initializes Paystack.
         """
-        
+
         # Ensure we have the customer's email
         email = email or wallet.user.email
-        
         if not email:
             raise ValueError(_("Email is required for card charge"))
-        
+
         # Generate reference if not provided
         if not reference:
             reference = generate_transaction_reference()
-        
-        # Convert amount to minor units (kobo/cents)
-        amount_in_minor_unit = int(Decimal(amount) * 100)
-        
+
+        # ✅ NEW: Calculate fees
+        fee_calculator = FeeCalculator(wallet=wallet)
+        fee_result = fee_calculator.calculate_deposit_fee(
+            amount=Money(amount, get_wallet_setting('CURRENCY')),
+            payment_channel=payment_channel,
+            is_international=is_international,
+            bearer=fee_bearer
+        )
+
+        # ✅ NEW: Determine charge amount based on fee bearer
+        if fee_result.bearer == FEE_BEARER_CUSTOMER:
+            amount_to_charge = fee_result.total_amount.amount
+        else:
+            amount_to_charge = amount
+
+        # Convert amount to minor units
+        amount_in_minor_unit = int(Decimal(amount_to_charge) * 100)
+
         # Prepare metadata
         charge_metadata = metadata.copy() if metadata else {}
         charge_metadata.update({
             'wallet_id': str(wallet.id),
             'user_id': str(wallet.user.id),
-            'transaction_type': 'wallet_deposit'
+            'transaction_type': 'wallet_deposit',
+            'fee_amount': float(fee_result.fee_amount.amount),  # ✅ NEW
+            'fee_bearer': fee_result.bearer,  # ✅ NEW
+            'original_amount': float(amount),  # ✅ NEW
         })
-        
+
         logger.info(
             f"Initializing card charge for wallet {wallet.id}: "
-            f"amount={amount}, reference={reference}"
+            f"amount={amount}, fee={fee_result.fee_amount.amount}, "
+            f"total_charge={amount_to_charge}, bearer={fee_result.bearer}"
         )
-        
-        # This ensures the transaction exists when the webhook arrives
+
+        # ✅ UPDATED: Create transaction with fee data
         transaction = Transaction.objects.create(
             wallet=wallet,
-            amount=amount,
+            amount=Money(amount, get_wallet_setting('CURRENCY')),
+            fees=fee_result.fee_amount,  # ✅ NEW
+            fee_bearer=fee_result.bearer,  # ✅ NEW
             transaction_type=TRANSACTION_TYPE_DEPOSIT,
             status=TRANSACTION_STATUS_PENDING,
             description=f"Card deposit of {amount}",
             metadata=charge_metadata,
             reference=reference,
-            payment_method='card'  # Set payment method
+            payment_method='card'
         )
-        
+
         logger.info(
             f"Created PENDING transaction {transaction.id} for card charge: "
-            f"reference={reference}, amount={amount}"
+            f"reference={reference}, amount={amount}, fee={fee_result.fee_amount.amount}"
         )
-        
+
         try:
             # Initialize transaction with Paystack
             charge_data = self.paystack.initialize_transaction(
@@ -351,27 +360,30 @@ class WalletService:
                 callback_url=callback_url,
                 metadata=charge_metadata
             )
-            
+
             logger.info(
                 f"Card charge initialized for wallet {wallet.id}: "
-                f"reference={reference}, access_code={charge_data.get('access_code')}"
+                f"reference={reference}, authorization_url={charge_data.get('authorization_url')}"
             )
-            
-            return charge_data
-        
+
+            # ✅ NEW: return fee breakdown
+            return {
+                **charge_data,
+                'fee_breakdown': fee_result.to_dict(),
+                'transaction_id': str(transaction.id),
+            }
+
         except Exception as e:
-            # If Paystack initialization fails, mark transaction as failed
             transaction.status = TRANSACTION_STATUS_FAILED
             transaction.failed_reason = f"Paystack initialization failed: {str(e)}"
             transaction.save(update_fields=['status', 'failed_reason', 'updated_at'])
-            
+
             logger.error(
                 f"Failed to initialize card charge: {str(e)}",
                 exc_info=True
             )
-            
-            # Re-raise the exception
             raise
+
     
     # ==========================================
     # WITHDRAWAL OPERATIONS
@@ -458,14 +470,15 @@ class WalletService:
             # Re-raise the exception
             raise
 
-    def withdraw_to_bank(   
+    def withdraw_to_bank(
         self,
         wallet: Wallet,
         amount: Decimal,
         bank_account: BankAccount,
         reason: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
-        reference: Optional[str] = None
+        reference: Optional[str] = None,
+        fee_bearer: Optional[str] = None  # ✅ NEW
     ) -> Tuple[Transaction, Dict[str, Any]]:
         """
         Withdraw funds from wallet to a bank account
@@ -484,6 +497,7 @@ class WalletService:
             reason (str, optional): Reason for withdrawal
             metadata (dict, optional): Additional metadata
             reference (str, optional): Custom transaction reference
+            fee_bearer (str, optional): Who bears the withdrawal fee (NEW)
             
         Returns:
             Tuple[Transaction, Dict]: (transaction, paystack_response)
@@ -516,12 +530,36 @@ class WalletService:
         if amount <= 0:
             raise ValueError(_("Amount must be greater than zero"))
         
+        # ✅ NEW: Calculate withdrawal fee
+        fee_calculator = FeeCalculator(wallet=wallet)
+        fee_result = fee_calculator.calculate_withdrawal_fee(
+            amount=Money(amount, wallet.balance.currency),
+            bearer=fee_bearer or FEE_BEARER_MERCHANT  # Default: merchant pays withdrawal fee
+        )
+        
+        # ✅ NEW: Calculate total amount to deduct from wallet
+        if fee_result.bearer == FEE_BEARER_MERCHANT:
+            # Merchant pays fee, deduct amount + fee
+            total_debit = amount + fee_result.fee_amount.amount
+        elif fee_result.bearer == FEE_BEARER_CUSTOMER:
+            # In withdrawal context, "customer" is the wallet owner
+            total_debit = amount + fee_result.fee_amount.amount
+        else:
+            # Platform pays fee, only deduct amount
+            total_debit = amount
+        
+        logger.info(
+            f"Processing withdrawal for wallet {wallet.id}: "
+            f"amount={amount}, fee={fee_result.fee_amount.amount}, "
+            f"total_debit={total_debit}, bearer={fee_result.bearer}"
+        )
+        
         # Check if wallet has sufficient funds (before creating transaction)
-        if wallet.balance < Money(amount, wallet.balance.currency):
+        if wallet.balance < Money(total_debit, wallet.balance.currency):  # ✅ UPDATED: use total_debit
             raise InsufficientFunds(
                 _("Insufficient funds. Available: {}, Required: {}").format(
                     wallet.balance,
-                    Money(amount, wallet.balance.currency)
+                    Money(total_debit, wallet.balance.currency)  # ✅ UPDATED: use total_debit
                 )
             )
         
@@ -545,11 +583,12 @@ class WalletService:
         ip_address = metadata.get('ip_address') or None
         user_agent = metadata.get('user_agent') or None
         
-        # Create withdrawal transaction in PENDING status
-        # This is created BEFORE the API call so webhooks can find it
+        # ✅ UPDATED: Create withdrawal transaction in PENDING status with fee
         txn = Transaction.objects.create(
             wallet=wallet,
             amount=Money(amount, wallet.balance.currency),
+            fees=fee_result.fee_amount,  # ✅ NEW: Store fee
+            fee_bearer=fee_result.bearer,  # ✅ NEW: Store bearer
             transaction_type=TRANSACTION_TYPE_WITHDRAWAL,
             status=TRANSACTION_STATUS_PENDING,
             description=reason,
@@ -563,7 +602,7 @@ class WalletService:
         logger.info(
             f"Created pending withdrawal transaction {txn.id} for wallet {wallet.id}: "
             f"amount={amount}, bank_account={bank_account.id}, "
-            f"reference={reference}"
+            f"reference={reference}, fee={fee_result.fee_amount.amount}"  # ✅ UPDATED: log fee
         )
         
         try:
@@ -620,8 +659,8 @@ class WalletService:
                 # Lock the wallet row to prevent race conditions
                 locked_wallet = Wallet.objects.select_for_update().get(id=wallet.id)
                 
-                # Withdraw from wallet
-                locked_wallet.withdraw(amount)
+                # ✅ UPDATED: Withdraw total_debit (amount + fee if merchant pays)
+                locked_wallet.withdraw(Money(total_debit, wallet.balance.currency))
             
             # Update transaction as successful 
             txn.paystack_reference = transfer_code
@@ -662,191 +701,15 @@ class WalletService:
             txn.failed_reason = str(e)
             txn.save(update_fields=['status', 'failed_reason', 'updated_at'])
             
+            # ✅ UPDATED: Refund wallet if debited
+            try:
+                wallet.deposit(Money(total_debit, wallet.balance.currency))
+                logger.info(f"Refunded wallet {wallet.id} after withdrawal failure")
+            except Exception as refund_error:
+                logger.error(f"Failed to refund wallet after withdrawal failure: {refund_error}")
+            
             logger.error(
                 f"Error processing withdrawal transaction {txn.id}: {str(e)}",
-                exc_info=True
-            )
-            
-            # Re-raise the exception
-            raise
-
-    def finalize_withdrawal(
-        self,
-        transaction: Transaction,
-        otp: str
-    ) -> Dict[str, Any]:
-        """
-        Finalize a pending bank withdrawal with OTP
-        
-        This method is used when Paystack requires OTP verification to complete
-        a bank transfer. The transfer_code from the initial withdraw_to_bank
-        call is stored in the transaction's paystack_reference field.
-        
-        Process:
-        1. Validate transaction is pending and has transfer code
-        2. Call Paystack to finalize transfer with OTP
-        3a. If successful: Withdraw from wallet and mark transaction as success
-        3b. If failed: Mark transaction as failed (don't touch wallet)
-        
-        Args:
-            transaction (Transaction): The pending withdrawal transaction
-            otp (str): One-Time Password received by the user
-            
-        Returns:
-            Dict[str, Any]: Finalization response from Paystack
-            
-        Raises:
-            ValueError: If transaction is invalid or not pending
-            PaystackAPIError: If Paystack API call fails
-        """
-        # Validate transaction
-        if not transaction:
-            raise ValueError(_("Transaction is required"))
-        
-        if transaction.transaction_type != TRANSACTION_TYPE_WITHDRAWAL:
-            raise ValueError(_("Transaction must be a withdrawal"))
-        
-        if transaction.status != TRANSACTION_STATUS_PENDING:
-            raise ValueError(
-                _("Transaction is not pending. Current status: {}").format(
-                    transaction.status
-                )
-            )
-        
-        if not transaction.paystack_reference:
-            raise ValueError(
-                _("Transaction does not have a Paystack transfer code")
-            )
-        
-        transfer_code = transaction.paystack_reference
-        wallet = transaction.wallet
-        
-        logger.info(
-            f"Finalizing withdrawal transaction {transaction.id} for wallet {wallet.id}: "
-            f"transfer_code={transfer_code}, otp={otp[:2]}***"
-        )
-        
-        try:
-            # Call Paystack to finalize the transfer
-            finalization_response = self.paystack.finalize_transfer(
-                transfer_code=transfer_code,
-                otp=otp
-            )
-            
-            logger.info(
-                f"Paystack finalization response for transaction {transaction.id}: "
-                f"status={finalization_response.get('status')}, "
-                f"message={finalization_response.get('message')}"
-            )
-            
-            # Update transaction status based on response
-            response_status = finalization_response.get('status', '').lower()
-            
-            if response_status == 'success':
-                # Transfer was successful - now withdraw from wallet
-                try:
-                    with db_transaction.atomic():
-                        # Lock the wallet row
-                        locked_wallet = Wallet.objects.select_for_update().get(id=wallet.id)
-                        
-                        # Withdraw the amount
-                        locked_wallet.withdraw(transaction.amount.amount)
-                    
-                    # Update transaction as successful
-                    transaction.status = TRANSACTION_STATUS_SUCCESS
-                    transaction.completed_at = timezone.now()
-                    transaction.paystack_response = finalization_response
-                    transaction.save(update_fields=[
-                        'status',
-                        'completed_at',
-                        'paystack_response',
-                        'updated_at'
-                    ])
-                    
-                    logger.info(
-                        f"Withdrawal transaction {transaction.id} completed successfully "
-                        f"after OTP verification"
-                    )
-                
-                except Exception as withdraw_error:
-                    # Wallet withdrawal failed after Paystack success
-                    # This is a critical error - log it extensively
-                    logger.critical(
-                        f"CRITICAL: Paystack transfer succeeded but wallet withdrawal failed "
-                        f"for transaction {transaction.id}. "
-                        f"Amount: {transaction.amount}, "
-                        f"Wallet: {wallet.id}, "
-                        f"Error: {str(withdraw_error)}",
-                        exc_info=True
-                    )
-                    
-                    # Mark transaction as failed
-                    transaction.status = TRANSACTION_STATUS_FAILED
-                    transaction.failed_reason = (
-                        f"Wallet withdrawal failed after Paystack success: {str(withdraw_error)}"
-                    )
-                    transaction.paystack_response = finalization_response
-                    transaction.save(update_fields=[
-                        'status',
-                        'failed_reason',
-                        'paystack_response',
-                        'updated_at'
-                    ])
-                    
-                    # Re-raise with a clear message
-                    raise ValueError(
-                        _("Transfer succeeded but wallet update failed. "
-                          "Please contact support immediately.")
-                    )
-            
-            elif response_status in ['failed', 'error']:
-                # Finalization failed - mark transaction as failed
-                # Don't touch wallet balance since Paystack transfer didn't complete
-                transaction.status = TRANSACTION_STATUS_FAILED
-                transaction.failed_reason = finalization_response.get(
-                    'message',
-                    'Transfer finalization failed'
-                )
-                transaction.paystack_response = finalization_response
-                transaction.save(update_fields=[
-                    'status',
-                    'failed_reason',
-                    'paystack_response',
-                    'updated_at'
-                ])
-                
-                logger.warning(
-                    f"Withdrawal transaction {transaction.id} failed during finalization: "
-                    f"{transaction.failed_reason}"
-                )
-            
-            else:
-                # Still pending/processing
-                transaction.paystack_response = finalization_response
-                transaction.save(update_fields=['paystack_response', 'updated_at'])
-                
-                logger.info(
-                    f"Withdrawal transaction {transaction.id} still processing "
-                    f"after OTP submission"
-                )
-            
-            return finalization_response
-        
-        except PaystackAPIError as e:
-            # Paystack API error during finalization
-            logger.error(
-                f"Paystack API error during finalization of transaction {transaction.id}: {str(e)}",
-                exc_info=True
-            )
-            
-            # Don't mark transaction as failed yet - user might want to retry
-            # Just re-raise the exception
-            raise
-        
-        except Exception as e:
-            # Unexpected error
-            logger.error(
-                f"Unexpected error during finalization of transaction {transaction.id}: {str(e)}",
                 exc_info=True
             )
             
