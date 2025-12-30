@@ -16,7 +16,8 @@ from wallet.constants import (
     TRANSACTION_TYPE_REFUND, TRANSACTION_TYPE_REVERSAL,
     TRANSACTION_TYPES, TRANSACTION_STATUSES,
     WEBHOOK_EVENT_CHARGE_SUCCESS, WEBHOOK_EVENT_CHARGE_FAILED,
-    PAYMENT_METHOD_WALLET
+    PAYMENT_METHOD_WALLET, FEE_BEARER_CUSTOMER,
+    FEE_BEARER_MERCHANT
 )
 from wallet.exceptions import (
     TransactionFailed,
@@ -466,17 +467,18 @@ class TransactionService:
         self,
         transaction: Transaction,
         amount: Optional[Decimal] = None,
+        refund_fees: bool = True,
         reason: Optional[str] = None
     ) -> Transaction:
         """
         Create a refund for a transaction
         
-        Uses a two-phase approach: create transaction first, then update balance
-        in a nested transaction to ensure failed refunds are still recorded.
+        Now supports fee refund based on original fee bearer.
         
         Args:
             transaction: Transaction to refund
             amount: Amount to refund, defaults to full amount
+            refund_fees: Whether to also refund fees (default: True)
             reason: Reason for refund
             
         Returns:
@@ -511,10 +513,33 @@ class TransactionService:
                 )
                 raise ValueError(error_msg)
         
+        # ✅ NEW: Calculate fee refund based on bearer
+        fee_refund_amount = Money(0, transaction.amount.currency)
+        if refund_fees and transaction.fees and transaction.fees.amount > 0:
+            # Full refund gets full fee back
+            if amount == transaction.amount.amount:
+                # Determine who gets fee refund based on original bearer
+                if transaction.fee_bearer == FEE_BEARER_CUSTOMER:
+                    # Customer paid the fee, so refund it to them
+                    fee_refund_amount = transaction.fees
+                elif transaction.fee_bearer == FEE_BEARER_MERCHANT:
+                    # Merchant bore the fee, so refund it to wallet
+                    fee_refund_amount = transaction.fees
+                # For platform/split, no fee refund (platform absorbed it)
+            else:
+                # Partial refund: prorate the fee
+                fee_percentage = amount / transaction.amount.amount
+                prorated_fee = transaction.fees.amount * fee_percentage
+                
+                if transaction.fee_bearer in [FEE_BEARER_CUSTOMER, FEE_BEARER_MERCHANT]:
+                    fee_refund_amount = Money(prorated_fee, transaction.amount.currency)
+        
         # Create refund transaction (outside atomic block to persist even on failure)
         refund_transaction = self.create_transaction(
             wallet=transaction.wallet,
             amount=amount,
+            fees=fee_refund_amount.amount,  # ✅ NEW: Store fee refund
+            fee_bearer=transaction.fee_bearer,  # ✅ NEW: Preserve original bearer
             transaction_type=TRANSACTION_TYPE_REFUND,
             status=TRANSACTION_STATUS_PENDING,
             description=reason or _("Refund for transaction {reference}").format(
@@ -525,16 +550,17 @@ class TransactionService:
         
         logger.info(
             f"Created refund transaction {refund_transaction.id} for "
-            f"transaction {transaction.id}: amount={amount}, reason={reason}"
+            f"transaction {transaction.id}: amount={amount}, "
+            f"fee_refund={fee_refund_amount.amount}, reason={reason}"
         )
         
         # Process refund based on original transaction type
         try:
             # Use atomic block ONLY for the wallet balance update
             with db_transaction.atomic():
-                if transaction.transaction_type == TRANSACTION_TYPE_PAYMENT:
-                    # Credit the wallet
-                    transaction.wallet.deposit(amount)
+                # ✅ UPDATED: Refund amount + fees
+                total_refund = amount + fee_refund_amount.amount
+                transaction.wallet.deposit(total_refund)
             
             # Update refund transaction as successful (outside atomic block)
             refund_transaction.status = TRANSACTION_STATUS_SUCCESS
@@ -544,7 +570,8 @@ class TransactionService:
             ])
             
             logger.info(
-                f"Refund transaction {refund_transaction.id} processed successfully"
+                f"Refund transaction {refund_transaction.id} processed successfully: "
+                f"total_refund={total_refund} (amount={amount} + fees={fee_refund_amount.amount})"
             )
             
         except Exception as e:
@@ -568,16 +595,17 @@ class TransactionService:
     def reverse_transaction(
         self,
         transaction: Transaction,
+        reverse_fees: bool = True,
         reason: Optional[str] = None
     ) -> Transaction:
         """
         Create a reversal for a transaction
         
-        Uses a two-phase approach: create transaction first, then update balance
-        in a nested transaction to ensure failed reversals are still recorded.
+        Now supports fee reversal based on original fee bearer.
         
         Args:
             transaction: Transaction to reverse
+            reverse_fees: Whether to also reverse fees (default: True)
             reason: Reason for reversal
             
         Returns:
@@ -596,10 +624,21 @@ class TransactionService:
             )
             raise ValueError(error_msg)
         
+        # ✅ NEW: Calculate fee reversal based on bearer
+        fee_reversal_amount = Money(0, transaction.amount.currency)
+        if reverse_fees and transaction.fees and transaction.fees.amount > 0:
+            # Determine who gets fee reversal based on original bearer
+            if transaction.fee_bearer == FEE_BEARER_MERCHANT:
+                # Merchant bore the fee, so reverse it back to wallet
+                fee_reversal_amount = transaction.fees
+            # For customer/platform/split, no fee reversal
+        
         # Create reversal transaction (outside atomic block to persist even on failure)
         reversal_transaction = self.create_transaction(
             wallet=transaction.wallet,
             amount=transaction.amount.amount,
+            fees=fee_reversal_amount.amount,  # ✅ NEW: Store fee reversal
+            fee_bearer=transaction.fee_bearer,  # ✅ NEW: Preserve original bearer
             transaction_type=TRANSACTION_TYPE_REVERSAL,
             status=TRANSACTION_STATUS_PENDING,
             description=reason or _("Reversal for transaction {reference}").format(
@@ -610,23 +649,24 @@ class TransactionService:
         
         logger.info(
             f"Created reversal transaction {reversal_transaction.id} for "
-            f"transaction {transaction.id}: amount={transaction.amount.amount}, "
-            f"reason={reason}"
+            f"transaction {transaction.id}: fee_reversal={fee_reversal_amount.amount}"
         )
         
-        # Process reversal based on original transaction type
+        # Process reversal
         try:
-            # Use atomic block ONLY for the wallet balance updates
+            # Reverse the transaction effect
             with db_transaction.atomic():
-                if transaction.transaction_type == TRANSACTION_TYPE_DEPOSIT:
-                    # Debit the wallet
-                    transaction.wallet.withdraw(transaction.amount.amount)
-                    
-                elif transaction.transaction_type == TRANSACTION_TYPE_WITHDRAWAL:
-                    # Credit the wallet
-                    transaction.wallet.deposit(transaction.amount.amount)
+                # ✅ UPDATED: Reverse amount + fees
+                total_reversal = transaction.amount.amount + fee_reversal_amount.amount
+                
+                if transaction.transaction_type == TRANSACTION_TYPE_WITHDRAWAL:
+                    # Credit back to wallet
+                    transaction.wallet.deposit(total_reversal)
+                else:
+                    # Debit from wallet
+                    transaction.wallet.withdraw(total_reversal)
             
-            # Update reversal transaction as successful (outside atomic block)
+            # Update reversal transaction as successful
             reversal_transaction.status = TRANSACTION_STATUS_SUCCESS
             reversal_transaction.completed_at = timezone.now()
             reversal_transaction.save(update_fields=[
@@ -634,11 +674,13 @@ class TransactionService:
             ])
             
             logger.info(
-                f"Reversal transaction {reversal_transaction.id} processed successfully"
+                f"Reversal transaction {reversal_transaction.id} processed successfully: "
+                f"total_reversal={total_reversal} (amount={transaction.amount.amount} + "
+                f"fees={fee_reversal_amount.amount})"
             )
             
         except Exception as e:
-            # Mark reversal as failed (outside atomic block, so it persists)
+            # Mark reversal as failed
             reversal_transaction.status = TRANSACTION_STATUS_FAILED
             reversal_transaction.failed_reason = str(e)
             reversal_transaction.save(update_fields=[
@@ -654,6 +696,7 @@ class TransactionService:
             raise
         
         return reversal_transaction
+
     
     # ==========================================
     # TRANSFER OPERATIONS

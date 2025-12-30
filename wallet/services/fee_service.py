@@ -550,6 +550,68 @@ class FeeCalculator:
             bearer,
             TRANSACTION_TYPE_DEPOSIT
         )
+    
+    def _create_fee_history(
+        self,
+        transaction,
+        fee_result,
+        calculation_method: str = 'settings',
+        config_used=None
+    ):
+        """
+        Create a FeeHistory record for audit trail
+        
+        Args:
+            transaction: Transaction instance
+            fee_result: FeeCalculationResult instance
+            calculation_method: Method used ('settings', 'database', 'custom')
+            config_used: FeeConfiguration instance if database-driven
+        """
+        try:
+            from wallet.models.fee_config import FeeHistory
+            
+            # Prepare calculation details
+            calculation_details = {
+                'original_amount': float(fee_result.original_amount.amount),
+                'calculated_fee': float(fee_result.fee_amount.amount),
+                'net_amount': float(fee_result.net_amount.amount),
+                'total_amount': float(fee_result.total_amount.amount),
+                'bearer': fee_result.bearer,
+                'transaction_type': fee_result.transaction_type,
+                'calculation_method': calculation_method,
+                'timestamp': timezone.now().isoformat(),
+            }
+            
+            # Add bearer-specific details
+            if fee_result.bearer == 'split':
+                calculation_details.update({
+                    'customer_pays': float(fee_result.customer_pays.amount),
+                    'merchant_receives': float(fee_result.merchant_receives.amount),
+                    'split_details': fee_result.split_details,
+                })
+            
+            # Create history record
+            FeeHistory.objects.create(
+                transaction=transaction,
+                configuration_used=config_used,
+                calculation_method=calculation_method,
+                original_amount=fee_result.original_amount,
+                calculated_fee=fee_result.fee_amount,
+                fee_bearer=fee_result.bearer,
+                calculation_details=calculation_details
+            )
+            
+            logger.debug(
+                f"Created fee history for transaction {transaction.id}: "
+                f"fee={fee_result.fee_amount.amount}, bearer={fee_result.bearer}"
+            )
+            
+        except Exception as e:
+            # Log error but don't fail the transaction
+            logger.error(
+                f"Failed to create fee history for transaction {transaction.id}: {str(e)}",
+                exc_info=True
+            )
 
 
 # ==========================================
@@ -584,3 +646,4 @@ def calculate_fee(
     return calculator.calculate_amount_with_fees(
         amount, transaction_type, payment_channel, is_international, bearer
     )
+

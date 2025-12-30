@@ -548,6 +548,63 @@ class TransactionAdmin(ExportMixin, AnalyticsMixin, admin.ModelAdmin):
         
         return render(request, 'admin/wallet/analytics/transaction_analytics.html', context)
 
+    def backfill_fee_history(self, request, queryset):
+        """
+        Backfill fee history for selected transactions
+        
+        This action calculates and creates fee history records for transactions
+        that don't have one yet.
+        """
+        from wallet.services.fee_service import FeeCalculator
+        from wallet.models.fee_config import FeeHistory
+        from django.contrib import messages
+        
+        created = 0
+        skipped = 0
+        errors = 0
+        
+        for transaction in queryset:
+            # Skip if already has fee history
+            if hasattr(transaction, 'fee_history'):
+                skipped += 1
+                continue
+            
+            # Skip if no fees
+            if not transaction.fees or transaction.fees.amount == 0:
+                skipped += 1
+                continue
+            
+            try:
+                # Create fee history from existing transaction data
+                FeeHistory.objects.create(
+                    transaction=transaction,
+                    calculation_method='backfill',
+                    original_amount=transaction.amount,
+                    calculated_fee=transaction.fees,
+                    fee_bearer=transaction.fee_bearer or 'platform',
+                    calculation_details={
+                        'backfilled': True,
+                        'backfill_date': timezone.now().isoformat(),
+                        'transaction_type': transaction.transaction_type,
+                        'original_bearer': transaction.fee_bearer,
+                    }
+                )
+                created += 1
+                
+            except Exception as e:
+                errors += 1
+                logger.error(
+                    f"Failed to backfill fee history for transaction {transaction.id}: {str(e)}"
+                )
+        
+        # Show result message
+        msg = f"Backfilled fee history: {created} created, {skipped} skipped, {errors} errors"
+        if errors > 0:
+            messages.warning(request, msg)
+        else:
+            messages.success(request, msg)
+
+    backfill_fee_history.short_description = "Backfill fee history for selected transactions"
 
 class CardAdmin(ExportMixin, admin.ModelAdmin):
     """Admin for the Card model"""
