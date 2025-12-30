@@ -272,7 +272,7 @@ class WalletViewSet(viewsets.ModelViewSet):
             callback_url = serializer.validated_data.get('callback_url', '')
             reference = serializer.validated_data.get('reference') or generate_transaction_reference()
             description = serializer.validated_data.get('description', 'Card deposit to wallet')
-            
+            fee_bearer = serializer.validated_data.get('fee_bearer')  # ✅ ADD THIS LINE
             # Prepare metadata
             metadata = serializer.validated_data.get('metadata') or {}
             if not isinstance(metadata, dict):
@@ -302,7 +302,8 @@ class WalletViewSet(viewsets.ModelViewSet):
                     status=TRANSACTION_STATUS_PENDING,
                     reference=reference,
                     description=description,
-                    metadata=metadata
+                    metadata=metadata,
+                    fee_bearer=fee_bearer,
                 )
                 
                 logger.info(
@@ -434,6 +435,7 @@ class WalletViewSet(viewsets.ModelViewSet):
             )
             reference = serializer.validated_data.get('reference')
             metadata = serializer.validated_data.get('metadata') or {}
+            fee_bearer = serializer.validated_data.get('fee_bearer')
             
             # Add request context to metadata
             if isinstance(metadata, dict):
@@ -495,7 +497,8 @@ class WalletViewSet(viewsets.ModelViewSet):
                 bank_account=bank_account,
                 reason=description,
                 metadata=metadata,
-                reference=reference
+                reference=reference,
+                fee_bearer=fee_bearer
             )
             
             logger.info(
@@ -780,6 +783,7 @@ class WalletViewSet(viewsets.ModelViewSet):
             description = serializer.validated_data.get('description', 'Wallet transfer')
             reference = serializer.validated_data.get('reference')
             metadata = serializer.validated_data.get('metadata') or {}
+            fee_bearer = serializer.validated_data.get('fee_bearer')
             
             # Validate amount
             if amount <= 0:
@@ -829,7 +833,8 @@ class WalletViewSet(viewsets.ModelViewSet):
                 amount=amount,
                 description=description,
                 metadata=metadata,
-                reference=reference
+                reference=reference,
+                fee_bearer=fee_bearer
             )
             
             logger.info(

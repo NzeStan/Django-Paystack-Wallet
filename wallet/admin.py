@@ -219,7 +219,7 @@ class TransactionAdmin(ExportMixin, AnalyticsMixin, admin.ModelAdmin):
         'id',
         'reference',
         'wallet_link',
-        'amount_display',
+        'formatted_amount',
         'fees_display',
         'fee_bearer_display',
         'net_amount_display',

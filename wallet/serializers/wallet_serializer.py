@@ -2,7 +2,7 @@ import datetime
 from decimal import Decimal
 from rest_framework import serializers
 from django.utils.translation import gettext_lazy as _
-
+from wallet.constants import FEE_BEARERS
 from wallet.models import Wallet
 
 
@@ -394,6 +394,15 @@ class WalletTransactionSerializer(serializers.Serializer):
         help_text=_('Optional additional data as JSON')
     )
     
+
+    fee_bearer = serializers.ChoiceField(
+        choices=FEE_BEARERS,  # Use the constant
+        required=False,
+        allow_null=True,
+        help_text=_('Who bears the transaction fee (defaults to system setting if not provided)')
+    )
+
+
     def validate_amount(self, value: Decimal) -> Decimal:
         """
         Validate transaction amount
