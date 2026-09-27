@@ -1,0 +1,2 @@
+{% load i18n %}{% blocktrans %}Your withdrawal of {{ amount }} has been paid to your bank account.{% endblocktrans %}
+{% blocktrans %}Reference: {{ reference }}{% endblocktrans %}

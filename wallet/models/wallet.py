@@ -1,623 +1,411 @@
+from datetime import timedelta
 from decimal import Decimal
+
+from django.conf import settings
+from django.contrib.auth.hashers import check_password, make_password
 from django.db import models, transaction
-from django.utils.translation import gettext_lazy as _
+from django.db.models import Q, Sum
 from django.utils import timezone
-from djmoney.models.fields import MoneyField
+from django.utils.translation import gettext_lazy as _
 from djmoney.money import Money
 
+from wallet.conf import wallet_settings
 from wallet.exceptions import (
+    CurrencyMismatchError,
     InsufficientFunds,
-    WalletLocked,
     InvalidAmount,
-    CurrencyMismatchError
+    InvalidPin,
+    MinimumBalanceViolation,
+    PinLocked,
+    PinNotSet,
+    WalletInactive,
+    WalletLocked,
 )
 from wallet.models.base import BaseModel
-from wallet.settings import get_wallet_setting
+from wallet.models.fields import WalletMoneyField
 
 
 class WalletQuerySet(models.QuerySet):
-    """Custom QuerySet for Wallet model with optimized queries"""
-    
     def active(self):
-        """Return only active wallets"""
         return self.filter(is_active=True, is_locked=False)
-    
+
     def locked(self):
-        """Return only locked wallets"""
         return self.filter(is_locked=True)
-    
+
     def with_user_details(self):
-        """Prefetch user details to avoid N+1 queries"""
         return self.select_related('user')
-    
+
     def with_full_details(self):
-        """Prefetch all related data for comprehensive wallet views"""
-        return self.select_related('user').prefetch_related(
-            'transactions',
-            'cards',
-            'bank_accounts',
-            'received_transactions'
-        )
-    
+        return self.select_related('user').prefetch_related('cards', 'bank_accounts')
+
     def with_transaction_summary(self):
-        """Annotate wallets with transaction statistics"""
-        from django.db.models import Count, Sum, Q
+        from django.db.models import Count
         from wallet.constants import TRANSACTION_STATUS_SUCCESS
-        
+
         return self.annotate(
             total_transactions=Count('transactions'),
             successful_transactions=Count(
-                'transactions',
-                filter=Q(transactions__status=TRANSACTION_STATUS_SUCCESS)
+                'transactions', filter=Q(transactions__status=TRANSACTION_STATUS_SUCCESS)
             ),
-            total_received=Sum(
-                'received_transactions__amount',
-                filter=Q(received_transactions__status=TRANSACTION_STATUS_SUCCESS)
-            )
         )
 
 
-class WalletManager(models.Manager):
-    """Custom Manager for Wallet model"""
-    
-    def get_queryset(self):
-        """Return custom queryset"""
-        return WalletQuerySet(self.model, using=self._db)
-    
-    def active(self):
-        """Return only active wallets"""
-        return self.get_queryset().active()
-    
-    def with_user_details(self):
-        """Get wallets with user details"""
-        return self.get_queryset().with_user_details()
-    
-    def with_full_details(self):
-        """Get wallets with full related data"""
-        return self.get_queryset().with_full_details()
-    
+class WalletManager(models.Manager.from_queryset(WalletQuerySet)):
     def get_or_create_for_user(self, user):
-        """
-        Get or create a wallet for a user (atomic operation)
-        
-        Args:
-            user: User instance
-            
-        Returns:
-            tuple: (Wallet instance, created boolean)
-        """
         return self.get_or_create(user=user)
 
 
 class Wallet(BaseModel):
     """
-    Wallet model for storing user balance and wallet information
-    
-    This model represents a digital wallet that can hold monetary balance,
-    track transactions, and enforce business rules for financial operations.
+    A user's wallet.
+
+    The balance must only ever be changed through :meth:`credit` / :meth:`debit`
+    (or the services built on them). Both lock the wallet row with
+    ``SELECT ... FOR UPDATE`` so concurrent requests cannot overspend.
     """
-    
-    # Core Fields
+
     user = models.OneToOneField(
-        get_wallet_setting('USER_MODEL'),
+        settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name='wallet',
         verbose_name=_('User'),
-        help_text=_('The user who owns this wallet')
     )
-    
-    balance = MoneyField(
-        max_digits=19,
-        decimal_places=2,
-        default=0,
-        default_currency=get_wallet_setting('CURRENCY'),
-        verbose_name=_('Balance'),
-        help_text=_('Current balance in the wallet')
-    )
-    
-    # Optional Identifiers
+    balance = WalletMoneyField(default=0, verbose_name=_('Balance'))
+
     tag = models.CharField(
-        max_length=100,
-        blank=True,
-        null=True,
-        db_index=True,
+        max_length=50, unique=True, blank=True, null=True,
         verbose_name=_('Tag'),
-        help_text=_('A custom identifier for the wallet')
+        help_text=_('Public handle other users can send money to'),
     )
-    
-    # Status Fields
-    is_active = models.BooleanField(
-        default=True,
-        db_index=True,
-        verbose_name=_('Is active'),
-        help_text=_('Whether the wallet is active and can perform operations')
+    phone_number = models.CharField(
+        max_length=20, unique=True, blank=True, null=True,
+        verbose_name=_('Phone number'),
+        help_text=_('E.164 phone number other users can send money to'),
     )
-    
-    is_locked = models.BooleanField(
-        default=False,
-        db_index=True,
-        verbose_name=_('Is locked'),
-        help_text=_('Locked wallets cannot perform transactions')
+
+    is_active = models.BooleanField(default=True, db_index=True, verbose_name=_('Is active'))
+    is_locked = models.BooleanField(default=False, db_index=True, verbose_name=_('Is locked'))
+    locked_reason = models.CharField(max_length=255, blank=True, default='', verbose_name=_('Locked reason'))
+    last_transaction_date = models.DateTimeField(null=True, blank=True, verbose_name=_('Last transaction date'))
+    ledger_sequence = models.PositiveBigIntegerField(
+        default=0, editable=False, verbose_name=_('Ledger sequence'),
+        help_text=_('Incremented on every balance change; orders the statement deterministically'),
     )
-    
-    # Transaction Tracking
-    last_transaction_date = models.DateTimeField(
-        null=True,
-        blank=True,
-        db_index=True,
-        verbose_name=_('Last transaction date'),
-        help_text=_('Date and time of the last transaction')
+
+    daily_limit = models.DecimalField(
+        max_digits=19, decimal_places=2, null=True, blank=True,
+        verbose_name=_('Daily limit'),
+        help_text=_('Overrides WALLET_MAXIMUM_DAILY_TRANSACTION for this wallet'),
     )
-    
-    # Daily Limits Tracking
-    daily_transaction_total = MoneyField(
-        max_digits=19,
-        decimal_places=2,
-        default=0,
-        default_currency=get_wallet_setting('CURRENCY'),
-        verbose_name=_('Daily transaction total'),
-        help_text=_('Total amount transacted today')
-    )
-    
-    daily_transaction_count = models.PositiveIntegerField(
-        default=0,
-        verbose_name=_('Daily transaction count'),
-        help_text=_('Number of transactions performed today')
-    )
-    
-    daily_transaction_reset = models.DateField(
-        null=True,
-        blank=True,
-        verbose_name=_('Daily transaction reset date'),
-        help_text=_('Date when daily limits were last reset')
-    )
-    
-    # Paystack Integration Fields
+
+    # Transaction PIN (optional, see WALLET_REQUIRE_TRANSACTION_PIN)
+    pin_hash = models.CharField(max_length=128, blank=True, default='', editable=False)
+    failed_pin_attempts = models.PositiveSmallIntegerField(default=0, editable=False)
+    pin_locked_until = models.DateTimeField(null=True, blank=True, editable=False)
+
+    # Paystack customer
     paystack_customer_code = models.CharField(
-        max_length=100,
-        blank=True,
-        null=True,
-        db_index=True,
-        unique=True,
-        verbose_name=_('Paystack customer code'),
-        help_text=_('Paystack customer identifier')
+        max_length=100, unique=True, blank=True, null=True, verbose_name=_('Paystack customer code'),
     )
-    
+    paystack_customer_id = models.BigIntegerField(null=True, blank=True, verbose_name=_('Paystack customer ID'))
+    customer_identified = models.BooleanField(
+        default=False, verbose_name=_('Customer identified'),
+        help_text=_('Paystack customer identity validation succeeded'),
+    )
+
+    # Dedicated virtual account
+    dedicated_account_id = models.BigIntegerField(null=True, blank=True, verbose_name=_('Dedicated account ID'))
     dedicated_account_number = models.CharField(
-        max_length=50,
-        blank=True,
-        null=True,
-        db_index=True,
-        verbose_name=_('Dedicated account number'),
-        help_text=_('Virtual account number for direct deposits')
+        max_length=20, blank=True, null=True, db_index=True, verbose_name=_('Dedicated account number'),
     )
-    
+    dedicated_account_name = models.CharField(
+        max_length=255, blank=True, null=True, verbose_name=_('Dedicated account name'),
+    )
     dedicated_account_bank = models.CharField(
-        max_length=100,
-        blank=True,
-        null=True,
-        verbose_name=_('Dedicated account bank'),
-        help_text=_('Bank name for the dedicated account')
+        max_length=100, blank=True, null=True, verbose_name=_('Dedicated account bank'),
     )
-    
-    # Custom Manager
+    dedicated_account_bank_slug = models.CharField(max_length=100, blank=True, null=True)
+    dedicated_account_active = models.BooleanField(default=False)
+
+    metadata = models.JSONField(default=dict, blank=True, verbose_name=_('Metadata'))
+
     objects = WalletManager()
-    
+
     class Meta:
         verbose_name = _('Wallet')
         verbose_name_plural = _('Wallets')
         ordering = ['-created_at']
         indexes = [
-            models.Index(fields=['user'], name='wallet_user_idx'),
             models.Index(fields=['is_active', 'is_locked'], name='wallet_status_idx'),
-            models.Index(fields=['tag'], name='wallet_tag_idx'),
-            models.Index(fields=['paystack_customer_code'], name='wallet_paystack_idx'),
-            models.Index(fields=['last_transaction_date'], name='wallet_last_txn_idx'),
         ]
-    
+
     def __str__(self):
-        """String representation of the wallet"""
-        user_display = getattr(self.user, 'email', str(self.user))
+        user_display = getattr(self.user, 'email', None) or str(self.user)
         return f"Wallet ({user_display}) - {self.balance}"
-    
+
     def __repr__(self):
-        """Developer-friendly representation"""
-        return (
-            f"<Wallet id={self.id} user_id={self.user_id} "
-            f"balance={self.balance} active={self.is_active}>"
-        )
-    
-    # ==========================================
-    # PROPERTIES
-    # ==========================================
-    
+        return f"<Wallet id={self.id} user_id={self.user_id} balance={self.balance}>"
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def currency(self):
+        return str(self.balance.currency)
+
     @property
     def available_balance(self):
-        """
-        Get the available balance (alias for balance)
-        
-        Returns:
-            Money: Available balance
-        """
         return self.balance
-    
+
     @property
     def is_operational(self):
-        """
-        Check if wallet can perform operations
-        
-        Returns:
-            bool: True if active and not locked
-        """
         return self.is_active and not self.is_locked
-    
+
     @property
-    def needs_daily_reset(self):
-        """
-        Check if daily limits need to be reset
-        
-        Returns:
-            bool: True if reset is needed
-        """
-        if not self.daily_transaction_reset:
-            return True
-        return self.daily_transaction_reset < timezone.now().date()
-    
-    # ==========================================
-    # VALIDATION METHODS
-    # ==========================================
-    
+    def has_pin(self):
+        return bool(self.pin_hash)
+
+    @property
+    def pin_is_locked(self):
+        return bool(self.pin_locked_until and self.pin_locked_until > timezone.now())
+
+    @property
+    def has_dedicated_account(self):
+        return bool(self.dedicated_account_number)
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
     def check_active(self):
-        """
-        Verify wallet is active and unlocked
-        
-        Raises:
-            WalletLocked: If wallet is locked or inactive
-        """
+        """Raise if the wallet cannot send or receive money."""
         if not self.is_active:
-            raise WalletLocked(_("Wallet is inactive"))
-        
+            raise WalletInactive(message=_("Wallet is inactive"))
         if self.is_locked:
             raise WalletLocked(self)
-    
+
     def validate_amount(self, amount):
-        """
-        Validate and normalize amount to Money object
-        
-        Args:
-            amount: Amount to validate (Decimal, int, float, or Money)
-            
-        Returns:
-            Money: Validated Money object
-            
-        Raises:
-            InvalidAmount: If amount is invalid
-            CurrencyMismatchError: If currencies don't match
-        """
-        # Convert to Money if needed
-        if isinstance(amount, (Decimal, int, float)):
-            amount = Money(amount, self.balance.currency)
-        elif not isinstance(amount, Money):
-            raise InvalidAmount(f"Expected Money object, got {type(amount).__name__}")
-        
-        # Validate positive amount
-        if amount.amount <= 0:
-            raise InvalidAmount(amount)
-        
-        # Validate currency match
-        if amount.currency != self.balance.currency:
-            raise CurrencyMismatchError(
-                f"Currency mismatch: wallet uses {self.balance.currency}, "
-                f"but got {amount.currency}"
-            )
-        
-        return amount
-    
+        """Normalise ``amount`` to a positive Money in the wallet's currency."""
+        from wallet.utils.money import to_decimal
+
+        if isinstance(amount, Money):
+            if str(amount.currency) != self.currency:
+                raise CurrencyMismatchError(
+                    _("Currency mismatch: wallet uses {wallet}, got {got}").format(
+                        wallet=self.currency, got=amount.currency
+                    )
+                )
+            value = to_decimal(amount.amount)
+        elif isinstance(amount, (Decimal, int, float, str)):
+            value = to_decimal(amount)
+        else:
+            raise InvalidAmount(message=f"Unsupported amount type {type(amount).__name__}")
+
+        if value <= 0:
+            raise InvalidAmount(value)
+        return Money(value, self.currency)
+
     def validate_sufficient_funds(self, amount):
-        """
-        Verify wallet has sufficient funds for withdrawal
-        
-        Args:
-            amount (Money): Amount to check
-            
-        Raises:
-            InsufficientFunds: If balance is insufficient
-        """
+        amount = amount if isinstance(amount, Money) else Money(amount, self.currency)
         if self.balance < amount:
             raise InsufficientFunds(self, amount)
-    
-    # ==========================================
-    # STATUS MANAGEMENT
-    # ==========================================
-    
-    def lock(self):
+
+    # ------------------------------------------------------------------
+    # Balance primitives (row-locked)
+    # ------------------------------------------------------------------
+
+    def _locked_copy(self):
+        return type(self).objects.select_for_update().get(pk=self.pk)
+
+    def _sync_from(self, locked):
+        self.balance = locked.balance
+        self.last_transaction_date = locked.last_transaction_date
+        self.ledger_sequence = locked.ledger_sequence
+        self.updated_at = locked.updated_at
+
+    def _target(self, locked):
+        """The row to change: ``self`` if the caller already holds its lock, else a fresh locked copy."""
+        if locked:
+            if not transaction.get_connection().in_atomic_block:
+                raise RuntimeError("locked=True requires an open transaction holding the wallet's row lock")
+            return self
+        return self._locked_copy()
+
+    def credit(self, amount, force=False, locked=False):
         """
-        Lock the wallet to prevent transactions
-        
-        Returns:
-            bool: True if locked successfully
+        Add ``amount`` to the balance and return the new balance.
+
+        ``force=True`` credits even a locked/inactive wallet. Use it only for
+        money that has already arrived (deposits, refunds, reversals).
+        ``locked=True`` means this instance came from ``select_for_update()`` in the
+        current transaction (skips re-locking).
         """
-        if not self.is_locked:
-            self.is_locked = True
-            self.save(update_fields=['is_locked', 'updated_at'])
-        return True
-    
-    def unlock(self):
+        if locked:
+            return self._credit(amount, force, locked=True)
+        with transaction.atomic():
+            return self._credit(amount, force)
+
+    def _credit(self, amount, force=False, locked=False):
+        amount = self.validate_amount(amount)
+        locked = self._target(locked)
+        if not force:
+            locked.check_active()
+        locked.balance = locked.balance + amount
+        locked.last_transaction_date = timezone.now()
+        locked.ledger_sequence += 1
+        locked.save(update_fields=['balance', 'balance_currency', 'last_transaction_date', 'ledger_sequence',
+                                   'updated_at'])
+        self._sync_from(locked)
+        return locked.balance
+
+    def debit(self, amount, enforce_minimum_balance=True, force=False, locked=False):
         """
-        Unlock the wallet to allow transactions
-        
-        Returns:
-            bool: True if unlocked successfully
+        Remove ``amount`` from the balance and return the new balance.
+
+        Raises InsufficientFunds / MinimumBalanceViolation / WalletLocked.
+        ``locked=True``: see :meth:`credit`.
         """
-        if self.is_locked:
-            self.is_locked = False
-            self.save(update_fields=['is_locked', 'updated_at'])
-        return True
-    
-    def deactivate(self):
-        """
-        Deactivate the wallet
-        
-        Returns:
-            bool: True if deactivated successfully
-        """
-        if self.is_active:
-            self.is_active = False
-            self.save(update_fields=['is_active', 'updated_at'])
-        return True
-    
-    def activate(self):
-        """
-        Activate the wallet
-        
-        Returns:
-            bool: True if activated successfully
-        """
-        if not self.is_active:
-            self.is_active = True
-            self.save(update_fields=['is_active', 'updated_at'])
-        return True
-    
-    # ==========================================
-    # DAILY LIMITS MANAGEMENT
-    # ==========================================
-    
-    def reset_daily_limit(self):
-        """
-        Reset daily transaction limits if needed
-        
-        This method is automatically called during transactions
-        to ensure daily limits are properly managed.
-        """
-        if self.needs_daily_reset:
-            self.daily_transaction_total = Money(0, self.balance.currency)
-            self.daily_transaction_count = 0
-            self.daily_transaction_reset = timezone.now().date()
-            self.save(update_fields=[
-                'daily_transaction_total',
-                'daily_transaction_count',
-                'daily_transaction_reset',
-                'updated_at'
-            ])
-    
-    def update_transaction_metrics(self, amount):
-        """
-        Update daily transaction metrics
-        
-        Args:
-            amount (Decimal): Transaction amount to add to daily total
-            
-        Raises:
-            InvalidAmount: If amount is invalid
-            CurrencyMismatchError: If currencies don't match
-        """
-        # Update last transaction date
-        self.last_transaction_date = timezone.now()
-        
-        # Reset daily limits if needed
-        self.reset_daily_limit()
-        
-        # Validate and convert amount
-        if isinstance(amount, (Decimal, int, float)):
-            amount = Money(amount, self.balance.currency)
-        elif not isinstance(amount, Money):
-            raise InvalidAmount(f"Expected Money object, got {type(amount).__name__}")
-        
-        # Validate currency match
-        if amount.currency != self.daily_transaction_total.currency:
-            raise CurrencyMismatchError(
-                f"Currency mismatch: wallet uses {self.daily_transaction_total.currency}, "
-                f"but got {amount.currency}"
-            )
-        
-        # Prevent negative daily total
-        new_total = self.daily_transaction_total + amount
-        if new_total.amount < 0:
-            raise InvalidAmount(f"Negative daily total not allowed: {new_total}")
-        
-        # Update metrics
-        self.daily_transaction_total = new_total
-        self.daily_transaction_count += 1
-        
-        # Save updates
-        self.save(update_fields=[
-            'last_transaction_date',
-            'daily_transaction_total',
-            'daily_transaction_count',
-            'updated_at'
-        ])
-    
-    # ==========================================
-    # CORE WALLET OPERATIONS
-    # ==========================================
-    
-    @transaction.atomic
+        if locked:
+            return self._debit(amount, enforce_minimum_balance, force, locked=True)
+        with transaction.atomic():
+            return self._debit(amount, enforce_minimum_balance, force)
+
+    def _debit(self, amount, enforce_minimum_balance=True, force=False, locked=False):
+        amount = self.validate_amount(amount)
+        locked = self._target(locked)
+        if not force:
+            locked.check_active()
+        if locked.balance < amount:
+            raise InsufficientFunds(locked, amount)
+        if enforce_minimum_balance:
+            minimum = Decimal(str(wallet_settings.MINIMUM_BALANCE or 0))
+            if locked.balance.amount - amount.amount < minimum:
+                raise MinimumBalanceViolation(
+                    _("This transaction would leave less than the minimum balance of {minimum}").format(
+                        minimum=Money(minimum, locked.currency)
+                    )
+                )
+        locked.balance = locked.balance - amount
+        locked.last_transaction_date = timezone.now()
+        locked.ledger_sequence += 1
+        locked.save(update_fields=['balance', 'balance_currency', 'last_transaction_date', 'ledger_sequence',
+                                   'updated_at'])
+        self._sync_from(locked)
+        return locked.balance
+
+    # Backwards compatible names
     def deposit(self, amount):
-        """
-        Add funds to the wallet
-        
-        This method handles the core deposit operation, updating the wallet
-        balance and transaction metrics. Transaction records should be
-        created by the service layer.
-        
-        Args:
-            amount: Amount to deposit (Money, Decimal, int, or float)
-            
-        Returns:
-            Money: Updated balance
-            
-        Raises:
-            WalletLocked: If wallet is locked or inactive
-            InvalidAmount: If amount is invalid
-            CurrencyMismatchError: If currencies don't match
-        """
-        # Verify wallet is operational
-        self.check_active()
-        
-        # Validate and normalize amount
-        amount = self.validate_amount(amount)
-        
-        # Add to balance
-        self.balance += amount
-        self.save(update_fields=['balance', 'updated_at'])
-        
-        # Update transaction metrics
-        self.update_transaction_metrics(amount.amount)
-        
-        return self.balance
-    
-    @transaction.atomic
+        return self.credit(amount)
+
     def withdraw(self, amount):
-        """
-        Remove funds from the wallet
-        
-        This method handles the core withdrawal operation, updating the wallet
-        balance and transaction metrics. Transaction records should be
-        created by the service layer.
-        
-        Args:
-            amount: Amount to withdraw (Money, Decimal, int, or float)
-            
-        Returns:
-            Money: Updated balance
-            
-        Raises:
-            WalletLocked: If wallet is locked or inactive
-            InvalidAmount: If amount is invalid
-            InsufficientFunds: If balance is insufficient
-            CurrencyMismatchError: If currencies don't match
-        """
-        # Verify wallet is operational
-        self.check_active()
-        
-        # Validate and normalize amount
-        amount = self.validate_amount(amount)
-        
-        # Verify sufficient funds
-        self.validate_sufficient_funds(amount)
-        
-        # Subtract from balance
-        self.balance -= amount
-        self.save(update_fields=['balance', 'updated_at'])
-        
-        # Update transaction metrics
-        self.update_transaction_metrics(amount.amount)
-        
-        return self.balance
-    
-    @transaction.atomic
-    def transfer(self, destination_wallet, amount, description=None):
-        """
-        Transfer funds to another wallet
-        
-        This method handles wallet-to-wallet transfers by withdrawing from
-        this wallet and depositing to the destination wallet. Transaction
-        records should be created by the service layer.
-        
-        Args:
-            destination_wallet (Wallet): Destination wallet
-            amount: Amount to transfer (Money, Decimal, int, or float)
-            description (str, optional): Transfer description
-            
-        Returns:
-            tuple: (source_balance, destination_balance)
-            
-        Raises:
-            WalletLocked: If either wallet is locked or inactive
-            InvalidAmount: If amount is invalid
-            InsufficientFunds: If source wallet has insufficient funds
-            CurrencyMismatchError: If currencies don't match
-        """
-        # Verify both wallets are operational
-        self.check_active()
-        destination_wallet.check_active()
-        
-        # Validate and normalize amount
-        amount = self.validate_amount(amount)
-        
-        # Validate currency match between wallets
-        if amount.currency != destination_wallet.balance.currency:
-            raise CurrencyMismatchError(
-                f"Currency mismatch: source wallet uses {amount.currency}, "
-                f"destination wallet uses {destination_wallet.balance.currency}"
-            )
-        
-        # Verify sufficient funds
-        self.validate_sufficient_funds(amount)
-        
-        # Perform transfer (withdrawal from source, deposit to destination)
-        source_balance = self.withdraw(amount)
-        destination_balance = destination_wallet.deposit(amount)
-        
-        return source_balance, destination_balance
-    
-    # ==========================================
-    # UTILITY METHODS
-    # ==========================================
-    
+        return self.debit(amount)
+
     def refresh_balance(self):
-        """
-        Refresh balance from database
-        
-        Useful when balance might have been updated by another process
-        """
         self.refresh_from_db(fields=['balance', 'balance_currency'])
-    
+        return self.balance
+
+    # ------------------------------------------------------------------
+    # Status management
+    # ------------------------------------------------------------------
+
+    def lock(self, reason=''):
+        self.is_locked = True
+        self.locked_reason = reason or ''
+        self.save(update_fields=['is_locked', 'locked_reason', 'updated_at'])
+        return True
+
+    def unlock(self):
+        self.is_locked = False
+        self.locked_reason = ''
+        self.save(update_fields=['is_locked', 'locked_reason', 'updated_at'])
+        return True
+
+    def activate(self):
+        self.is_active = True
+        self.save(update_fields=['is_active', 'updated_at'])
+        return True
+
+    def deactivate(self):
+        self.is_active = False
+        self.save(update_fields=['is_active', 'updated_at'])
+        return True
+
+    # ------------------------------------------------------------------
+    # Transaction PIN
+    # ------------------------------------------------------------------
+
+    def set_pin(self, raw_pin):
+        self.pin_hash = make_password(str(raw_pin))
+        self.failed_pin_attempts = 0
+        self.pin_locked_until = None
+        self.save(update_fields=['pin_hash', 'failed_pin_attempts', 'pin_locked_until', 'updated_at'])
+
+    def clear_pin(self):
+        self.pin_hash = ''
+        self.failed_pin_attempts = 0
+        self.pin_locked_until = None
+        self.save(update_fields=['pin_hash', 'failed_pin_attempts', 'pin_locked_until', 'updated_at'])
+
+    def verify_pin(self, raw_pin):
+        """Check the PIN, counting failures and locking out after too many. Raises on failure."""
+        if not self.has_pin:
+            raise PinNotSet()
+        if self.pin_is_locked:
+            raise PinLocked()
+
+        if raw_pin is not None and check_password(str(raw_pin), self.pin_hash):
+            if self.failed_pin_attempts:
+                self.failed_pin_attempts = 0
+                self.pin_locked_until = None
+                self.save(update_fields=['failed_pin_attempts', 'pin_locked_until', 'updated_at'])
+            return True
+
+        self.failed_pin_attempts += 1
+        fields = ['failed_pin_attempts', 'updated_at']
+        if self.failed_pin_attempts >= int(wallet_settings.PIN_MAX_ATTEMPTS):
+            self.pin_locked_until = timezone.now() + timedelta(minutes=int(wallet_settings.PIN_LOCKOUT_MINUTES))
+            self.failed_pin_attempts = 0
+            fields.append('pin_locked_until')
+            self.save(update_fields=fields)
+            raise PinLocked()
+        self.save(update_fields=fields)
+        raise InvalidPin()
+
+    # ------------------------------------------------------------------
+    # Limits & stats
+    # ------------------------------------------------------------------
+
+    def get_daily_limit(self):
+        if self.daily_limit is not None:
+            return self.daily_limit
+        limit = wallet_settings.MAXIMUM_DAILY_TRANSACTION
+        return Decimal(str(limit)) if limit is not None else None
+
+    def get_daily_outgoing_total(self):
+        """Total money that left this wallet today (pending or successful debits)."""
+        from wallet.constants import (
+            DIRECTION_DEBIT,
+            TRANSACTION_STATUS_PENDING,
+            TRANSACTION_STATUS_PROCESSING,
+            TRANSACTION_STATUS_SUCCESS,
+            TRANSACTION_TYPE_PAYMENT,
+            TRANSACTION_TYPE_TRANSFER,
+            TRANSACTION_TYPE_WITHDRAWAL,
+        )
+
+        start = timezone.localtime().replace(hour=0, minute=0, second=0, microsecond=0)
+        total = self.transactions.filter(
+            direction=DIRECTION_DEBIT,
+            transaction_type__in=[TRANSACTION_TYPE_WITHDRAWAL, TRANSACTION_TYPE_TRANSFER, TRANSACTION_TYPE_PAYMENT],
+            status__in=[TRANSACTION_STATUS_PENDING, TRANSACTION_STATUS_PROCESSING, TRANSACTION_STATUS_SUCCESS],
+            created_at__gte=start,
+        ).aggregate(total=Sum('total_amount'))['total']
+        return total or Decimal('0')
+
     def get_transaction_count(self):
-        """
-        Get total transaction count
-        
-        Returns:
-            int: Total number of transactions
-        """
         return self.transactions.count()
-    
-    def get_successful_transactions_count(self):
-        """
-        Get count of successful transactions
-        
-        Returns:
-            int: Number of successful transactions
-        """
-        from wallet.constants import TRANSACTION_STATUS_SUCCESS
-        return self.transactions.filter(status=TRANSACTION_STATUS_SUCCESS).count()
-    
-    def get_pending_transactions_count(self):
-        """
-        Get count of pending transactions
-        
-        Returns:
-            int: Number of pending transactions
-        """
-        from wallet.constants import TRANSACTION_STATUS_PENDING
-        return self.transactions.filter(status=TRANSACTION_STATUS_PENDING).count()
-    
+
     def has_pending_transactions(self):
-        """
-        Check if wallet has any pending transactions
-        
-        Returns:
-            bool: True if there are pending transactions
-        """
         from wallet.constants import TRANSACTION_STATUS_PENDING
         return self.transactions.filter(status=TRANSACTION_STATUS_PENDING).exists()

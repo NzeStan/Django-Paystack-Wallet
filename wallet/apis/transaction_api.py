@@ -1,832 +1,150 @@
-import logging
-from typing import Any, Dict
-from rest_framework import viewsets, status, permissions
-from rest_framework.decorators import action
-from rest_framework.response import Response
-from rest_framework.request import Request
+"""
+Transaction endpoints.
+
+    GET  transactions/                     ?type=&status=&direction=&search=&start_date=&end_date=
+    GET  transactions/{id}/
+    POST transactions/verify/              {reference} - re-check a deposit with Paystack
+    POST transactions/{id}/cancel/         unpaid deposit (owner) or escrowed payment (staff)
+    POST transactions/{id}/release/        release an escrowed payment to the seller (buyer or staff)
+    POST transactions/{id}/refund/         refund a deposit to the payer's card/bank (staff)
+    POST transactions/{id}/reverse/        reverse a transfer or payment (staff)
+    GET  transactions/statistics/
+    GET  transactions/summary/
+    GET  transactions/export/?export_format=csv|xlsx|pdf
+"""
+from django.core.exceptions import ImproperlyConfigured
+from django.db.models import Q
 from django.utils.translation import gettext_lazy as _
-from django.shortcuts import get_object_or_404
-from django.db import transaction as db_transaction
-from django.http import HttpResponse
-from wallet.models import Transaction, Wallet
-from wallet.services.transaction_service import TransactionService
-from wallet.constants import TRANSACTION_STATUS_PENDING
+from rest_framework import status, viewsets
+from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.response import Response
+
+from wallet.apis.base import WalletAPIMixin, error_response
+from wallet.apis.wallet_api import _parse_when
+from wallet.constants import TRANSACTION_TYPE_DEPOSIT, TRANSACTION_TYPE_PAYMENT
+from wallet.exceptions import InvalidTransactionState
+from wallet.models import Transaction
 from wallet.serializers.transaction_serializer import (
-    TransactionSerializer,
+    ReasonSerializer,
+    RefundSerializer,
     TransactionDetailSerializer,
-    TransactionListSerializer,
-    TransactionCreateSerializer,
-    TransactionVerifySerializer,
-    TransactionRefundSerializer,
-    TransactionCancelSerializer,
-    TransactionFilterSerializer,
-    TransactionStatisticsSerializer,
-    TransactionSummarySerializer,
-    TransactionExportSerializer,
-    BulkTransactionCreateSerializer,
-    BulkTransactionUpdateSerializer
+    TransactionSerializer,
+    VerifyTransactionSerializer,
 )
+from wallet.services.deposit_service import DepositService
+from wallet.services.transaction_service import TransactionService
+from wallet.services.transfer_service import TransferService
+from wallet.utils.exporters import EXPORT_FORMATS, export_queryset
 
-logger = logging.getLogger(__name__)
-
-
-# ==========================================
-# CUSTOM PERMISSIONS
-# ==========================================
-
-class IsTransactionOwner(permissions.BasePermission):
-    """
-    Permission to check if user owns the transaction's wallet
-    
-    Ensures that users can only access transactions from their own wallets.
-    """
-    
-    message = _("You do not have permission to access this transaction")
-    
-    def has_object_permission(self, request: Request, view: Any, obj: Transaction) -> bool:
-        """
-        Check if user owns the transaction's wallet
-        
-        Args:
-            request: HTTP request
-            view: View instance
-            obj: Transaction object to check
-            
-        Returns:
-            bool: True if user owns the transaction's wallet
-        """
-        return obj.wallet.user == request.user
+EXPORT_FIELDS = [
+    'reference', 'transaction_type', 'direction', 'status', 'amount', 'fees', 'total_amount', 'balance_after',
+    'payment_method', 'description', 'created_at', 'completed_at',
+]
 
 
-# ==========================================
-# UTILITY FUNCTIONS
-# ==========================================
-
-def get_client_ip(request: Request) -> str:
-    """
-    Extract client IP address from request
-    
-    Handles proxy headers and direct connections.
-    
-    Args:
-        request: HTTP request
-        
-    Returns:
-        str: Client IP address
-    """
-    x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
-    if x_forwarded_for:
-        ip = x_forwarded_for.split(',')[0]
-    else:
-        ip = request.META.get('REMOTE_ADDR')
-    return ip
-
-
-def get_user_agent(request: Request) -> str:
-    """
-    Extract user agent from request
-    
-    Args:
-        request: HTTP request
-        
-    Returns:
-        str: User agent string
-    """
-    return request.META.get('HTTP_USER_AGENT', '')
-
-
-# ==========================================
-# TRANSACTION VIEWSET
-# ==========================================
-
-class TransactionViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    API ViewSet for transaction operations
-    
-    Provides read-only access to transactions with comprehensive filtering,
-    statistics, and export capabilities. Transactions are automatically
-    created through wallet operations (deposit, withdraw, transfer).
-    
-    list:
-        List all transactions for the authenticated user's wallets
-        with optional filtering by type, status, date range, etc.
-    
-    retrieve:
-        Get detailed information about a specific transaction
-    
-    verify:
-        Verify a transaction by its reference number
-    
-    refund:
-        Initiate a refund for a completed transaction
-    
-    cancel:
-        Cancel a pending transaction
-    
-    statistics:
-        Get transaction statistics for user's wallets
-    
-    summary:
-        Get a comprehensive summary of transactions
-    
-    export:
-        Export transactions to CSV or Excel format
-    """
-    
+class TransactionViewSet(WalletAPIMixin, viewsets.ReadOnlyModelViewSet):
     serializer_class = TransactionSerializer
-    permission_classes = [permissions.IsAuthenticated, IsTransactionOwner]
-    
-    def __init__(self, **kwargs):
-        """Initialize with transaction service"""
-        super().__init__(**kwargs)
-        self.transaction_service = TransactionService()
-    
-    def get_queryset(self):
-        """
-        Get transactions for the current user's wallets with optimized queries
-        
-        Returns:
-            QuerySet: Optimized transaction queryset
-        """
-        user = self.request.user
-        user_wallets = Wallet.objects.filter(user=user)
-        
-        # Base queryset with optimized relations
-        queryset = Transaction.objects.filter(
-            wallet__in=user_wallets
-        ).select_related(
-            'wallet',
-            'wallet__user',
-            'recipient_wallet',
-            'recipient_wallet__user',
-            'recipient_bank_account',
-            'recipient_bank_account__bank',
-            'card',
-            'related_transaction'
-        )
-        
-        return queryset
-    
-    def get_serializer_class(self):
-        """
-        Return appropriate serializer based on action
-        
-        Returns:
-            Serializer class
-        """
-        if self.action == 'retrieve':
-            return TransactionDetailSerializer
-        elif self.action == 'list':
-            return TransactionListSerializer
-        elif self.action == 'create':
-            return TransactionCreateSerializer
-        elif self.action == 'verify':
-            return TransactionVerifySerializer
-        elif self.action == 'refund':
-            return TransactionRefundSerializer
-        elif self.action == 'cancel':
-            return TransactionCancelSerializer
-        elif self.action == 'statistics':
-            return TransactionStatisticsSerializer
-        elif self.action == 'summary':
-            return TransactionSummarySerializer
-        elif self.action == 'export':
-            return TransactionExportSerializer
-        
-        return self.serializer_class
-    
-    def list(self, request: Request, *args, **kwargs):
-        """
-        List transactions with comprehensive filtering
-        
-        Query Parameters:
-            - wallet_id: Filter by wallet ID
-            - transaction_type: Filter by transaction type
-            - status: Filter by status
-            - payment_method: Filter by payment method
-            - reference: Filter by reference
-            - start_date: Filter by start date (ISO 8601)
-            - end_date: Filter by end date (ISO 8601)
-            - min_amount: Filter by minimum amount
-            - max_amount: Filter by maximum amount
-            - limit: Results per page (default: 20, max: 100)
-            - offset: Pagination offset (default: 0)
-        
-        Returns:
-            Response: Paginated transaction list
-        """
-        # Parse and validate filter parameters
-        filter_serializer = TransactionFilterSerializer(data=request.query_params)
-        filter_serializer.is_valid(raise_exception=True)
-        
-        # Extract validated parameters
-        filters = filter_serializer.validated_data
-        wallet_id = filters.get('wallet_id')
-        transaction_type = filters.get('transaction_type')
-        status_param = filters.get('status')
-        payment_method = filters.get('payment_method')
-        reference = filters.get('reference')
-        start_date = filters.get('start_date')
-        end_date = filters.get('end_date')
-        min_amount = filters.get('min_amount')
-        max_amount = filters.get('max_amount')
-        limit = filters.get('limit', 20)
-        offset = filters.get('offset', 0)
-        
-        # Build queryset with filters
-        queryset = self.get_queryset()
-        
-        if wallet_id:
-            queryset = queryset.filter(wallet__id=wallet_id)
-        
-        if transaction_type:
-            queryset = queryset.by_type(transaction_type)
-        
-        if status_param:
-            queryset = queryset.filter(status=status_param)
-        
-        if payment_method:
-            queryset = queryset.filter(payment_method=payment_method)
-        
-        if reference:
-            queryset = queryset.filter(reference__icontains=reference)
-        
-        if start_date or end_date:
-            queryset = queryset.in_date_range(start_date, end_date)
-        
-        if min_amount is not None or max_amount is not None:
-            queryset = queryset.by_amount_range(min_amount, max_amount)
-        
-        # Order by most recent first
-        queryset = queryset.order_by('-created_at')
-        
-        # Get total count before pagination
-        total_count = queryset.count()
-        
-        # Apply pagination
-        queryset = queryset[offset:offset + limit]
-        
-        # Serialize data
-        serializer = self.get_serializer(queryset, many=True)
-        
-        logger.info(
-            f"Listed {len(serializer.data)} transactions for user {request.user.id} "
-            f"(total: {total_count})"
-        )
-        
-        # Return paginated response
-        return Response({
-            'count': total_count,
-            'next': offset + limit if offset + limit < total_count else None,
-            'previous': offset - limit if offset > 0 else None,
-            'results': serializer.data
-        })
-    
-    def retrieve(self, request: Request, pk=None):
-        """
-        Retrieve detailed transaction information
-        
-        Args:
-            pk: Transaction ID
-            
-        Returns:
-            Response: Detailed transaction data
-        """
-        try:
-            transaction = self.get_object()
-            serializer = self.get_serializer(transaction)
-            
-            logger.info(
-                f"Retrieved transaction {transaction.id} for user {request.user.id}"
-            )
-            
-            return Response(serializer.data)
-        
-        except Transaction.DoesNotExist:
-            logger.warning(
-                f"Transaction {pk} not found for user {request.user.id}"
-            )
-            return Response(
-                {'error': _("Transaction not found")},
-                status=status.HTTP_404_NOT_FOUND
-            )
-    
-    # ==========================================
-    # CUSTOM ACTIONS
-    # ==========================================
-    
-    @action(detail=False, methods=['post'])
-    def verify(self, request: Request):
-        """
-        Verify a transaction by reference
-        
-        Body Parameters:
-            - reference: Transaction reference to verify
-        
-        Returns:
-            Response: Transaction verification result
-        """
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        
-        reference = serializer.validated_data['reference']
-        
-        try:
-            transaction = self.transaction_service.get_transaction_by_reference(
-                reference
-            )
-            
-            # Check permission
-            if transaction.wallet.user != request.user:
-                logger.warning(
-                    f"User {request.user.id} attempted to verify "
-                    f"transaction {transaction.id} from another user"
-                )
-                return Response(
-                    {'error': _("You do not have permission to verify this transaction")},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-            
-            result_serializer = TransactionDetailSerializer(transaction)
-            
-            logger.info(
-                f"Verified transaction {transaction.id} with reference {reference}"
-            )
-            
-            return Response(result_serializer.data)
-        
-        except Transaction.DoesNotExist:
-            logger.error(f"Transaction with reference {reference} not found")
-            return Response(
-                {'error': _("Transaction not found")},
-                status=status.HTTP_404_NOT_FOUND
-            )
-    
-    @action(detail=True, methods=['post'])
-    @db_transaction.atomic
-    def refund(self, request: Request, pk=None):
-        """
-        Refund a transaction
-        
-        Body Parameters:
-            - amount: Amount to refund (optional, defaults to full amount)
-            - reason: Reason for refund (optional)
-        
-        Returns:
-            Response: Refund transaction details
-        """
-        try:
-            transaction = self.get_object()
-            
-            # Parse refund data
-            amount = request.data.get('amount')
-            reason = request.data.get('reason')
-            
-            # Perform refund
-            refund_transaction = self.transaction_service.refund_transaction(
-                transaction=transaction,
-                amount=amount,
-                reason=reason
-            )
-            
-            refund_serializer = TransactionDetailSerializer(refund_transaction)
-            
-            logger.info(
-                f"Created refund transaction {refund_transaction.id} for "
-                f"transaction {transaction.id} by user {request.user.id}"
-            )
-            
-            return Response(
-                {
-                    'message': _("Refund processed successfully"),
-                    'refund': refund_serializer.data
-                },
-                status=status.HTTP_201_CREATED
-            )
-        
-        except ValueError as e:
-            logger.error(
-                f"Refund validation error for transaction {pk}: {str(e)}"
-            )
-            return Response(
-                {'error': str(e)},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        except Transaction.DoesNotExist:
-            logger.warning(f"Transaction {pk} not found for refund")
-            return Response(
-                {'error': _("Transaction not found")},
-                status=status.HTTP_404_NOT_FOUND
-            )
-        except Exception as e:
-            logger.error(
-                f"Refund failed for transaction {pk}: {str(e)}",
-                exc_info=True
-            )
-            return Response(
-                {'error': _("Refund failed: {error}").format(error=str(e))},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-    
-    @action(detail=True, methods=['post'])
-    @db_transaction.atomic
-    def cancel(self, request: Request, pk=None):
-        """
-        Cancel a pending transaction
-        
-        Body Parameters:
-            - reason: Reason for cancellation (optional)
-        
-        Returns:
-            Response: Cancelled transaction details
-        """
-        try:
-            transaction = self.get_object()
-            
-            # Parse cancellation reason
-            reason = request.data.get('reason')
-            
-            # Cancel transaction
-            cancelled_transaction = self.transaction_service.cancel_transaction(
-                transaction=transaction,
-                reason=reason
-            )
-            
-            cancel_serializer = TransactionDetailSerializer(cancelled_transaction)
-            
-            logger.info(
-                f"Cancelled transaction {transaction.id} by user {request.user.id}"
-            )
-            
-            return Response(
-                {
-                    'message': _("Transaction cancelled successfully"),
-                    'transaction': cancel_serializer.data
-                }
-            )
-        
-        except ValueError as e:
-            logger.error(
-                f"Cancel validation error for transaction {pk}: {str(e)}"
-            )
-            return Response(
-                {'error': str(e)},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        except Transaction.DoesNotExist:
-            logger.warning(f"Transaction {pk} not found for cancellation")
-            return Response(
-                {'error': _("Transaction not found")},
-                status=status.HTTP_404_NOT_FOUND
-            )
-        except Exception as e:
-            logger.error(
-                f"Cancellation failed for transaction {pk}: {str(e)}",
-                exc_info=True
-            )
-            return Response(
-                {'error': _("Cancellation failed: {error}").format(error=str(e))},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-    
-    @action(detail=False, methods=['get'])
-    def statistics(self, request: Request):
-        """
-        Get transaction statistics for user's wallets
-        
-        Query Parameters:
-            - wallet_id: Filter by specific wallet (optional)
-            - start_date: Start date for statistics (optional)
-            - end_date: End date for statistics (optional)
-        
-        Returns:
-            Response: Transaction statistics
-        """
-        try:
-            # Parse filters
-            wallet_id = request.query_params.get('wallet_id')
-            start_date = request.query_params.get('start_date')
-            end_date = request.query_params.get('end_date')
-            
-            # Get wallet if specified
-            wallet = None
-            if wallet_id:
-                wallet = get_object_or_404(
-                    Wallet,
-                    id=wallet_id,
-                    user=request.user
-                )
-            
-            # Get statistics
-            stats = self.transaction_service.get_transaction_statistics(
-                wallet=wallet,
-                start_date=start_date,
-                end_date=end_date
-            )
-            
-            serializer = self.get_serializer(stats)
-            
-            logger.info(
-                f"Retrieved transaction statistics for user {request.user.id}"
-            )
-            
-            return Response(serializer.data)
-        
-        except Exception as e:
-            logger.error(
-                f"Failed to retrieve statistics for user {request.user.id}: {str(e)}",
-                exc_info=True
-            )
-            return Response(
-                {'error': _("Failed to retrieve statistics")},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-    
-    @action(detail=False, methods=['get'])
-    def summary(self, request: Request):
-        """
-        Get comprehensive transaction summary
-        
-        Query Parameters:
-            - wallet_id: Filter by specific wallet (optional)
-            - start_date: Start date for summary (optional)
-            - end_date: End date for summary (optional)
-        
-        Returns:
-            Response: Transaction summary grouped by type and status
-        """
-        try:
-            # Parse filters
-            wallet_id = request.query_params.get('wallet_id')
-            start_date = request.query_params.get('start_date')
-            end_date = request.query_params.get('end_date')
-            
-            # Get wallet if specified
-            wallet = None
-            if wallet_id:
-                wallet = get_object_or_404(
-                    Wallet,
-                    id=wallet_id,
-                    user=request.user
-                )
-            
-            # Get summary
-            summary = self.transaction_service.get_transaction_summary(
-                wallet=wallet,
-                start_date=start_date,
-                end_date=end_date
-            )
-            
-            serializer = self.get_serializer(summary)
-            
-            logger.info(
-                f"Retrieved transaction summary for user {request.user.id}"
-            )
-            
-            return Response(serializer.data)
-        
-        except Exception as e:
-            logger.error(
-                f"Failed to retrieve summary for user {request.user.id}: {str(e)}",
-                exc_info=True
-            )
-            return Response(
-                {'error': _("Failed to retrieve summary")},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-    
-    @action(detail=False, methods=['get'])
-    def export(self, request: Request):
-        """
-        Export transactions to CSV, Excel, or PDF
-        
-        Query Parameters:
-            - format: Export format ('csv', 'xlsx', or 'pdf', default: 'csv')
-            - wallet_id: Filter by wallet ID (optional)
-            - transaction_type: Filter by type (optional)
-            - status: Filter by status (optional)
-            - start_date: Start date (optional)
-            - end_date: End date (optional)
-        
-        Returns:
-            HttpResponse: File download response (CSV, Excel, or PDF)
-        
-        Example Usage:
-            GET /api/transactions/export/?format=csv
-            GET /api/transactions/export/?format=xlsx&wallet_id=123
-            GET /api/transactions/export/?format=pdf&status=success&start_date=2024-01-01
-        """
-        try:
-            # Parse parameters
-            export_format = request.query_params.get('format', 'csv')
-            wallet_id = request.query_params.get('wallet_id')
-            transaction_type = request.query_params.get('transaction_type')
-            status_param = request.query_params.get('status')
-            start_date = request.query_params.get('start_date')
-            end_date = request.query_params.get('end_date')
-            
-            # Build queryset
-            queryset = self.get_queryset()
-            
-            if wallet_id:
-                queryset = queryset.filter(wallet__id=wallet_id)
-            if transaction_type:
-                queryset = queryset.by_type(transaction_type)
-            if status_param:
-                queryset = queryset.filter(status=status_param)
-            if start_date or end_date:
-                queryset = queryset.in_date_range(start_date, end_date)
-            
-            queryset = queryset.order_by('-created_at')
-            
-            # Define fields to export (DRY - defined once, used three times)
-            export_fields = [
-                'id',
-                'reference',
-                'wallet.tag',
-                'wallet.user.email',
-                'amount.amount',
-                'amount.currency.code',
-                'fees.amount',
-                'transaction_type',
-                'status',
-                'description',
-                'created_at',
-                'completed_at'
-            ]
-            
-            # Export based on format
-            if export_format == 'csv':
-                from wallet.utils.exporters import export_queryset_to_csv
-                
-                response = export_queryset_to_csv(
-                    queryset=queryset,
-                    fields=export_fields,
-                    filename_prefix='transactions'
-                )
-            elif export_format == 'xlsx':
-                from wallet.utils.exporters import export_queryset_to_excel
-                
-                response = export_queryset_to_excel(
-                    queryset=queryset,
-                    fields=export_fields,
-                    filename_prefix='transactions',
-                    sheet_name='Transactions'
-                )
-            elif export_format == 'pdf':
-                from wallet.utils.exporters import export_queryset_to_pdf
-                
-                response = export_queryset_to_pdf(
-                    queryset=queryset,
-                    fields=export_fields,
-                    filename_prefix='transactions',
-                    title='Transaction Records'
-                )
-            else:
-                return Response(
-                    {'error': _("Invalid export format. Use 'csv', 'xlsx', or 'pdf'")},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            logger.info(
-                f"Exported {queryset.count()} transactions to {export_format} "
-                f"for user {request.user.id}"
-            )
-            
-            return response
-        
-        except Exception as e:
-            logger.error(
-                f"Export failed for user {request.user.id}: {str(e)}",
-                exc_info=True
-            )
-            return Response(
-                {'error': _("Export failed")},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+    staff_actions = ('refund', 'reverse')
+    # Actions where staff may act on any user's transaction
+    staff_wide_actions = ('refund', 'reverse', 'release', 'cancel')
+    idempotent_actions = ('refund', 'reverse', 'release', 'cancel')
 
-        
-    #admin oly bulk operations
-    @action(
-        detail=False, 
-        methods=['post'], 
-        permission_classes=[permissions.IsAdminUser],
-        url_path='bulk-create'
-    )
-    def bulk_create(self, request):
-        """
-        Admin-only: Bulk create transactions
-        
-        POST /api/transactions/bulk-create/
-        
-        Body: {
-            "transactions": [
-                {
-                    "wallet_id": "uuid",
-                    "amount": "100.00",
-                    "transaction_type": "deposit",
-                    "description": "Bulk import",
-                    "status": "success"  // optional
-                },
-                ...
-            ]
+    def get_queryset(self):
+        queryset = Transaction.objects.with_full_details()
+        if not (self.request.user.is_staff and self.action in self.staff_wide_actions):
+            queryset = queryset.filter(wallet__user=self.request.user)
+        params = self.request.query_params
+        filters = {
+            'transaction_type': params.get('type') or params.get('transaction_type'),
+            'status': params.get('status'),
+            'direction': params.get('direction'),
+            'payment_method': params.get('payment_method'),
         }
-        
-        Returns: {
-            "created": 10,
-            "transactions": [...]
-        }
-        """
-        serializer = BulkTransactionCreateSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        
+        queryset = queryset.filter(**{k: v for k, v in filters.items() if v})
+        queryset = queryset.in_date_range(_parse_when(params.get('start_date')),
+                                          _parse_when(params.get('end_date'), end=True))
+        if params.get('search'):
+            queryset = queryset.filter(Q(reference__icontains=params['search'])
+                                       | Q(description__icontains=params['search']))
+        return queryset.order_by('-created_at')
+
+    def get_serializer_class(self):
+        return TransactionDetailSerializer if self.action == 'retrieve' else TransactionSerializer
+
+    @action(detail=False, methods=['post'])
+    def verify(self, request):
+        data = self.validated(VerifyTransactionSerializer)
+        txn = self.get_queryset().filter(reference=data['reference']).first()
+        if txn is None:
+            return error_response(_("Transaction not found"), status.HTTP_404_NOT_FOUND, 'not_found')
+        if txn.transaction_type != TRANSACTION_TYPE_DEPOSIT:
+            raise InvalidTransactionState(_("Only deposits can be verified"))
+        DepositService().verify_deposit(txn.reference)
+        txn.refresh_from_db()
+        return Response(TransactionDetailSerializer(txn).data)
+
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        txn = self.get_object()
+        if txn.transaction_type == TRANSACTION_TYPE_PAYMENT and not request.user.is_staff:
+            # A buyer could otherwise take the goods and then cancel the escrow.
+            raise PermissionDenied(_("Escrowed payments can only be cancelled by staff"))
+        data = self.validated(ReasonSerializer)
+        txn = TransactionService().cancel_transaction(txn, data.get('reason'), performed_by=request.user)
+        return Response(TransactionDetailSerializer(txn).data)
+
+    @action(detail=True, methods=['post'])
+    def release(self, request, pk=None):
+        txn = self.get_object()
+        txn = TransferService().release_payment(txn, performed_by=request.user)
+        return Response(TransactionDetailSerializer(txn).data)
+
+    @action(detail=True, methods=['post'])
+    def refund(self, request, pk=None):
+        txn = self.get_object()
+        data = self.validated(RefundSerializer)
+        refund = TransactionService().refund_deposit(txn, amount=data.get('amount'), reason=data.get('reason'),
+                                                     performed_by=request.user)
+        return Response(TransactionDetailSerializer(refund).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'])
+    def reverse(self, request, pk=None):
+        txn = self.get_object()
+        data = self.validated(ReasonSerializer)
+        reversal = TransactionService().reverse_transaction(txn, reason=data.get('reason'),
+                                                           performed_by=request.user)
+        return Response(TransactionDetailSerializer(reversal).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['get'])
+    def statistics(self, request):
+        stats = TransactionService().get_transaction_statistics(
+            wallet=self.get_user_wallet(), start_date=_parse_when(request.query_params.get('start_date')),
+            end_date=_parse_when(request.query_params.get('end_date'), end=True),
+        )
+        return Response({key: str(value) if not isinstance(value, (dict, int)) else value
+                         for key, value in stats.items()})
+
+    @action(detail=False, methods=['get'])
+    def summary(self, request):
+        summary = TransactionService().get_transaction_summary(wallet=self.get_user_wallet())
+        return Response(_stringify(summary))
+
+    @action(detail=False, methods=['get'])
+    def export(self, request):
+        export_format = request.query_params.get('export_format', 'csv')
+        if export_format not in EXPORT_FORMATS:
+            return error_response(_("Use export_format=csv, xlsx or pdf"), status.HTTP_400_BAD_REQUEST, 'invalid_format')
         try:
-            # Build transactions data
-            transactions_data = []
-            for txn_data in serializer.validated_data['transactions']:
-                wallet = get_object_or_404(Wallet, id=txn_data['wallet_id'])
-                
-                transactions_data.append({
-                    'wallet': wallet,
-                    'amount': txn_data['amount'],
-                    'transaction_type': txn_data['transaction_type'],
-                    'description': txn_data.get('description', ''),
-                    'status': txn_data.get('status', TRANSACTION_STATUS_PENDING),
-                    'metadata': txn_data.get('metadata', {})
-                })
-            
-            # Bulk create
-            created_transactions = self.transaction_service.bulk_create_transactions(
-                transactions_data
-            )
-            
-            logger.info(
-                f"Admin {request.user.id} bulk created {len(created_transactions)} transactions"
-            )
-            
-            return Response(
-                {
-                    'created': len(created_transactions),
-                    'transactions': TransactionSerializer(
-                        created_transactions, 
-                        many=True
-                    ).data
-                },
-                status=status.HTTP_201_CREATED
-            )
-            
-        except Exception as e:
-            logger.error(f"Bulk create failed: {str(e)}", exc_info=True)
-            return Response(
-                {'detail': str(e)},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-    
-    @action(
-        detail=False,
-        methods=['post'],
-        permission_classes=[permissions.IsAdminUser],
-        url_path='bulk-update-status'
-    )
-    def bulk_update_status(self, request):
-        """
-        Admin-only: Bulk update transaction statuses
-        
-        POST /api/transactions/bulk-update-status/
-        
-        Body: {
-            "transaction_ids": ["uuid1", "uuid2", ...],
-            "status": "success",
-            "reason": "Bulk reconciliation"  // optional
-        }
-        
-        Returns: {
-            "updated": 10
-        }
-        """
-        serializer = BulkTransactionUpdateSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        
-        try:
-            updated_count = self.transaction_service.bulk_update_status(
-                transaction_ids=serializer.validated_data['transaction_ids'],
-                status=serializer.validated_data['status'],
-                reason=serializer.validated_data.get('reason')
-            )
-            
-            logger.info(
-                f"Admin {request.user.id} bulk updated {updated_count} transactions "
-                f"to status {serializer.validated_data['status']}"
-            )
-            
-            return Response(
-                {'updated': updated_count},
-                status=status.HTTP_200_OK
-            )
-            
-        except Exception as e:
-            logger.error(f"Bulk update failed: {str(e)}", exc_info=True)
-            return Response(
-                {'detail': str(e)},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return export_queryset(self.get_queryset(), EXPORT_FIELDS, export_format, 'transactions',
+                                   title='Transactions')
+        except ImproperlyConfigured as exc:     # optional export libraries not installed
+            return error_response(str(exc), status.HTTP_501_NOT_IMPLEMENTED, 'export_unavailable')
+
+
+def _stringify(value):
+    if isinstance(value, dict):
+        return {key: _stringify(item) for key, item in value.items()}
+    if isinstance(value, (int, str)) or value is None:
+        return value
+    return str(value)

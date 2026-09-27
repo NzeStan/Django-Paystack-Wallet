@@ -1,2440 +1,383 @@
-# API Reference
+# REST API reference
 
-This document provides comprehensive documentation for all the API endpoints available in the Django Paystack Wallet system.
+All endpoints live under the prefix you include the URLs at (examples use `/wallet/`).
+Authentication is your Django REST Framework authentication (session, token, JWT, …);
+permissions default to `IsAuthenticated` (`WALLET_API_PERMISSION_CLASSES`).
 
-## Authentication
+Users only ever see their own wallet, transactions, cards, bank accounts and settlements.
+Amounts are decimal strings (`"1500.00"`) in the wallet's currency. Lists are paginated:
 
-All API endpoints require authentication. The wallet system uses Django REST Framework's authentication classes, which can be configured in your project settings.
+```json
+{"count": 42, "next": "…?page=2", "previous": null, "results": [ … ]}
+```
 
-```python
-REST_FRAMEWORK = {
-    'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework.authentication.SessionAuthentication',
-        'rest_framework.authentication.TokenAuthentication',
-    ),
-    'DEFAULT_PERMISSION_CLASSES': (
-        'rest_framework.permissions.IsAuthenticated',
-    ),
+(`?page=2&page_size=50`, up to `WALLET_API_MAX_PAGE_SIZE`.)
+
+## Errors
+
+Business errors:
+
+```json
+{"detail": "Recipient wallet not found", "code": "recipient_not_found"}
+```
+
+Validation errors (standard DRF):
+
+```json
+{"amount": ["Ensure this value is greater than or equal to 0.01."]}
+```
+
+| HTTP | Common `code`s |
+| --- | --- |
+| 400 | `insufficient_funds`, `invalid_amount`, `limit_exceeded`, `minimum_balance`, `recipient_error`, `bank_account_error`, `card_error`, `currency_mismatch`, `invalid_phone_number`, `pin_required`, `pin_not_set`, `settlement_error` |
+| 403 | `wallet_locked`, `wallet_inactive`, `feature_disabled`, `invalid_pin`, `pin_locked` |
+| 404 | `not_found`, `recipient_not_found`, `wallet_not_found`, `bank_account_not_found`, `card_not_found` |
+| 409 | `duplicate_reference`, `invalid_transaction_state`, `idempotency_in_progress` |
+| 422 | `idempotency_key_reused` |
+| 429 | rate limited (`Retry-After` header) |
+| 502 | `paystack_error` (Paystack's own message is shown when it rejected the request) |
+
+When `WALLET_REQUIRE_TRANSACTION_PIN` is on, send `"pin": "1234"` with withdraw, transfer,
+pay, charge-card and settlement requests.
+
+## Idempotency keys
+
+Send `Idempotency-Key: <a new UUID per operation>` with every money-moving POST
+(deposit, charge-card, withdraw, finalize-withdrawal, transfer, pay, card charge,
+settlement create/finalize, and the staff refund/reverse/release/cancel actions).
+If the network drops and the app retries with the **same key and body**, the API returns
+the original response (with header `Idempotent-Replayed: true`) instead of moving money
+again. Keys are per user and remembered for `WALLET_IDEMPOTENCY_TTL_HOURS`.
+
+| Situation | Response |
+| --- | --- |
+| Same key, same body, first request finished | Original status and body, `Idempotent-Replayed: true` |
+| Same key, first request still running | `409 idempotency_in_progress` |
+| Same key, different body | `422 idempotency_key_reused` |
+| No key while `WALLET_REQUIRE_IDEMPOTENCY_KEY` is on | `400 idempotency_key_required` |
+| First attempt hit a server error (5xx) | Not stored; retrying with the same key is safe |
+
+## Rate limits
+
+Sensitive endpoints are rate limited per user (`WALLET_THROTTLE_RATES`). Over the limit
+you get `429` with a `Retry-After` header.
+
+---
+
+## Wallets
+
+`{id}` is the wallet UUID or `me`.
+
+### `GET /wallet/api/wallets/me/`
+
+```json
+{
+  "id": "870da5a6-3072-4f4d-8bff-92593f0762a9",
+  "tag": "ada",
+  "phone_number": "+2348031234567",
+  "balance": "43475.00",
+  "currency": "NGN",
+  "is_active": true,
+  "is_locked": false,
+  "is_operational": true,
+  "has_pin": false,
+  "dedicated_account": {"account_number": "9930000001", "account_name": "ADA OBI", "bank_name": "Wema Bank", "active": true},
+  "last_transaction_date": "2026-09-27T04:14:29.535732+01:00",
+  "created_at": "2026-09-27T04:14:29.422350+01:00",
+  "updated_at": "2026-09-27T04:14:29.422366+01:00",
+  "daily_limit": null,
+  "daily_spent": "10025.00",
+  "customer_identified": false
 }
 ```
 
-For token-based authentication, include the token in the request header:
+### `PATCH /wallet/api/wallets/me/`
 
-```
-Authorization: Token 9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b
-```
-
-## Base URL
-
-All API endpoints are prefixed with `/wallet/api/` by default. This can be customized in your URL configuration.
-
-## Wallet API
-
-### List Wallets
-
-Retrieves all wallets belonging to the authenticated user.
-
-**Endpoint:** `GET /wallet/api/wallets/`
-
-**Response:**
 ```json
-[
-    {
-        "id": "550e8400-e29b-41d4-a716-446655440000",
-        "user": 1,
-        "user_email": "user@example.com",
-        "user_name": "John Doe",
-        "balance_amount": "1000.00",
-        "balance_currency": "NGN",
-        "tag": "johndoe",
-        "is_active": true,
-        "is_locked": false,
-        "last_transaction_date": "2023-01-15T12:30:45Z",
-        "daily_transaction_total_amount": "500.00",
-        "daily_transaction_count": 3,
-        "daily_transaction_reset": "2023-01-15",
-        "created_at": "2023-01-01T10:00:00Z",
-        "updated_at": "2023-01-15T12:30:45Z",
-        "dedicated_account_number": "0123456789",
-        "dedicated_account_bank": "Test Bank"
-    }
-]
+{"tag": "ada.pay", "phone_number": "0803 123 4567"}
 ```
 
-### Get Wallet
+Phone numbers are normalised (`+2348031234567`) and must be unique; tags are 3-30
+characters (letters, digits, `.`, `-`, `_`) and unique.
 
-Retrieves a specific wallet by ID.
+### `GET /wallet/api/wallets/me/balance/`
 
-**Endpoint:** `GET /wallet/api/wallets/{id}/`
+```json
+{"balance": "43475.00", "currency": "NGN", "is_operational": true, "updated_at": "2026-09-27T03:14:29Z"}
+```
 
-**Response:**
+### `GET /wallet/api/wallets/me/transactions/`
+
+Filters: `type`, `status`, `direction` (`credit`/`debit`), `search` (reference or
+description), `start_date`, `end_date` (`YYYY-MM-DD` covers the whole day, or ISO datetime).
+
+### `GET /wallet/api/wallets/me/statement/`
+
+Posted entries (with `balance_after`) oldest first. Takes `start_date` and `end_date`.
+
+### `POST /wallet/api/wallets/me/deposit/`
+
+Start a Paystack checkout.
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `amount` | ✔ | Amount to credit |
+| `email` | | Defaults to the user's email |
+| `callback_url` | | Where Paystack returns the customer (default `WALLET_DEFAULT_CALLBACK_URL`) |
+| `channels` | | e.g. `["card", "bank_transfer", "ussd"]` |
+| `reference` | | Your own unique reference |
+| `description`, `metadata` | | `metadata` is echoed in webhooks |
+| `fee_bearer` | | Only if `WALLET_ALLOW_FEE_BEARER_OVERRIDE` (or staff) |
+
+`201`:
+
 ```json
 {
-    "id": "550e8400-e29b-41d4-a716-446655440000",
-    "user": 1,
-    "user_email": "user@example.com",
-    "user_name": "John Doe",
-    "balance_amount": "1000.00",
-    "balance_currency": "NGN",
-    "tag": "johndoe",
-    "is_active": true,
-    "is_locked": false,
-    "last_transaction_date": "2023-01-15T12:30:45Z",
-    "daily_transaction_total_amount": "500.00",
-    "daily_transaction_count": 3,
-    "daily_transaction_reset": "2023-01-15",
-    "created_at": "2023-01-01T10:00:00Z",
-    "updated_at": "2023-01-15T12:30:45Z",
-    "dedicated_account_number": "0123456789",
-    "dedicated_account_bank": "Test Bank",
-    "transaction_count": 15,
-    "cards_count": 2,
-    "bank_accounts_count": 1,
-    "paystack_customer_code": "CUS_123456"
+  "authorization_url": "https://checkout.paystack.com/0peioxfhpn",
+  "access_code": "0peioxfhpn",
+  "reference": "DEP-1790478869-OMCF7MOPCN",
+  "transaction_id": "353c1fa2-ffda-43ed-9171-64603e4d29d0",
+  "amount": "5000.00",
+  "charge_amount": "5000.00",
+  "currency": "NGN",
+  "public_key": "pk_test_…",
+  "fee_breakdown": {"fee_amount": "0.00", "bearer": "platform", "customer_pays": "5000.00", "merchant_receives": "5000.00", "…": "…"}
 }
 ```
 
-You can also use `default` as the ID to retrieve the user's default wallet:
+Redirect to `authorization_url`, or open Paystack InlineJS with `access_code` and
+`public_key`. The wallet is credited by the webhook, or when you call:
 
-**Endpoint:** `GET /wallet/api/wallets/default/`
+### `POST /wallet/api/wallets/me/verify-deposit/`
 
-### Update Wallet
+```json
+{"reference": "DEP-1790478869-OMCF7MOPCN"}
+```
 
-Updates a wallet's attributes.
+Returns the transaction. Safe to call repeatedly: a deposit is credited only once.
 
-**Endpoint:** `PATCH /wallet/api/wallets/{id}/`
+### `POST /wallet/api/wallets/me/charge-card/`
 
-**Request:**
+Top up from a saved card: `{"amount": "3000", "card_id": "…"}` (default card if
+omitted). `200` if charged now, `202` if the bank needs another step (the webhook
+completes it).
+
+### `POST /wallet/api/wallets/me/withdraw/`
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `amount` | ✔ | Amount the bank account should receive |
+| `bank_account_id` | | Default bank account if omitted |
+| `description`, `reference`, `metadata`, `fee_bearer`, `pin` | | `reference`: 16-50 lowercase letters, digits, `-`, `_` |
+
+Response (`200` success, `202` processing / OTP needed, `400` failed):
+
 ```json
 {
-    "tag": "new-tag",
-    "is_active": true
-}
-```
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440000",
-    "tag": "new-tag",
-    "is_active": true,
-    "is_locked": false
-}
-```
-
-### Get Wallet Balance
-
-Retrieves the current balance of a wallet.
-
-**Endpoint:** `GET /wallet/api/wallets/{id}/balance/`
-
-**Response:**
-```json
-{
-    "balance": "1000.00",
-    "currency": "NGN"
-}
-```
-
-### Deposit to Wallet
-
-Initiates a deposit to the wallet using Paystack.
-
-**Endpoint:** `POST /wallet/api/wallets/{id}/deposit/`
-
-**Request:**
-```json
-{
-    "amount": "500.00",
-    "email": "user@example.com",
-    "callback_url": "https://example.com/callback"
-}
-```
-
-**Response:**
-```json
-{
-    "authorization_url": "https://checkout.paystack.com/0peioxfhpn",
-    "access_code": "0peioxfhpn",
-    "reference": "REF123456"
-}
-```
-
-### Withdraw from Wallet
-
-Withdraws funds from the wallet to a bank account.
-
-**Endpoint:** `POST /wallet/api/wallets/{id}/withdraw/`
-
-**Request:**
-```json
-{
-    "amount": "200.00",
-    "bank_account_id": "550e8400-e29b-41d4-a716-446655440001",
-    "description": "Withdrawal to my account"
-}
-```
-
-**Response:**
-```json
-{
-    "transaction": {
-        "id": "550e8400-e29b-41d4-a716-446655440002",
-        "reference": "TRX123456",
-        "amount_value": "200.00",
-        "transaction_type": "withdrawal",
-        "status": "success",
-        "description": "Withdrawal to my account",
-        "created_at": "2023-01-15T14:30:00Z"
-    },
-    "transfer_data": {
-        "transfer_code": "TRF_123456",
-        "status": "success"
-    }
-}
-```
-
-### Transfer to Another Wallet
-
-Transfers funds from one wallet to another.
-
-**Endpoint:** `POST /wallet/api/wallets/{id}/transfer/`
-
-**Request:**
-```json
-{
-    "amount": "100.00",
-    "destination_wallet_id": "550e8400-e29b-41d4-a716-446655440003",
-    "description": "Payment for services"
-}
-```
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440004",
-    "reference": "TRX789012",
-    "amount_value": "100.00",
-    "amount_currency": "NGN",
-    "transaction_type": "transfer",
-    "transaction_type_display": "Transfer",
-    "status": "success",
-    "status_display": "Success",
-    "description": "Payment for services",
-    "recipient_wallet_id": "550e8400-e29b-41d4-a716-446655440003",
-    "created_at": "2023-01-15T15:00:00Z"
-}
-```
-
-### Lock Wallet
-
-Locks a wallet to prevent transactions.
-
-**Endpoint:** `POST /wallet/api/wallets/{id}/lock/`
-
-**Response:**
-```json
-{
-    "detail": "Wallet locked successfully"
-}
-```
-
-### Unlock Wallet
-
-Unlocks a previously locked wallet.
-
-**Endpoint:** `POST /wallet/api/wallets/{id}/unlock/`
-
-**Response:**
-```json
-{
-    "detail": "Wallet unlocked successfully"
-}
-```
-
-### Get Wallet Transactions
-
-Retrieves transactions for a specific wallet.
-
-**Endpoint:** `GET /wallet/api/wallets/{id}/transactions/?type=deposit&status=success&limit=10&offset=0`
-
-**Parameters:**
-- `type` (optional): Filter by transaction type (deposit, withdrawal, transfer, etc.)
-- `status` (optional): Filter by transaction status (pending, success, failed, etc.)
-- `limit` (optional): Number of results to return (default: 20)
-- `offset` (optional): Result offset for pagination (default: 0)
-
-**Response:**
-```json
-{
-    "count": 15,
-    "next": 10,
-    "previous": null,
-    "results": [
-        {
-            "id": "550e8400-e29b-41d4-a716-446655440005",
-            "reference": "TRX123456",
-            "amount_value": "500.00",
-            "amount_currency": "NGN",
-            "transaction_type": "deposit",
-            "transaction_type_display": "Deposit",
-            "status": "success",
-            "status_display": "Success",
-            "description": "Deposit to wallet",
-            "created_at": "2023-01-15T12:30:45Z",
-            "completed_at": "2023-01-15T12:31:00Z"
-        },
-        // ...more transactions
-    ]
-}
-```
-
-### Get Wallet Cards
-
-Retrieves all cards associated with a wallet.
-
-**Endpoint:** `GET /wallet/api/wallets/{id}/cards/`
-
-**Response:**
-```json
-[
-    {
-        "id": "550e8400-e29b-41d4-a716-446655440006",
-        "card_type": "visa",
-        "card_type_display": "Visa",
-        "last_four": "4242",
-        "expiry_month": "12",
-        "expiry_year": "2025",
-        "is_default": true,
-        "is_active": true,
-        "is_expired": false,
-        "masked_pan": "424242******4242",
-        "created_at": "2023-01-10T10:00:00Z"
-    }
-]
-```
-
-### Get Wallet Bank Accounts
-
-Retrieves all bank accounts associated with a wallet.
-
-**Endpoint:** `GET /wallet/api/wallets/{id}/bank_accounts/`
-
-**Response:**
-```json
-[
-    {
-        "id": "550e8400-e29b-41d4-a716-446655440007",
-        "bank_name": "Test Bank",
-        "bank_code": "123",
-        "account_number": "0123456789",
-        "account_name": "John Doe",
-        "account_type": "savings",
-        "account_type_display": "Savings",
-        "is_default": true,
-        "is_active": true,
-        "is_verified": true,
-        "created_at": "2023-01-05T14:00:00Z"
-    }
-]
-```
-
-### Get Dedicated Account
-
-Retrieves or creates a dedicated virtual account for a wallet.
-
-**Endpoint:** `GET /wallet/api/wallets/{id}/dedicated_account/`
-
-**Response:**
-```json
-{
-    "account_number": "0123456789",
-    "bank_name": "Test Bank",
-    "account_name": "John Doe"
-}
-```
-
-## Transaction API
-
-### List Transactions
-
-Retrieves all transactions associated with the authenticated user's wallets.
-
-**Endpoint:** `GET /wallet/api/transactions/?wallet_id=550e8400-e29b-41d4-a716-446655440000&transaction_type=deposit&status=success&limit=10&offset=0`
-
-**Parameters:**
-- `wallet_id` (optional): Filter by wallet ID
-- `transaction_type` (optional): Filter by transaction type
-- `status` (optional): Filter by status
-- `reference` (optional): Filter by reference
-- `start_date` (optional): Filter by start date (YYYY-MM-DD)
-- `end_date` (optional): Filter by end date (YYYY-MM-DD)
-- `min_amount` (optional): Filter by minimum amount
-- `max_amount` (optional): Filter by maximum amount
-- `payment_method` (optional): Filter by payment method
-- `limit` (optional): Number of results (default: 20)
-- `offset` (optional): Result offset for pagination (default: 0)
-
-**Response:**
-```json
-{
-    "count": 25,
-    "next": 10,
-    "previous": null,
-    "results": [
-        {
-            "id": "550e8400-e29b-41d4-a716-446655440008",
-            "reference": "TRX123456",
-            "amount_value": "500.00",
-            "amount_currency": "NGN",
-            "transaction_type": "deposit",
-            "transaction_type_display": "Deposit",
-            "status": "success",
-            "status_display": "Success",
-            "description": "Deposit to wallet",
-            "created_at": "2023-01-15T12:30:45Z",
-            "completed_at": "2023-01-15T12:31:00Z"
-        },
-        // ...more transactions
-    ]
-}
-```
-
-### Get Transaction
-
-Retrieves a specific transaction by ID.
-
-**Endpoint:** `GET /wallet/api/transactions/{id}/`
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440008",
-    "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-    "amount_value": "500.00",
-    "amount_currency": "NGN",
-    "reference": "TRX123456",
-    "transaction_type": "deposit",
-    "transaction_type_display": "Deposit",
-    "status": "success",
-    "status_display": "Success",
-    "payment_method": "card",
-    "payment_method_display": "Card",
-    "description": "Deposit to wallet",
-    "metadata": {},
-    "recipient_wallet_id": null,
-    "recipient_bank_account_id": null,
-    "card_id": "550e8400-e29b-41d4-a716-446655440006",
-    "related_transaction_id": null,
-    "fees_value": "7.50",
-    "ip_address": "127.0.0.1",
-    "created_at": "2023-01-15T12:30:45Z",
-    "updated_at": "2023-01-15T12:31:00Z",
-    "completed_at": "2023-01-15T12:31:00Z",
-    "failed_reason": null,
-    "paystack_reference": "PSK_123456",
-    "paystack_response": {}
-}
-```
-
-### Verify Transaction
-
-Verifies a transaction by reference.
-
-**Endpoint:** `POST /wallet/api/transactions/verify/`
-
-**Request:**
-```json
-{
-    "reference": "TRX123456"
-}
-```
-
-**Response:**
-```json
-{
-    "status": "success",
-    "reference": "TRX123456",
-    "amount": 50000,
-    "currency": "NGN",
-    "customer": {
-        "email": "user@example.com"
-    }
-}
-```
-
-### Refund Transaction
-
-Creates a refund for a transaction.
-
-**Endpoint:** `POST /wallet/api/transactions/refund/`
-
-**Request:**
-```json
-{
-    "transaction_id": "550e8400-e29b-41d4-a716-446655440008",
-    "amount": "500.00",
-    "reason": "Customer requested refund"
-}
-```
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440009",
-    "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-    "amount_value": "500.00",
-    "amount_currency": "NGN",
-    "reference": "TRX987654",
-    "transaction_type": "refund",
-    "transaction_type_display": "Refund",
-    "status": "success",
-    "status_display": "Success",
-    "description": "Refund for transaction TRX123456",
-    "related_transaction_id": "550e8400-e29b-41d4-a716-446655440008",
-    "created_at": "2023-01-16T09:00:00Z",
-    "completed_at": "2023-01-16T09:00:15Z"
-}
-```
-
-## Card API
-
-### List Cards
-
-Retrieves all cards associated with the authenticated user's wallets.
-
-**Endpoint:** `GET /wallet/api/cards/`
-
-**Response:**
-```json
-[
-    {
-        "id": "550e8400-e29b-41d4-a716-446655440006",
-        "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-        "card_type": "visa",
-        "card_type_display": "Visa",
-        "last_four": "4242",
-        "expiry_month": "12",
-        "expiry_year": "2025",
-        "bin": "424242",
-        "card_holder_name": "John Doe",
-        "email": "user@example.com",
-        "is_default": true,
-        "is_active": true,
-        "is_expired": false,
-        "masked_pan": "424242******4242",
-        "created_at": "2023-01-10T10:00:00Z",
-        "updated_at": "2023-01-10T10:00:00Z"
-    }
-]
-```
-
-### Get Card
-
-Retrieves a specific card by ID.
-
-**Endpoint:** `GET /wallet/api/cards/{id}/`
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440006",
-    "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-    "card_type": "visa",
-    "card_type_display": "Visa",
-    "last_four": "4242",
-    "expiry_month": "12",
-    "expiry_year": "2025",
-    "bin": "424242",
-    "card_holder_name": "John Doe",
-    "email": "user@example.com",
-    "is_default": true,
-    "is_active": true,
-    "is_expired": false,
-    "masked_pan": "424242******4242",
-    "created_at": "2023-01-10T10:00:00Z",
-    "updated_at": "2023-01-10T10:00:00Z",
-    "transaction_count": 5
-}
-```
-
-### Update Card
-
-Updates a card's attributes.
-
-**Endpoint:** `PATCH /wallet/api/cards/{id}/`
-
-**Request:**
-```json
-{
-    "card_holder_name": "John Smith",
-    "is_default": true
-}
-```
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440006",
-    "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-    "card_type": "visa",
-    "card_type_display": "Visa",
-    "last_four": "4242",
-    "expiry_month": "12",
-    "expiry_year": "2025",
-    "bin": "424242",
-    "card_holder_name": "John Smith",
-    "email": "user@example.com",
-    "is_default": true,
-    "is_active": true,
-    "is_expired": false,
-    "masked_pan": "424242******4242",
-    "created_at": "2023-01-10T10:00:00Z",
-    "updated_at": "2023-01-16T14:30:00Z"
-}
-```
-
-### Delete Card
-
-Removes a card (marks it as inactive).
-
-**Endpoint:** `DELETE /wallet/api/cards/{id}/`
-
-**Response:** HTTP 204 No Content
-
-### Charge Card
-
-Charges a saved card.
-
-**Endpoint:** `POST /wallet/api/cards/{id}/charge/`
-
-**Request:**
-```json
-{
-    "amount": "300.00",
-    "description": "Charge for subscription"
-}
-```
-
-**Response:**
-```json
-{
-    "status": "success",
-    "reference": "CHG_123456",
-    "amount": 30000,
-    "currency": "NGN",
-    "customer": {
-        "email": "user@example.com"
-    }
-}
-```
-
-### Initialize Card Payment
-
-Initializes a new card payment.
-
-**Endpoint:** `POST /wallet/api/cards/initialize/`
-
-**Request:**
-```json
-{
-    "amount": "500.00",
-    "email": "user@example.com",
-    "callback_url": "https://example.com/callback"
-}
-```
-
-**Response:**
-```json
-{
-    "authorization_url": "https://checkout.paystack.com/0peioxfhpn",
-    "access_code": "0peioxfhpn",
-    "reference": "REF123456"
-}
-```
-
-### Set Card as Default
-
-Sets a card as the default payment method.
-
-**Endpoint:** `POST /wallet/api/cards/{id}/set_default/`
-
-**Response:**
-```json
-{
-    "detail": "Card set as default successfully"
-}
-```
-
-## Bank Account API
-
-### List Bank Accounts
-
-Retrieves all bank accounts associated with the authenticated user's wallets.
-
-**Endpoint:** `GET /wallet/api/bank-accounts/`
-
-**Response:**
-```json
-[
-    {
-        "id": "550e8400-e29b-41d4-a716-446655440007",
-        "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-        "bank_name": "Test Bank",
-        "bank_code": "123",
-        "account_number": "0123456789",
-        "account_name": "John Doe",
-        "account_type": "savings",
-        "account_type_display": "Savings",
-        "is_verified": true,
-        "is_default": true,
-        "is_active": true,
-        "created_at": "2023-01-05T14:00:00Z",
-        "updated_at": "2023-01-05T14:00:00Z"
-    }
-]
-```
-
-### Get Bank Account
-
-Retrieves a specific bank account by ID.
-
-**Endpoint:** `GET /wallet/api/bank-accounts/{id}/`
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440007",
-    "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-    "bank_name": "Test Bank",
-    "bank_code": "123",
-    "account_number": "0123456789",
-    "account_name": "John Doe",
-    "account_type": "savings",
-    "account_type_display": "Savings",
-    "is_verified": true,
-    "is_default": true,
-    "is_active": true,
-    "created_at": "2023-01-05T14:00:00Z",
-    "updated_at": "2023-01-05T14:00:00Z",
-    "transaction_count": 3,
-    "settlement_count": 1,
-    "bank_details": {
-        "id": "550e8400-e29b-41d4-a716-446655440010",
-        "name": "Test Bank",
-        "code": "123",
-        "slug": "test-bank",
-        "country": "NG",
-        "currency": "NGN",
-        "type": "nuban",
-        "is_active": true
-    }
-}
-```
-
-### Create Bank Account
-
-Creates a new bank account.
-
-**Endpoint:** `POST /wallet/api/bank-accounts/`
-
-**Request:**
-```json
-{
-    "bank_code": "123",
-    "account_number": "0123456789",
-    "account_name": "John Doe",
-    "account_type": "savings",
-    "is_default": true
-}
-```
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440011",
-    "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-    "bank_name": "Test Bank",
-    "bank_code": "123",
-    "account_number": "0123456789",
-    "account_name": "John Doe",
-    "account_type": "savings",
-    "account_type_display": "Savings",
-    "is_verified": true,
-    "is_default": true,
-    "is_active": true,
-    "created_at": "2023-01-16T15:00:00Z",
-    "updated_at": "2023-01-16T15:00:00Z",
-    "transaction_count": 0,
-    "settlement_count": 0,
-    "bank_details": {
-        "id": "550e8400-e29b-41d4-a716-446655440010",
-        "name": "Test Bank",
-        "code": "123",
-        "slug": "test-bank",
-        "country": "NG",
-        "currency": "NGN",
-        "type": "nuban",
-        "is_active": true
-    }
-}
-```
-
-### Update Bank Account
-
-Updates a bank account's attributes.
-
-**Endpoint:** `PATCH /wallet/api/bank-accounts/{id}/`
-
-**Request:**
-```json
-{
-    "account_name": "John Smith",
-    "is_default": true
-}
-```
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440007",
-    "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-    "bank_name": "Test Bank",
-    "bank_code": "123",
-    "account_number": "0123456789",
-    "account_name": "John Smith",
-    "account_type": "savings",
-    "account_type_display": "Savings",
-    "is_verified": true,
-    "is_default": true,
-    "is_active": true,
-    "created_at": "2023-01-05T14:00:00Z",
-    "updated_at": "2023-01-16T15:30:00Z"
-}
-```
-
-### Delete Bank Account
-
-Removes a bank account (marks it as inactive).
-
-**Endpoint:** `DELETE /wallet/api/bank-accounts/{id}/`
-
-**Response:** HTTP 204 No Content
-
-### Verify Bank Account
-
-Verifies a bank account with Paystack.
-
-**Endpoint:** `POST /wallet/api/bank-accounts/verify/`
-
-**Request:**
-```json
-{
-    "account_number": "0123456789",
-    "bank_code": "123"
-}
-```
-
-**Response:**
-```json
-{
-    "account_number": "0123456789",
-    "account_name": "John Doe",
-    "bank_code": "123"
-}
-```
-
-### Set Bank Account as Default
-
-Sets a bank account as the default for withdrawals.
-
-**Endpoint:** `POST /wallet/api/bank-accounts/{id}/set_default/`
-
-**Response:**
-```json
-{
-    "detail": "Bank account set as default successfully"
-}
-```
-
-## Bank API
-
-### List Banks
-
-Retrieves all available banks.
-
-**Endpoint:** `GET /wallet/api/banks/`
-
-**Response:**
-```json
-[
-    {
-        "id": "550e8400-e29b-41d4-a716-446655440010",
-        "name": "Test Bank",
-        "code": "123",
-        "slug": "test-bank",
-        "country": "NG",
-        "currency": "NGN",
-        "type": "nuban",
-        "is_active": true
-    },
-    {
-        "id": "550e8400-e29b-41d4-a716-446655440012",
-        "name": "Another Bank",
-        "code": "456",
-        "slug": "another-bank",
-        "country": "NG",
-        "currency": "NGN",
-        "type": "nuban",
-        "is_active": true
-    }
-]
-```
-
-### Get Bank
-
-Retrieves a specific bank by ID.
-
-**Endpoint:** `GET /wallet/api/banks/{id}/`
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440010",
-    "name": "Test Bank",
-    "code": "123",
-    "slug": "test-bank",
-    "country": "NG",
-    "currency": "NGN",
-    "type": "nuban",
-    "is_active": true
-}
-```
-
-### Refresh Banks
-
-Refreshes the bank list from Paystack.
-
-**Endpoint:** `GET /wallet/api/banks/refresh/`
-
-**Response:**
-```json
-[
-    {
-        "id": "550e8400-e29b-41d4-a716-446655440010",
-        "name": "Test Bank",
-        "code": "123",
-        "slug": "test-bank",
-        "country": "NG",
-        "currency": "NGN",
-        "type": "nuban",
-        "is_active": true
-    },
-    // ...more banks
-]
-```
-
-## Settlement API
-
-### List Settlements
-
-Retrieves all settlements associated with the authenticated user's wallets.
-
-**Endpoint:** `GET /wallet/api/settlements/`
-
-**Response:**
-```json
-[
-    {
-        "id": "550e8400-e29b-41d4-a716-446655440013",
-        "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-        "bank_account_id": "550e8400-e29b-41d4-a716-446655440007",
-        "bank_account_name": "John Doe",
-        "bank_account_number": "0123456789",
-        "bank_name": "Test Bank",
-        "amount_value": "1000.00",
-        "amount_currency": "NGN",
-        "fees_value": "10.00",
-        "status": "success",
-        "status_display": "Success",
-        "reference": "STL123456",
-        "paystack_transfer_code": "TRF_123456",
-        "reason": "Monthly settlement",
-        "metadata": {},
-        "transaction_id": "550e8400-e29b-41d4-a716-446655440014",
-        "created_at": "2023-01-15T00:00:00Z",
-        "updated_at": "2023-01-15T00:05:00Z",
-        "settled_at": "2023-01-15T00:05:00Z",
-        "failure_reason": null
-    }
-]
-```
-
-### Get Settlement
-
-Retrieves a specific settlement by ID.
-
-**Endpoint:** `GET /wallet/api/settlements/{id}/`
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440013",
-    "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-    "bank_account_id": "550e8400-e29b-41d4-a716-446655440007",
-    "bank_account_name": "John Doe",
-    "bank_account_number": "0123456789",
-    "bank_name": "Test Bank",
-    "amount_value": "1000.00",
-    "amount_currency": "NGN",
-    "fees_value": "10.00",
-    "status": "success",
-    "status_display": "Success",
-    "reference": "STL123456",
-    "paystack_transfer_code": "TRF_123456",
-    "reason": "Monthly settlement",
-    "metadata": {},
-    "transaction_id": "550e8400-e29b-41d4-a716-446655440014",
-    "created_at": "2023-01-15T00:00:00Z",
-    "updated_at": "2023-01-15T00:05:00Z",
-    "settled_at": "2023-01-15T00:05:00Z",
-    "failure_reason": null,
-    "paystack_transfer_data": {
-        "amount": 100000,
-        "status": "success",
-        "transfer_code": "TRF_123456",
-        "recipient": {
-            "recipient_code": "RCP_123456",
-            "name": "John Doe",
-            "type": "nuban"
-        }
-    }
-}
-```
-
-### Create Settlement
-
-Creates a new settlement to transfer funds to a bank account.
-
-**Endpoint:** `POST /wallet/api/settlements/create_settlement/`
-
-**Request:**
-```json
-{
-    "bank_account_id": "550e8400-e29b-41d4-a716-446655440007",
-    "amount": "500.00",
-    "reason": "Manual settlement"
-}
-```
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440015",
-    "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-    "bank_account_id": "550e8400-e29b-41d4-a716-446655440007",
-    "bank_account_name": "John Doe",
-    "bank_account_number": "0123456789",
-    "bank_name": "Test Bank",
-    "amount_value": "500.00",
-    "amount_currency": "NGN",
-    "fees_value": "5.00",
+  "status": "pending_otp",
+  "message": "Enter the OTP to complete the withdrawal",
+  "transaction": {
+    "id": "4b1a19b2-ba73-46ab-94bf-c16eb034d58a",
+    "reference": "wdr-1790478869-p4w5ehseav",
+    "transaction_type": "withdrawal",
+    "direction": "debit",
     "status": "pending",
-    "status_display": "Pending",
-    "reference": "STL987654",
-    "paystack_transfer_code": "TRF_987654",
-    "reason": "Manual settlement",
-    "metadata": {},
-    "transaction_id": "550e8400-e29b-41d4-a716-446655440016",
-    "created_at": "2023-01-16T15:00:00Z",
-    "updated_at": "2023-01-16T15:00:00Z",
-    "settled_at": null,
-    "failure_reason": null
+    "amount": "10000.00",
+    "fees": "25.00",
+    "total_amount": "10025.00",
+    "balance_after": "43475.00",
+    "bank_account": {"id": "…", "bank_name": "Test Bank", "account_name": "ADA OBI", "account_number": "******6789"},
+    "requires_otp": true,
+    "paystack_transfer_code": "TRF_1ptvuv321ahaa7q",
+    "…": "…"
+  }
 }
 ```
 
-### Verify Settlement
+`status` is one of `success`, `pending_otp`, `processing`, `failed`.
 
-Verifies the status of a settlement with Paystack.
+### `POST /wallet/api/wallets/me/finalize-withdrawal/`
 
-**Endpoint:** `POST /wallet/api/settlements/{id}/verify/`
-
-**Response:**
 ```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440015",
-    "status": "success",
-    "status_display": "Success",
-    "settled_at": "2023-01-16T15:05:00Z",
-    "paystack_transfer_data": {
-        "amount": 50000,
-        "status": "success",
-        "transfer_code": "TRF_987654",
-        "recipient": {
-            "recipient_code": "RCP_123456",
-            "name": "John Doe",
-            "type": "nuban"
-        }
-    }
-}
+{"otp": "123456", "transaction_id": "4b1a19b2-…"}
 ```
 
-## Settlement Schedule API
+Identify the withdrawal with `transaction_id`, `reference` or `transfer_code`. A wrong
+OTP returns `502` with Paystack's message; the withdrawal stays pending.
 
-### List Settlement Schedules
+### `POST /wallet/api/wallets/me/resend-otp/`
 
-Retrieves all settlement schedules associated with the authenticated user's wallets.
+Same identifiers as above.
 
-**Endpoint:** `GET /wallet/api/settlement-schedules/`
+### `GET /wallet/api/wallets/lookup/?recipient=08031234567`
 
-**Response:**
+Confirm a recipient before sending (`recipient_type` optional: `id`, `tag`,
+`phone_number`, `email`):
+
 ```json
-[
-    {
-        "id": "550e8400-e29b-41d4-a716-446655440017",
-        "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-        "bank_account_id": "550e8400-e29b-41d4-a716-446655440007",
-        "bank_account_name": "John Doe",
-        "bank_account_number": "0123456789",
-        "bank_name": "Test Bank",
-        "is_active": true,
-        "schedule_type": "monthly",
-        "schedule_type_display": "Monthly",
-        "amount_threshold_value": null,
-        "minimum_amount_value": "100.00",
-        "maximum_amount_value": "1000.00",
-        "day_of_week": null,
-        "day_of_week_display": null,
-        "day_of_month": 15,
-        "time_of_day": "00:00:00",
-        "last_settlement": "2023-01-15T00:00:00Z",
-        "next_settlement": "2023-02-15T00:00:00Z",
-        "created_at": "2023-01-01T00:00:00Z",
-        "updated_at": "2023-01-15T00:05:00Z"
-    }
-]
+{"wallet_id": "5fba474c-…", "tag": "bola", "name": "Bola A.", "phone_number": "+234809****888", "can_receive": true}
 ```
 
-### Get Settlement Schedule
+### `POST /wallet/api/wallets/me/transfer/`
 
-Retrieves a specific settlement schedule by ID.
+| Field | Required | Notes |
+| --- | --- | --- |
+| `recipient` | ✔* | Wallet ID, tag, phone number (any format) or email |
+| `recipient_type` | | Force the lookup: `id`, `tag`, `phone_number`, `email` |
+| `phone_number` | ✔* | Shortcut for `recipient` + `recipient_type=phone_number` |
+| `destination_wallet_id` | ✔* | Shortcut for `recipient` + `recipient_type=id` |
+| `amount` | ✔ | |
+| `description`, `reference`, `metadata`, `fee_bearer`, `pin` | | |
 
-**Endpoint:** `GET /wallet/api/settlement-schedules/{id}/`
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440017",
-    "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-    "bank_account_id": "550e8400-e29b-41d4-a716-446655440007",
-    "bank_account_name": "John Doe",
-    "bank_account_number": "0123456789",
-    "bank_name": "Test Bank",
-    "is_active": true,
-    "schedule_type": "monthly",
-    "schedule_type_display": "Monthly",
-    "amount_threshold_value": null,
-    "minimum_amount_value": "100.00",
-    "maximum_amount_value": "1000.00",
-    "day_of_week": null,
-    "day_of_week_display": null,
-    "day_of_month": 15,
-    "time_of_day": "00:00:00",
-    "last_settlement": "2023-01-15T00:00:00Z",
-    "next_settlement": "2023-02-15T00:00:00Z",
-    "created_at": "2023-01-01T00:00:00Z",
-    "updated_at": "2023-01-15T00:05:00Z"
-}
-```
-
-### Create Settlement Schedule
-
-Creates a new settlement schedule.
-
-**Endpoint:** `POST /wallet/api/settlement-schedules/`
-
-**Request:**
-```json
-{
-    "bank_account_id": "550e8400-e29b-41d4-a716-446655440007",
-    "schedule_type": "weekly",
-    "minimum_amount": "100.00",
-    "maximum_amount": "1000.00",
-    "day_of_week": 1,
-    "time_of_day": "12:00:00",
-    "is_active": true
-}
-```
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440018",
-    "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-    "bank_account_id": "550e8400-e29b-41d4-a716-446655440007",
-    "bank_account_name": "John Doe",
-    "bank_account_number": "0123456789",
-    "bank_name": "Test Bank",
-    "is_active": true,
-    "schedule_type": "weekly",
-    "schedule_type_display": "Weekly",
-    "amount_threshold_value": null,
-    "minimum_amount_value": "100.00",
-    "maximum_amount_value": "1000.00",
-    "day_of_week": 1,
-    "day_of_week_display": "Tuesday",
-    "day_of_month": null,
-    "time_of_day": "12:00:00",
-    "last_settlement": null,
-    "next_settlement": "2023-01-17T12:00:00Z",
-    "created_at": "2023-01-16T15:00:00Z",
-    "updated_at": "2023-01-16T15:00:00Z"
-}
-```
-
-### Update Settlement Schedule
-
-Updates a settlement schedule's attributes.
-
-**Endpoint:** `PATCH /wallet/api/settlement-schedules/{id}/`
-
-**Request:**
-```json
-{
-    "is_active": false,
-    "minimum_amount": "200.00"
-}
-```
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440017",
-    "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-    "bank_account_id": "550e8400-e29b-41d4-a716-446655440007",
-    "bank_account_name": "John Doe",
-    "bank_account_number": "0123456789",
-    "bank_name": "Test Bank",
-    "is_active": false,
-    "schedule_type": "monthly",
-    "schedule_type_display": "Monthly",
-    "amount_threshold_value": null,
-    "minimum_amount_value": "200.00",
-    "maximum_amount_value": "1000.00",
-    "day_of_week": null,
-    "day_of_week_display": null,
-    "day_of_month": 15,
-    "time_of_day": "00:00:00",
-    "last_settlement": "2023-01-15T00:00:00Z",
-    "next_settlement": "2023-02-15T00:00:00Z",
-    "created_at": "2023-01-01T00:00:00Z",
-    "updated_at": "2023-01-16T15:30:00Z"
-}
-```
-
-### Delete Settlement Schedule
-
-Deletes a settlement schedule.
-
-**Endpoint:** `DELETE /wallet/api/settlement-schedules/{id}/`
-
-**Response:** HTTP 204 No Content
-
-### Recalculate Next Settlement
-
-Recalculates the next settlement date for a schedule.
-
-**Endpoint:** `POST /wallet/api/settlement-schedules/{id}/recalculate/`
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440017",
-    "next_settlement": "2023-02-15T00:00:00Z"
-}
-```
-
-## Webhook API
-
-### Paystack Webhook
-
-Processes webhook events from Paystack.
-
-**Endpoint:** `POST /wallet/webhook/`
-
-**Headers:**
-```
-X-Paystack-Signature: a4a51e39c76a7b55b4791245d5cd391dd7a51e32
-Content-Type: application/json
-```
-
-**Request:**
-```json
-{
-    "event": "charge.success",
-    "data": {
-        "id": 123456,
-        "status": "success",
-        "reference": "REF123456",
-        "amount": 50000,
-        "currency": "NGN",
-        "channel": "card",
-        "customer": {
-            "id": 87654,
-            "email": "user@example.com"
-        },
-        "authorization": {
-            "authorization_code": "AUTH_123456",
-            "card_type": "visa",
-            "last4": "4242",
-            "exp_month": "12",
-            "exp_year": "2025",
-            "bin": "424242",
-            "bank": "Test Bank",
-            "reusable": true
-        },
-        "metadata": {
-            "wallet_id": "550e8400-e29b-41d4-a716-446655440000"
-        }
-    }
-}
-```
-
-**Response:**
-```json
-{
-    "status": "success",
-    "event_id": "550e8400-e29b-41d4-a716-446655440019"
-}
-```
-
-## Error Responses
-
-### Authentication Error
-
-**Response:** HTTP 401 Unauthorized
-```json
-{
-    "detail": "Authentication credentials were not provided."
-}
-```
-
-### Permission Error
-
-**Response:** HTTP 403 Forbidden
-```json
-{
-    "detail": "You do not have permission to perform this action."
-}
-```
-
-### Not Found Error
-
-**Response:** HTTP 404 Not Found
-```json
-{
-    "detail": "Not found."
-}
-```
-
-### Validation Error
-
-**Response:** HTTP 400 Bad Request
-```json
-{
-    "amount": [
-        "Ensure this value is greater than or equal to 0.01."
-    ],
-    "bank_account_id": [
-        "Bank account not found."
-    ]
-}
-```
-
-### Business Logic Error
-
-**Response:** HTTP 400 Bad Request
-```json
-{
-    "detail": "Insufficient funds in wallet."
-}
-```
-
-## Pagination
-
-All list endpoints support pagination using the `limit` and `offset` query parameters:
-
-```
-GET /wallet/api/transactions/?limit=10&offset=20
-```
-
-The response includes pagination information:
+\* one of them. `201` returns the sender's (debit) transaction:
 
 ```json
 {
-    "count": 35,
-    "next": 30,
-    "previous": 10,
-    "results": [
-        // Items
-    ]
+  "id": "22d2a663-0eb9-46e3-be53-968818b29f9e",
+  "reference": "TRF-1790478869-DZC5JONN9U",
+  "transaction_type": "transfer",
+  "direction": "debit",
+  "status": "success",
+  "amount": "1500.00",
+  "fees": "0.00",
+  "total_amount": "1500.00",
+  "balance_after": "53500.00",
+  "currency": "NGN",
+  "counterparty": {"wallet_id": "5fba474c-…", "tag": "bola"},
+  "related_transaction": "f2ed0823-…",
+  "description": "Lunch",
+  "…": "…"
 }
 ```
 
-## Filtering
+### `POST /wallet/api/wallets/me/pay/`
 
-Many endpoints support filtering using query parameters:
-
-```
-GET /wallet/api/transactions/?transaction_type=deposit&status=success
-```
-
-Refer to the individual endpoint documentation for available filters.
-
-## Cross-Origin Resource Sharing (CORS)
-
-The API supports CORS for cross-domain requests. The following headers are included in responses:
-
-```
-Access-Control-Allow-Origin: *
-Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
-Access-Control-Allow-Headers: Content-Type, Authorization
-```
-
-If you need to restrict CORS to specific domains, you can configure it in your Django settings:
-
-```python
-CORS_ALLOWED_ORIGINS = [
-    "https://example.com",
-    "https://app.example.com"
-]
-```
-
-## API Versioning
-
-API versioning is not implemented by default but can be added if needed. If you want to implement versioning, you can use Django REST Framework's versioning classes:
-
-```python
-REST_FRAMEWORK = {
-    'DEFAULT_VERSIONING_CLASS': 'rest_framework.versioning.URLPathVersioning',
-    'DEFAULT_VERSION': 'v1',
-    'ALLOWED_VERSIONS': ['v1'],
-    'VERSION_PARAM': 'version',
-}
-```
-
-Then, URLs would be structured as:
-
-```
-/wallet/api/v1/wallets/
-```
-
-## Rate Limiting
-
-Rate limiting is not implemented by default but can be added if needed. If you want to implement rate limiting, you can use Django REST Framework's throttling classes:
-
-```python
-REST_FRAMEWORK = {
-    'DEFAULT_THROTTLE_CLASSES': [
-        'rest_framework.throttling.AnonRateThrottle',
-        'rest_framework.throttling.UserRateThrottle'
-    ],
-    'DEFAULT_THROTTLE_RATES': {
-        'anon': '100/day',
-        'user': '1000/day'
-    }
-}
-```
-
-## Next Steps
-
-This concludes the API reference documentation. For implementation details, see the [Installation Guide](installation.md), [Configuration Guide](configuration.md), and [Usage Guide](usage.md).# API Reference
-
-This document provides comprehensive documentation for all the API endpoints available in the Django Paystack Wallet system.
-
-## Authentication
-
-All API endpoints require authentication. The wallet system uses Django REST Framework's authentication classes, which can be configured in your project settings.
-
-```python
-REST_FRAMEWORK = {
-    'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework.authentication.SessionAuthentication',
-        'rest_framework.authentication.TokenAuthentication',
-    ),
-    'DEFAULT_PERMISSION_CLASSES': (
-        'rest_framework.permissions.IsAuthenticated',
-    ),
-}
-```
-
-For token-based authentication, include the token in the request header:
-
-```
-Authorization: Token 9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b
-```
-
-## Base URL
-
-All API endpoints are prefixed with `/wallet/api/` by default. This can be customized in your URL configuration.
-
-## Wallet API
-
-### List Wallets
-
-Retrieves all wallets belonging to the authenticated user.
-
-**Endpoint:** `GET /wallet/api/wallets/`
-
-**Response:**
 ```json
-[
-    {
-        "id": "550e8400-e29b-41d4-a716-446655440000",
-        "user": 1,
-        "user_email": "user@example.com",
-        "user_name": "John Doe",
-        "balance_amount": "1000.00",
-        "balance_currency": "NGN",
-        "tag": "johndoe",
-        "is_active": true,
-        "is_locked": false,
-        "last_transaction_date": "2023-01-15T12:30:45Z",
-        "daily_transaction_total_amount": "500.00",
-        "daily_transaction_count": 3,
-        "daily_transaction_reset": "2023-01-15",
-        "created_at": "2023-01-01T10:00:00Z",
-        "updated_at": "2023-01-15T12:30:45Z",
-        "dedicated_account_number": "0123456789",
-        "dedicated_account_bank": "Test Bank"
-    }
-]
+{"amount": "15000", "merchant": "seller-tag", "escrow": true, "description": "Order #1001", "metadata": {"order_id": 1001}}
 ```
 
-### Get Wallet
+`merchant` is optional (omit it and the platform keeps the payment). With `escrow`, the
+payment stays `pending` until the buyer or staff releases it, or staff cancels it (see
+transactions). Buyers cannot cancel an escrow themselves.
 
-Retrieves a specific wallet by ID.
+### `POST /wallet/api/wallets/me/set-pin/`
 
-**Endpoint:** `GET /wallet/api/wallets/{id}/`
-
-**Response:**
 ```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440000",
-    "user": 1,
-    "user_email": "user@example.com",
-    "user_name": "John Doe",
-    "balance_amount": "1000.00",
-    "balance_currency": "NGN",
-    "tag": "johndoe",
-    "is_active": true,
-    "is_locked": false,
-    "last_transaction_date": "2023-01-15T12:30:45Z",
-    "daily_transaction_total_amount": "500.00",
-    "daily_transaction_count": 3,
-    "daily_transaction_reset": "2023-01-15",
-    "created_at": "2023-01-01T10:00:00Z",
-    "updated_at": "2023-01-15T12:30:45Z",
-    "dedicated_account_number": "0123456789",
-    "dedicated_account_bank": "Test Bank",
-    "transaction_count": 15,
-    "cards_count": 2,
-    "bank_accounts_count": 1,
-    "paystack_customer_code": "CUS_123456"
-}
+{"pin": "4826", "confirm_pin": "4826", "current_pin": "…only when changing…"}
 ```
 
-You can also use `default` as the ID to retrieve the user's default wallet:
+Obvious PINs (`1111`, `1234`, …) are rejected.
 
-**Endpoint:** `GET /wallet/api/wallets/default/`
+### `GET | POST /wallet/api/wallets/me/dedicated-account/`
 
-### Update Wallet
+`GET` returns the account (`404` if none). `POST` (`{"preferred_bank": "wema-bank"}`
+optional) creates it:
 
-Updates a wallet's attributes.
-
-**Endpoint:** `PATCH /wallet/api/wallets/{id}/`
-
-**Request:**
 ```json
-{
-    "tag": "new-tag",
-    "is_active": true
-}
+{"account_number": "9930000002", "account_name": "ADA OBI", "bank_name": "Wema Bank", "bank_slug": "wema-bank", "active": true}
 ```
 
-**Response:**
+### `POST /wallet/api/wallets/me/requery-dedicated-account/`
+
+Asks Paystack to re-check for transfers into the account (`{"date": "2026-09-27"}`
+optional). New money arrives by webhook.
+
+### `POST /wallet/api/wallets/me/validate-customer/`
+
+Paystack identity validation, needed before a DVA for most Nigerian businesses. Returns
+`202`; the result arrives by webhook.
+
 ```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440000",
-    "tag": "new-tag",
-    "is_active": true,
-    "is_locked": false
-}
+{"first_name": "Ada", "last_name": "Obi", "identification_type": "bank_account", "bvn": "22222222222", "bank_code": "058", "account_number": "0123456789"}
 ```
 
-### Get Wallet Balance
+### `POST /wallet/api/wallets/fee-quote/`
 
-Retrieves the current balance of a wallet.
-
-**Endpoint:** `GET /wallet/api/wallets/{id}/balance/`
-
-**Response:**
 ```json
-{
-    "balance": "1000.00",
-    "currency": "NGN"
-}
+{"amount": "10000", "transaction_type": "withdrawal", "payment_channel": "local_card"}
 ```
 
-### Deposit to Wallet
-
-Initiates a deposit to the wallet using Paystack.
-
-**Endpoint:** `POST /wallet/api/wallets/{id}/deposit/`
-
-**Request:**
 ```json
-{
-    "amount": "500.00",
-    "email": "user@example.com",
-    "callback_url": "https://example.com/callback"
-}
+{"original_amount": "10000.00", "fee_amount": "25.00", "bearer": "customer", "customer_pays": "10025.00", "merchant_receives": "10000.00", "source": "settings", "…": "…"}
 ```
 
-**Response:**
-```json
-{
-    "authorization_url": "https://checkout.paystack.com/0peioxfhpn",
-    "access_code": "0peioxfhpn",
-    "reference": "REF123456"
-}
-```
-
-### Withdraw from Wallet
-
-Withdraws funds from the wallet to a bank account.
-
-**Endpoint:** `POST /wallet/api/wallets/{id}/withdraw/`
-
-**Request:**
-```json
-{
-    "amount": "200.00",
-    "bank_account_id": "550e8400-e29b-41d4-a716-446655440001",
-    "description": "Withdrawal to my account"
-}
-```
-
-**Response:**
-```json
-{
-    "transaction": {
-        "id": "550e8400-e29b-41d4-a716-446655440002",
-        "reference": "TRX123456",
-        "amount_value": "200.00",
-        "transaction_type": "withdrawal",
-        "status": "success",
-        "description": "Withdrawal to my account",
-        "created_at": "2023-01-15T14:30:00Z"
-    },
-    "transfer_data": {
-        "transfer_code": "TRF_123456",
-        "status": "success"
-    }
-}
-```
-
-### Transfer to Another Wallet
-
-Transfers funds from one wallet to another.
-
-**Endpoint:** `POST /wallet/api/wallets/{id}/transfer/`
-
-**Request:**
-```json
-{
-    "amount": "100.00",
-    "destination_wallet_id": "550e8400-e29b-41d4-a716-446655440003",
-    "description": "Payment for services"
-}
-```
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440004",
-    "reference": "TRX789012",
-    "amount_value": "100.00",
-    "amount_currency": "NGN",
-    "transaction_type": "transfer",
-    "transaction_type_display": "Transfer",
-    "status": "success",
-    "status_display": "Success",
-    "description": "Payment for services",
-    "recipient_wallet_id": "550e8400-e29b-41d4-a716-446655440003",
-    "created_at": "2023-01-15T15:00:00Z"
-}
-```
-
-### Lock Wallet
-
-Locks a wallet to prevent transactions.
-
-**Endpoint:** `POST /wallet/api/wallets/{id}/lock/`
-
-**Response:**
-```json
-{
-    "detail": "Wallet locked successfully"
-}
-```
-
-### Unlock Wallet
-
-Unlocks a previously locked wallet.
-
-**Endpoint:** `POST /wallet/api/wallets/{id}/unlock/`
-
-**Response:**
-```json
-{
-    "detail": "Wallet unlocked successfully"
-}
-```
-
-### Get Wallet Transactions
-
-Retrieves transactions for a specific wallet.
-
-**Endpoint:** `GET /wallet/api/wallets/{id}/transactions/?type=deposit&status=success&limit=10&offset=0`
-
-**Parameters:**
-- `type` (optional): Filter by transaction type (deposit, withdrawal, transfer, etc.)
-- `status` (optional): Filter by transaction status (pending, success, failed, etc.)
-- `limit` (optional): Number of results to return (default: 20)
-- `offset` (optional): Result offset for pagination (default: 0)
-
-**Response:**
-```json
-{
-    "count": 15,
-    "next": 10,
-    "previous": null,
-    "results": [
-        {
-            "id": "550e8400-e29b-41d4-a716-446655440005",
-            "reference": "TRX123456",
-            "amount_value": "500.00",
-            "amount_currency": "NGN",
-            "transaction_type": "deposit",
-            "transaction_type_display": "Deposit",
-            "status": "success",
-            "status_display": "Success",
-            "description": "Deposit to wallet",
-            "created_at": "2023-01-15T12:30:45Z",
-            "completed_at": "2023-01-15T12:31:00Z"
-        },
-        // ...more transactions
-    ]
-}
-```
-
-### Get Wallet Cards
-
-Retrieves all cards associated with a wallet.
-
-**Endpoint:** `GET /wallet/api/wallets/{id}/cards/`
-
-**Response:**
-```json
-[
-    {
-        "id": "550e8400-e29b-41d4-a716-446655440006",
-        "card_type": "visa",
-        "card_type_display": "Visa",
-        "last_four": "4242",
-        "expiry_month": "12",
-        "expiry_year": "2025",
-        "is_default": true,
-        "is_active": true,
-        "is_expired": false,
-        "masked_pan": "424242******4242",
-        "created_at": "2023-01-10T10:00:00Z"
-    }
-]
-```
-
-### Get Wallet Bank Accounts
-
-Retrieves all bank accounts associated with a wallet.
-
-**Endpoint:** `GET /wallet/api/wallets/{id}/bank_accounts/`
-
-**Response:**
-```json
-[
-    {
-        "id": "550e8400-e29b-41d4-a716-446655440007",
-        "bank_name": "Test Bank",
-        "bank_code": "123",
-        "account_number": "0123456789",
-        "account_name": "John Doe",
-        "account_type": "savings",
-        "account_type_display": "Savings",
-        "is_default": true,
-        "is_active": true,
-        "is_verified": true,
-        "created_at": "2023-01-05T14:00:00Z"
-    }
-]
-```
-
-### Get Dedicated Account
-
-Retrieves or creates a dedicated virtual account for a wallet.
-
-**Endpoint:** `GET /wallet/api/wallets/{id}/dedicated_account/`
-
-**Response:**
-```json
-{
-    "account_number": "0123456789",
-    "bank_name": "Test Bank",
-    "account_name": "John Doe"
-}
-```
-
-## Transaction API
-
-### List Transactions
-
-Retrieves all transactions associated with the authenticated user's wallets.
-
-**Endpoint:** `GET /wallet/api/transactions/?wallet_id=550e8400-e29b-41d4-a716-446655440000&transaction_type=deposit&status=success&limit=10&offset=0`
-
-**Parameters:**
-- `wallet_id` (optional): Filter by wallet ID
-- `transaction_type` (optional): Filter by transaction type
-- `status` (optional): Filter by status
-- `reference` (optional): Filter by reference
-- `start_date` (optional): Filter by start date (YYYY-MM-DD)
-- `end_date` (optional): Filter by end date (YYYY-MM-DD)
-- `min_amount` (optional): Filter by minimum amount
-- `max_amount` (optional): Filter by maximum amount
-- `payment_method` (optional): Filter by payment method
-- `limit` (optional): Number of results (default: 20)
-- `offset` (optional): Result offset for pagination (default: 0)
-
-**Response:**
-```json
-{
-    "count": 25,
-    "next": 10,
-    "previous": null,
-    "results": [
-        {
-            "id": "550e8400-e29b-41d4-a716-446655440008",
-            "reference": "TRX123456",
-            "amount_value": "500.00",
-            "amount_currency": "NGN",
-            "transaction_type": "deposit",
-            "transaction_type_display": "Deposit",
-            "status": "success",
-            "status_display": "Success",
-            "description": "Deposit to wallet",
-            "created_at": "2023-01-15T12:30:45Z",
-            "completed_at": "2023-01-15T12:31:00Z"
-        },
-        // ...more transactions
-    ]
-}
-```
-
-### Get Transaction
-
-Retrieves a specific transaction by ID.
-
-**Endpoint:** `GET /wallet/api/transactions/{id}/`
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440008",
-    "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-    "amount_value": "500.00",
-    "amount_currency": "NGN",
-    "reference": "TRX123456",
-    "transaction_type": "deposit",
-    "transaction_type_display": "Deposit",
-    "status": "success",
-    "status_display": "Success",
-    "payment_method": "card",
-    "payment_method_display": "Card",
-    "description": "Deposit to wallet",
-    "metadata": {},
-    "recipient_wallet_id": null,
-    "recipient_bank_account_id": null,
-    "card_id": "550e8400-e29b-41d4-a716-446655440006",
-    "related_transaction_id": null,
-    "fees_value": "7.50",
-    "ip_address": "127.0.0.1",
-    "created_at": "2023-01-15T12:30:45Z",
-    "updated_at": "2023-01-15T12:31:00Z",
-    "completed_at": "2023-01-15T12:31:00Z",
-    "failed_reason": null,
-    "paystack_reference": "PSK_123456",
-    "paystack_response": {}
-}
-```
-
-### Verify Transaction
-
-Verifies a transaction by reference.
-
-**Endpoint:** `POST /wallet/api/transactions/verify/`
-
-**Request:**
-```json
-{
-    "reference": "TRX123456"
-}
-```
-
-**Response:**
-```json
-{
-    "status": "success",
-    "reference": "TRX123456",
-    "amount": 50000,
-    "currency": "NGN",
-    "customer": {
-        "email": "user@example.com"
-    }
-}
-```
-
-### Refund Transaction
-
-Creates a refund for a transaction.
-
-**Endpoint:** `POST /wallet/api/transactions/refund/`
-
-**Request:**
-```json
-{
-    "transaction_id": "550e8400-e29b-41d4-a716-446655440008",
-    "amount": "500.00",
-    "reason": "Customer requested refund"
-}
-```
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440009",
-    "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-    "amount_value": "500.00",
-    "amount_currency": "NGN",
-    "reference": "TRX987654",
-    "transaction_type": "refund",
-    "transaction_type_display": "Refund",
-    "status": "success",
-    "status_display": "Success",
-    "description": "Refund for transaction TRX123456",
-    "related_transaction_id": "550e8400-e29b-41d4-a716-446655440008",
-    "created_at": "2023-01-16T09:00:00Z",
-    "completed_at": "2023-01-16T09:00:15Z"
-}
-```
-
-## Card API
-
-### List Cards
-
-Retrieves all cards associated with the authenticated user's wallets.
-
-**Endpoint:** `GET /wallet/api/cards/`
-
-**Response:**
-```json
-[
-    {
-        "id": "550e8400-e29b-41d4-a716-446655440006",
-        "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-        "card_type": "visa",
-        "card_type_display": "Visa",
-        "last_four": "4242",
-        "expiry_month": "12",
-        "expiry_year": "2025",
-        "bin": "424242",
-        "card_holder_name": "John Doe",
-        "email": "user@example.com",
-        "is_default": true,
-        "is_active": true,
-        "is_expired": false,
-        "masked_pan": "424242******4242",
-        "created_at": "2023-01-10T10:00:00Z",
-        "updated_at": "2023-01-10T10:00:00Z"
-    }
-]
-```
-
-### Get Card
-
-Retrieves a specific card by ID.
-
-**Endpoint:** `GET /wallet/api/cards/{id}/`
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440006",
-    "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-    "card_type": "visa",
-    "card_type_display": "Visa",
-    "last_four": "4242",
-    "expiry_month": "12",
-    "expiry_year": "2025",
-    "bin": "424242",
-    "card_holder_name": "John Doe",
-    "email": "user@example.com",
-    "is_default": true,
-    "is_active": true,
-    "is_expired": false,
-    "masked_pan": "424242******4242",
-    "created_at": "2023-01-10T10:00:00Z",
-    "updated_at": "2023-01-10T10:00:00Z",
-    "transaction_count": 5
-}
-```
-
-### Update Card
-
-Updates a card's attributes.
-
-**Endpoint:** `PATCH /wallet/api/cards/{id}/`
-
-**Request:**
-```json
-{
-    "card_holder_name": "John Smith",
-    "is_default": true
-}
-```
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440006",
-    "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-    "card_type": "visa",
-    "card_type_display": "Visa",
-    "last_four": "4242",
-    "expiry_month": "12",
-    "expiry_year": "2025",
-    "bin": "424242",
-    "card_holder_name": "John Smith",
-    "email": "user@example.com",
-    "is_default": true,
-    "is_active": true,
-    "is_expired": false,
-    "masked_pan": "424242******4242",
-    "created_at": "2023-01-10T10:00:00Z",
-    "updated_at": "2023-01-16T14:30:00Z"
-}
-```
-
-### Delete Card
-
-Removes a card (marks it as inactive).
-
-**Endpoint:** `DELETE /wallet/api/cards/{id}/`
-
-**Response:** HTTP 204 No Content
-
-### Charge Card
-
-Charges a saved card.
-
-**Endpoint:** `POST /wallet/api/cards/{id}/charge/`
-
-**Request:**
-```json
-{
-    "amount": "300.00",
-    "description": "Charge for subscription"
-}
-```
-
-**Response:**
-```json
-{
-    "status": "success",
-    "reference": "CHG_123456",
-    "amount": 30000,
-    "currency": "NGN",
-    "customer": {
-        "email": "user@example.com"
-    }
-}
-```
-
-### Initialize Card Payment
-
-Initializes a new card payment.
-
-**Endpoint:** `POST /wallet/api/cards/initialize/`
-
-**Request:**
-```json
-{
-    "amount": "500.00",
-    "email": "user@example.com",
-    "callback_url": "https://example.com/callback"
-}
-```
-
-**Response:**
-```json
-{
-    "authorization_url": "https://checkout.paystack.com/0peioxfhpn",
-    "access_code": "0peioxfhpn",
-    "reference": "REF123456"
-}
-```
-
-### Set Card as Default
-
-Sets a card as the default payment method.
-
-**Endpoint:** `POST /wallet/api/cards/{id}/set_default/`
-
-**Response:**
-```json
-{
-    "detail": "Card set as default successfully"
-}
-```
-
-## Bank Account API
-
-### List Bank Accounts
-
-Retrieves all bank accounts associated with the authenticated user's wallets.
-
-**Endpoint:** `GET /wallet/api/bank-accounts/`
-
-**Response:**
-```json
-[
-    {
-        "id": "550e8400-e29b-41d4-a716-446655440007",
-        "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-        "bank_name": "Test Bank",
-        "bank_code": "123",
-        "account_number": "0123456789",
-        "account_name": "John Doe",
-        "account_type": "savings",
-        "account_type_display": "Savings",
-        "is_verified": true,
-        "is_default": true,
-        "is_active": true,
-        "created_at": "2023-01-05T14:00:00Z",
-        "updated_at": "2023-01-05T14:00:00Z"
-    }
-]
-```
-
-### Get Bank Account
-
-Retrieves a specific bank account by ID.
-
-**Endpoint:** `GET /wallet/api/bank-accounts/{id}/`
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440007",
-    "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-    "bank_name": "Test Bank",
-    "bank_code": "123",
-    "account_number": "0123456789",
-    "account_name": "John Doe",
-    "account_type": "savings",
-    "account_type_display": "Savings",
-    "is_verified": true,
-    "is_default": true,
-    "is_active": true,
-    "created_at": "2023-01-05T14:00:00Z",
-    "updated_at": "2023-01-05T14:00:00Z",
-    "transaction_count": 3,
-    "settlement_count": 1,
-    "bank_details": {
-        "id": "550e8400-e29b-41d4-a716-446655440010",
-        "name": "Test Bank",
-        "code": "123",
-        "slug": "test-bank",
-        "country": "NG",
-        "currency": "NGN",
-        "type": "nuban",
-        "is_active": true
-    }
-}
-```
-
-### Create Bank Account
-
-Creates a new bank account.
-
-**Endpoint:** `POST /wallet/api/bank-accounts/`
-
-**Request:**
-```json
-{
-    "bank_code": "123",
-    "account_number": "0123456789",
-    "account_name": "John Doe",
-    "account_type": "savings",
-    "is_default": true
-}
-```
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440011",
-    "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-    "bank_name": "Test Bank",
-    "bank_code": "123",
-    "account_number": "0123456789",
-    "account_name": "John Doe",
-    "account_type": "savings",
-    "account_type_display": "Savings",
-    "is_verified": true,
-    "is_default": true,
-    "is_active": true,
-    "created_at": "2023-01-16T15:00:00Z",
-    "updated_at": "2023-01-16T15:00:00Z",
-    "transaction_count": 0,
-    "settlement_count": 0,
-    "bank_details": {
-        "id": "550e8400-e29b-41d4-a716-446655440010",
-        "name": "Test Bank",
-        "code": "123",
-        "slug": "test-bank",
-        "country": "NG",
-        "currency": "NGN",
-        "type": "nuban",
-        "is_active": true
-    }
-}
-```
-
-### Update Bank Account
-
-Updates a bank account's attributes.
-
-**Endpoint:** `PATCH /wallet/api/bank-accounts/{id}/`
-
-**Request:**
-```json
-{
-    "account_name": "John Smith",
-    "is_default": true
-}
-```
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440007",
-    "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-    "bank_name": "Test Bank",
-    "bank_code": "123",
-    "account_number": "0123456789",
-    "account_name": "John Smith",
-    "account_type": "savings",
-    "account_type_display": "Savings",
-    "is_verified": true,
-    "is_default": true,
-    "is_active": true,
-    "created_at": "2023-01-05T14:00:00Z",
-    "updated_at": "2023-01-16T15:30:00Z"
-}
-```
-
-### Delete Bank Account
-
-Removes a bank account (marks it as inactive).
-
-**Endpoint:** `DELETE /wallet/api/bank-accounts/{id}/`
-
-**Response:** HTTP 204 No Content
-
-### Verify Bank Account
-
-Verifies a bank account with Paystack.
-
-**Endpoint:** `POST /wallet/api/bank-accounts/verify/`
-
-**Request:**
-```json
-{
-    "account_number": "0123456789",
-    "bank_code": "123"
-}
-```
-
-**Response:**
-```json
-{
-    "account_number": "0123456789",
-    "account_name": "John Doe",
-    "bank_code": "123"
-}
-```
-
-### Set Bank Account as Default
-
-Sets a bank account as the default for withdrawals.
-
-**Endpoint:** `POST /wallet/api/bank-accounts/{id}/set_default/`
-
-**Response:**
-```json
-{
-    "detail": "Bank account set as default successfully"
-}
-```
-
-## Bank API
-
-### List Banks
-
-Retrieves all available banks.
-
-**Endpoint:** `GET /wallet/api/banks/`
-
-**Response:**
-```json
-[
-    {
-        "id": "550e8400-e29b-41d4-a716-446655440010",
-        "name": "Test Bank",
-        "code": "123",
-        "slug": "test-bank",
-        "country": "NG",
-        "currency": "NGN",
-        "type": "nuban",
-        "is_active": true
-    },
-    {
-        "id": "550e8400-e29b-41d4-a716-446655440012",
-        "name": "Another Bank",
-        "code": "456",
-        "slug": "another-bank",
-        "country": "NG",
-        "currency": "NGN",
-        "type": "nuban",
-        "is_active": true
-    }
-]
-```
-
-### Get Bank
-
-Retrieves a specific bank by ID.
-
-**Endpoint:** `GET /wallet/api/banks/{id}/`
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440010",
-    "name": "Test Bank",
-    "code": "123",
-    "slug": "test-bank",
-    "country": "NG",
-    "currency": "NGN",
-    "type": "nuban",
-    "is_active": true
-}
-```
-
-### Refresh Banks
-
-Refreshes the bank list from Paystack.
-
-**Endpoint:** `GET /wallet/api/banks/refresh/`
-
-**Response:**
-```json
-[
-    {
-        "id": "550e8400-e29b-41d4-a716-446655440010",
-        "name": "Test Bank",
-        "code": "123",
-        "slug": "test-bank",
-        "country": "NG",
-        "currency": "NGN",
-        "type": "nuban",
-        "is_active": true
-    },
-    // ...more banks
-]
-```
-
-## Settlement API
-
-### List Settlements
-
-Retrieves all settlements associated with the authenticated user's wallets.
-
-**Endpoint:** `GET /wallet/api/settlements/`
-
-**Response:**
-```json
-[
-    {
-        "id": "550e8400-e29b-41d4-a716-446655440013",
-        "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-        "bank_account_id": "550e8400-e29b-41d4-a716-446655440007",
-        "bank_account_name": "John Doe",
-        "bank_account_number": "0123456789",
-        "bank_name": "Test Bank",
-        "amount_value": "1000.00",
-        "amount_currency": "NGN",
-        "fees_value": "10.00",
-        "status": "success",
-        "status_display": "Success",
-        "reference": "STL123456",
-        "paystack_transfer_code": "TRF_123456",
-        "reason": "Monthly settlement",
-        "metadata": {},
-        "transaction_id": "550e8400-e29b-41d4-a716-446655440014",
-        "created_at": "2023-01-15T00:00:00Z",
-        "updated_at": "2023-01-15T00:05:00Z",
-        "settled_at": "2023-01-15T00:05:00Z",
-        "failure_reason": null
-    }
-]
-```
-
-### Get Settlement
-
-Retrieves a specific settlement by ID.
-
-**Endpoint:** `GET /wallet/api/settlements/{id}/`
-
-**Response:**
-```json
-{
-    "id": "550e8400-e29b-41d4-a716-446655440013",
-    "wallet_id": "550e8400-e29b-41d4-a716-446655440000",
-    "bank_account_id": "550e8400-e29b-41d4-a716-446655440007",
-    "bank_account_name": "John Doe",
-    "bank_account_number": "0123456789",
-    "bank_name": "Test Bank",
-    "amount_value": "1000.00",
-    "amount_currency": "NGN",
-    "fees_value": "10.00",
+`transaction_type`: `deposit`, `withdrawal`, `transfer`, `payment`. `payment_channel`
+(deposits): `local_card`, `intl_card`, `dva`, `bank_transfer`, `ussd`, `qr`,
+`mobile_money`, `bank`.
+
+---
+
+## Transactions
+
+| Method & path | Who | Description |
+| --- | --- | --- |
+| `GET /wallet/api/transactions/` | owner | Filters: `type`, `status`, `direction`, `payment_method`, `search`, `start_date`, `end_date` |
+| `GET /wallet/api/transactions/{id}/` | owner | Includes `metadata`, Paystack references |
+| `POST /wallet/api/transactions/verify/` | owner | `{"reference": "…"}`: re-check a deposit with Paystack |
+| `POST /wallet/api/transactions/{id}/cancel/` | owner / staff | Owner: an unpaid deposit. Staff: an escrowed payment (refunds the buyer). `{"reason": "…"}` |
+| `POST /wallet/api/transactions/{id}/release/` | buyer / staff | Release an escrowed payment to the seller (e.g. buyer confirms delivery) |
+| `POST /wallet/api/transactions/{id}/refund/` | staff | Refund a deposit to the payer's card/bank (`{"amount": "…", "reason": "…"}`) |
+| `POST /wallet/api/transactions/{id}/reverse/` | staff | Reverse a transfer or payment |
+| `GET /wallet/api/transactions/statistics/` | owner | Counts, credits, debits, fees |
+| `GET /wallet/api/transactions/summary/` | owner | Grouped by type and status |
+| `GET /wallet/api/transactions/export/?export_format=csv` | owner | `csv`, `xlsx`, `pdf` (xlsx/pdf need the `export` extra); same filters as the list |
+
+## Cards
+
+| Method & path | Description |
+| --- | --- |
+| `GET /wallet/api/cards/` | Active saved cards (`?include_inactive=true`) |
+| `GET /wallet/api/cards/{id}/` | |
+| `DELETE /wallet/api/cards/{id}/` | Remove, and revoke the authorization on Paystack |
+| `POST /wallet/api/cards/{id}/set-default/` | |
+| `POST /wallet/api/cards/{id}/charge/` | `{"amount": "3000"}`: top up the wallet from this card |
+
+Cards are added automatically when the user pays with a reusable card.
+
+## Banks & bank accounts
+
+| Method & path | Description |
+| --- | --- |
+| `GET /wallet/api/banks/` | `?country=`, `?currency=`, `?search=` |
+| `POST /wallet/api/bank-accounts/resolve/` | `{"bank_code": "058", "account_number": "0123456789"}` returns `{"account_name": "ADA OBI", …}` |
+| `GET /wallet/api/bank-accounts/` | |
+| `POST /wallet/api/bank-accounts/` | `{"bank_code", "account_number", "account_type"?, "currency"?, "set_default"?}`; the name is verified with Paystack |
+| `GET /wallet/api/bank-accounts/{id}/` | |
+| `DELETE /wallet/api/bank-accounts/{id}/` | |
+| `POST /wallet/api/bank-accounts/{id}/set-default/` | |
+
+## Settlements
+
+| Method & path | Description |
+| --- | --- |
+| `GET /wallet/api/settlements/` | `?status=` |
+| `POST /wallet/api/settlements/` | `{"amount", "bank_account_id"?, "reason"?, "pin"?}` |
+| `GET /wallet/api/settlements/{id}/` | |
+| `POST /wallet/api/settlements/{id}/finalize/` | `{"otp": "…"}` |
+| `POST /wallet/api/settlements/{id}/verify/` | Re-check with Paystack |
+| `POST /wallet/api/settlements/{id}/retry/` | Failed settlements only |
+| `GET /wallet/api/settlements/statistics/` | |
+| `GET, POST /wallet/api/settlement-schedules/` | `{"bank_account_id", "schedule_type": "daily\|weekly\|monthly\|threshold", "day_of_week"?, "day_of_month"?, "time_of_day"?, "amount_threshold"?, "minimum_amount"?, "maximum_amount"?}` |
+| `GET, PATCH, DELETE /wallet/api/settlement-schedules/{id}/` | |
+| `POST /wallet/api/settlement-schedules/{id}/activate/` · `/deactivate/` | |
+
+## Webhooks
+
+| Method & path | Who | Description |
+| --- | --- | --- |
+| `POST /wallet/webhook/` | Paystack | `200` for authentic events (including duplicates), `401` bad signature/IP, `400` malformed |
+| `GET /wallet/api/webhook-events/` | staff | `?event_type=`, `?processed=true\|false` |
+| `POST /wallet/api/webhook-events/{id}/reprocess/` | staff | Replay an event |
+| `CRUD /wallet/api/webhook-endpoints/` | staff | Endpoints that receive signed copies (`WALLET_ENABLE_WEBHOOK_FORWARDING`) |
+| `POST /wallet/api/webhook-endpoints/{id}/test/` | staff | Send the latest event |
+| `GET /wallet/api/webhook-deliveries/` · `POST …/{id}/retry/` | staff | Delivery log and retries |
+
+Forwarded deliveries carry `X-Wallet-Event`, `X-Wallet-Event-Id`,
+`X-Wallet-Delivery-Attempt` and, when the endpoint has a secret,
+`X-Wallet-Signature` = HMAC-SHA512 of the raw body keyed by the secret.
+
+## Checkout callback
+
+`GET /wallet/callback/?reference=…` verifies the payment with Paystack, then redirects
+to `WALLET_CALLBACK_REDIRECT_URL?reference=…&status=…` or renders
+`wallet/payment_callback.html` (override the template to match your site).

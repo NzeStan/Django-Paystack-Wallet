@@ -1,242 +1,172 @@
-# Installation Guide
+# Installation
 
-This guide will walk you through the process of installing and configuring the Django Paystack Wallet system.
+## Requirements
 
-## Prerequisites
+- Python 3.10+
+- Django 4.2+
+- Django REST Framework 3.14+
+- A Paystack account (test keys are fine to start)
+- PostgreSQL or MySQL in production (SQLite works for development, but it has no
+  row-level locking, so concurrent requests are not isolated there)
 
-- Python 3.8 or higher
-- Django 3.2 or higher
-- Paystack account with API keys
-- PostgreSQL or MySQL database (recommended, but SQLite works for development)
-
-## Installation Steps
-
-### 1. Install the Package
+## 1. Install
 
 ```bash
 pip install django-paystack-wallet
 ```
 
-### 2. Add to Installed Apps
+Optional extras:
 
-Add the wallet app to your `INSTALLED_APPS` in your Django project's `settings.py`:
+| Extra | Adds | Needed for |
+| --- | --- | --- |
+| `celery` | Celery | Background webhook processing, scheduled reconciliation/payouts |
+| `export` | xlsxwriter, reportlab | Excel and PDF exports (CSV works without it) |
+| `all` | both | |
+
+```bash
+pip install "django-paystack-wallet[celery,export]"
+```
+
+## 2. Settings
 
 ```python
+from pathlib import Path
+from wallet.conf import load_env_file
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+load_env_file(BASE_DIR / '.env')
+
 INSTALLED_APPS = [
-    ...
+    'django.contrib.admin',
+    'django.contrib.auth',
+    'django.contrib.contenttypes',
+    # ...
     'rest_framework',
+    'djmoney',
     'wallet',
 ]
+
+USE_TZ = True
 ```
 
-### 3. Configure Paystack Settings
+`load_env_file` is a tiny, dependency-free `.env` reader. Variables that are already set
+in the real environment always win, so production values are never replaced by a stray
+file. If you already use `python-dotenv` or `django-environ`, keep using them: the wallet
+reads plain environment variables.
 
-Add your Paystack API keys and other wallet settings to your project's `settings.py`:
+## 3. Environment
 
-```python
-# Paystack Configuration
-PAYSTACK_SECRET_KEY = 'sk_test_your_secret_key'
-PAYSTACK_PUBLIC_KEY = 'pk_test_your_public_key'
-PAYSTACK_API_URL = 'https://api.paystack.co'
-
-# Wallet Settings
-WALLET_USE_UUID = True  # Use UUID instead of ID as primary key
-WALLET_CURRENCY = 'NGN'  # Default currency
-WALLET_AUTO_CREATE_WALLET = True  # Auto-create wallet for new users
-WALLET_TRANSACTION_CHARGE_PERCENT = 1.5  # Default transaction charge
-WALLET_MINIMUM_BALANCE = 0  # Minimum balance to maintain
-WALLET_MAXIMUM_DAILY_TRANSACTION = 1000000  # Maximum daily transaction limit
-WALLET_AUTO_SETTLEMENT = False  # Auto-settlement of wallet funds
+```bash
+cp .env.example .env
 ```
 
-### 4. Add URLs
+At minimum set:
 
-Include the wallet URLs in your project's `urls.py`:
+```bash
+PAYSTACK_SECRET_KEY=sk_test_...
+PAYSTACK_PUBLIC_KEY=pk_test_...
+```
+
+Every other setting has a sensible default. See [configuration](configuration.md).
+Check what is actually in effect with:
+
+```bash
+python manage.py wallet_settings
+```
+
+## 4. URLs
 
 ```python
-from django.urls import path, include
+from django.urls import include, path
 
 urlpatterns = [
-    ...
     path('wallet/', include('wallet.urls')),
 ]
 ```
 
-### 5. Run Migrations
+This gives you:
 
-Run migrations to create the necessary database tables:
+| Path | Purpose |
+| --- | --- |
+| `/wallet/api/...` | REST API ([reference](api_reference.md)) |
+| `/wallet/webhook/` | Paystack webhook receiver |
+| `/wallet/callback/` | Where Paystack sends customers back after checkout |
+
+The URLs are namespaced (`wallet:paystack-webhook`, `wallet:payment-callback`, …).
+Prefer to expose only some endpoints? See [extending](extending.md#your-own-endpoints).
+
+## 5. Database and banks
 
 ```bash
 python manage.py migrate
+python manage.py sync_banks                            # Nigerian banks
+python manage.py sync_banks --country ghana --currency GHS
 ```
 
-### 6. Configure Webhooks
+Or set `WALLET_AUTO_SYNC_BANKS=true` to sync automatically after the first `migrate`.
 
-Set up your webhook URL in your Paystack dashboard:
+## 6. Paystack dashboard
 
-1. Go to Paystack dashboard > Settings > API Keys & Webhooks
-2. Add webhook URL: `https://your-domain.com/wallet/webhook/`
-3. Make sure your webhook URL is accessible from the internet
+In **Settings → API Keys & Webhooks**:
 
-### 7. Setup Celery (Optional but Recommended)
+- **Webhook URL**: `https://your-domain.com/wallet/webhook/`
+- **Callback URL** (optional): `https://your-domain.com/wallet/callback/`
+  (or set `WALLET_DEFAULT_CALLBACK_URL`)
 
-For background tasks like automatic settlements, it's recommended to use Celery:
+Webhooks are how deposits, transfers and refunds complete. Locally, expose your dev
+server with a tunnel (ngrok, cloudflared) to receive them.
 
-1. Install Celery:
+## 7. Scheduled jobs
+
+Webhooks can be delayed or lost, so run the reconciliation safety net periodically.
+
+**With cron / a scheduler:**
+
 ```bash
-pip install celery
+*/10 * * * *  python manage.py reconcile_transactions    # verify stale deposits & withdrawals
+*/15 * * * *  python manage.py process_settlements        # scheduled payouts (if you use them)
+*/15 * * * *  python manage.py retry_webhook_deliveries   # only if you forward webhooks
+0 3 * * *     python manage.py prune_wallet_data          # keep webhook/idempotency tables small
 ```
 
-2. Configure Celery in your Django project:
+**With Celery** (`WALLET_USE_CELERY=true`):
 
 ```python
-# settings.py
-CELERY_BROKER_URL = 'redis://localhost:6379/0'
-CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
-CELERY_ACCEPT_CONTENT = ['json']
-CELERY_TASK_SERIALIZER = 'json'
-CELERY_RESULT_SERIALIZER = 'json'
-CELERY_TIMEZONE = 'UTC'
-
-# Add periodic tasks for the wallet system
-from celery.schedules import crontab
-
 CELERY_BEAT_SCHEDULE = {
-    'process_due_settlement_schedules': {
-        'task': 'wallet.tasks.process_due_settlement_schedules_task',
-        'schedule': crontab(minute='0', hour='*/1'),  # Run hourly
-    },
-    'reset_daily_transaction_limits': {
-        'task': 'wallet.tasks.reset_daily_transaction_limits_task',
-        'schedule': crontab(minute='0', hour='0'),  # Run at midnight
-    },
-    'sync_banks_from_paystack': {
-        'task': 'wallet.tasks.sync_banks_from_paystack_task',
-        'schedule': crontab(minute='0', hour='0', day_of_week='1'),  # Run weekly
-    },
-    'verify_pending_settlements': {
-        'task': 'wallet.tasks.verify_pending_settlements_task',
-        'schedule': crontab(minute='*/15'),  # Run every 15 minutes
-    },
-    'retry_failed_webhook_deliveries': {
-        'task': 'wallet.tasks.retry_failed_webhook_deliveries_task',
-        'schedule': crontab(minute='*/10'),  # Run every 10 minutes
-    },
-    'verify_bank_accounts': {
-        'task': 'wallet.tasks.verify_bank_accounts_task',
-        'schedule': crontab(minute='0', hour='*/3'),  # Run every 3 hours
-    },
-    'check_expired_cards': {
-        'task': 'wallet.tasks.check_expired_cards_task',
-        'schedule': crontab(minute='0', hour='0'),  # Run daily at midnight
-    },
+    'wallet-reconcile': {'task': 'wallet.tasks.reconcile_transactions_task', 'schedule': 600},
+    'wallet-settlements': {'task': 'wallet.tasks.process_due_settlements_task', 'schedule': 900},
+    'wallet-webhook-retries': {'task': 'wallet.tasks.retry_failed_webhook_deliveries_task', 'schedule': 900},
+    'wallet-expired-cards': {'task': 'wallet.tasks.check_expired_cards_task', 'schedule': 86400},
+    'wallet-prune': {'task': 'wallet.tasks.prune_wallet_data_task', 'schedule': 86400},
 }
 ```
 
-3. Create a `celery.py` file in your project directory:
+With Celery on, webhooks are acknowledged immediately and processed on your workers.
 
-```python
-import os
-from celery import Celery
+## 8. Production essentials
 
-# Set the default Django settings module for the 'celery' program.
-os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'your_project.settings')
+- **PostgreSQL** (or MySQL/InnoDB). SQLite has no row locks.
+- **A shared cache** (Redis/Memcached) as `CACHES['default']`, so rate limits work across
+  servers.
+- **Celery** for webhook processing at volume.
+- Mobile/web clients send an **`Idempotency-Key`** header on money-moving requests.
+- Route the **`wallet.audit`** logger to durable storage.
 
-app = Celery('your_project')
+See [`loadtest/README.md`](../loadtest/README.md) for benchmarking your setup.
 
-# Using a string here means the worker doesn't have to serialize
-# the configuration object to child processes.
-app.config_from_object('django.conf:settings', namespace='CELERY')
-
-# Load task modules from all registered Django app configs.
-app.autodiscover_tasks()
-```
-
-4. Start Celery worker and beat:
+## 9. Verify
 
 ```bash
-celery -A your_project worker -l info
-celery -A your_project beat -l info
+python manage.py check
 ```
 
-## Verify Installation
+The package registers system checks for missing or mismatched Paystack keys, live keys
+with `DEBUG=True`, invalid fee bearers, bad dotted paths, Celery enabled but not
+installed, and more.
 
-To verify that the wallet system is properly installed, you can:
+## Upgrading from the pre-1.0 code
 
-1. Check the admin interface to see wallet models (`/admin/wallet/`)
-2. Test the API endpoints:
-   - `/wallet/api/wallets/`
-   - `/wallet/api/transactions/`
-   - `/wallet/api/banks/`
-
-## Advanced Configuration
-
-### Custom User Model
-
-If you're using a custom user model, make sure to set it in the wallet settings:
-
-```python
-# settings.py
-WALLET_USER_MODEL = 'yourapp.CustomUser'
-```
-
-### Webhook Forwarding
-
-If you want to forward webhook events to your own endpoints:
-
-1. Create webhook endpoints in the admin interface (`/admin/wallet/webhookendpoint/`)
-2. Configure the endpoint URL, secret, and event types
-
-### Transaction Fees
-
-To configure transaction fees:
-
-```python
-WALLET_TRANSACTION_CHARGE_PERCENT = 1.5  # 1.5% charge on transactions
-```
-
-### Customizing Templates
-
-To customize the admin templates, create the following directory structure in your project:
-
-```
-templates/
-└── admin/
-    └── wallet/
-        └── analytics/
-            ├── wallet_analytics.html
-            ├── transaction_analytics.html
-            └── settlement_analytics.html
-```
-
-Copy the original templates from the package and modify them as needed.
-
-## Troubleshooting
-
-### Webhook Issues
-
-If webhooks are not being processed:
-
-1. Check that your webhook URL is accessible from the internet
-2. Verify that the webhook signature header is being sent correctly
-3. Check the webhook events in the admin interface
-
-### Transaction Issues
-
-If transactions are failing:
-
-1. Verify your Paystack API keys are correct
-2. Check the transaction logs in the admin interface
-3. Make sure your Paystack account is properly set up
-
-### Database Issues
-
-If you encounter database-related issues:
-
-1. Make sure you've run migrations (`python manage.py migrate`)
-2. Check that your database settings are correct
-3. For production, use PostgreSQL or MySQL instead of SQLite
-
-## Next Steps
-
-After installation, see the [Configuration](configuration.md) and [Usage](usage.md) guides for more details on how to use and customize the wallet system.
+1.0 ships a fresh `0001_initial` migration. If you ran an earlier development
+version against a database you want to keep, back it up, then either start from a
+fresh database or fake the initial migration after aligning the schema by hand. See
+the [changelog](../CHANGELOG.md) for everything that changed.

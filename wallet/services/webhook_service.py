@@ -1,549 +1,384 @@
+"""
+Paystack webhook handling.
+
+1. (optional) check the request comes from a Paystack IP
+2. verify ``X-Paystack-Signature`` (HMAC-SHA512 of the raw body)
+3. store the event - duplicates (Paystack retries) are detected by a hash of the body
+4. dispatch to the built-in handler for the event (deposits, transfers, refunds, DVA, identity)
+5. send the ``paystack_webhook_received`` signal - hook your own logic here for
+   subscriptions, invoices, payment requests, disputes, ...
+6. (optional) forward a signed copy to registered HTTP endpoints
+
+Processing errors are recorded on the event and never turned into a non-200
+response: the event is stored and can be replayed with
+:meth:`WebhookService.reprocess_webhook_event`.
+"""
+import hashlib
+import hmac
 import json
 import logging
-import hmac
-import hashlib
+from datetime import timedelta
+
 import requests
-from typing import Dict, List, Optional
+from django.db import IntegrityError, transaction as db_transaction
 from django.utils import timezone
-from django.utils.translation import gettext_lazy as _
-from django.db import transaction as db_transaction
 
-from wallet.models import WebhookEvent, WebhookEndpoint, WebhookDeliveryAttempt
-from wallet.exceptions import InvalidWebhookSignature
-from wallet.settings import get_wallet_setting
-from wallet.services.transaction_service import TransactionService
-from wallet.services.settlement_service import SettlementService
+from wallet.conf import wallet_settings
+from wallet.constants import (
+    WEBHOOK_EVENT_CHARGE_DISPUTE_CREATE,
+    WEBHOOK_EVENT_CHARGE_DISPUTE_REMIND,
+    WEBHOOK_EVENT_CHARGE_DISPUTE_RESOLVE,
+    WEBHOOK_EVENT_CHARGE_FAILED,
+    WEBHOOK_EVENT_CHARGE_SUCCESS,
+    WEBHOOK_EVENT_CUSTOMER_IDENTIFICATION_FAILED,
+    WEBHOOK_EVENT_CUSTOMER_IDENTIFICATION_SUCCESS,
+    WEBHOOK_EVENT_DVA_ASSIGN_FAILED,
+    WEBHOOK_EVENT_DVA_ASSIGN_SUCCESS,
+    WEBHOOK_EVENT_REFUND_FAILED,
+    WEBHOOK_EVENT_REFUND_PENDING,
+    WEBHOOK_EVENT_REFUND_PROCESSED,
+    WEBHOOK_EVENT_REFUND_PROCESSING,
+    WEBHOOK_EVENT_TRANSFER_FAILED,
+    WEBHOOK_EVENT_TRANSFER_REVERSED,
+    WEBHOOK_EVENT_TRANSFER_SUCCESS,
+)
+from wallet.exceptions import InvalidWebhookSignature, WalletError
+from wallet.models import Transaction, WebhookDeliveryAttempt, WebhookEndpoint, WebhookEvent
+from wallet.paystack.client import verify_signature
+from wallet.services.base import BaseService
+from wallet.signals import dispute_event, paystack_webhook_received, send_on_commit
+
+logger = logging.getLogger('wallet')
 
 
-logger = logging.getLogger(__name__)
+class WebhookService(BaseService):
 
+    def __init__(self, paystack=None):
+        super().__init__(paystack)
+        self._handlers = {
+            WEBHOOK_EVENT_CHARGE_SUCCESS: self._handle_charge,
+            WEBHOOK_EVENT_CHARGE_FAILED: self._handle_charge,
+            WEBHOOK_EVENT_TRANSFER_SUCCESS: self._handle_transfer,
+            WEBHOOK_EVENT_TRANSFER_FAILED: self._handle_transfer,
+            WEBHOOK_EVENT_TRANSFER_REVERSED: self._handle_transfer,
+            WEBHOOK_EVENT_REFUND_PENDING: self._handle_refund,
+            WEBHOOK_EVENT_REFUND_PROCESSING: self._handle_refund,
+            WEBHOOK_EVENT_REFUND_PROCESSED: self._handle_refund,
+            WEBHOOK_EVENT_REFUND_FAILED: self._handle_refund,
+            WEBHOOK_EVENT_DVA_ASSIGN_SUCCESS: self._handle_dedicated_account,
+            WEBHOOK_EVENT_DVA_ASSIGN_FAILED: self._handle_dedicated_account,
+            WEBHOOK_EVENT_CUSTOMER_IDENTIFICATION_SUCCESS: self._handle_identification,
+            WEBHOOK_EVENT_CUSTOMER_IDENTIFICATION_FAILED: self._handle_identification,
+            WEBHOOK_EVENT_CHARGE_DISPUTE_CREATE: self._handle_dispute,
+            WEBHOOK_EVENT_CHARGE_DISPUTE_REMIND: self._handle_dispute,
+            WEBHOOK_EVENT_CHARGE_DISPUTE_RESOLVE: self._handle_dispute,
+        }
 
-class WebhookService:
-    """
-    Service for handling and processing webhook events from Paystack
-    and forwarding to custom webhook endpoints.
-    """
-    
-    def __init__(self):
-        """Initialize webhook service with transaction and settlement services"""
-        self.transaction_service = TransactionService()
-        self.settlement_service = SettlementService()
-        self._secret_key = get_wallet_setting('PAYSTACK_SECRET_KEY')
-    
-    # ==================== Signature Verification ====================
-    
-    def verify_paystack_webhook_signature(
-        self, 
-        signature: str, 
-        payload_bytes: bytes
-    ) -> bool:
-        """
-        Verify that a webhook came from Paystack using HMAC SHA512.
-        
-        Args:
-            signature: X-Paystack-Signature header value
-            payload_bytes: Raw request body
-            
-        Returns:
-            True if signature is valid
-            
-        Raises:
-            InvalidWebhookSignature: If the signature is invalid
-        """
+    # ------------------------------------------------------------------
+    # Verification
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def is_allowed_ip(ip_address):
+        if not wallet_settings.WEBHOOK_VERIFY_IP:
+            return True
+        return ip_address in set(wallet_settings.WEBHOOK_ALLOWED_IPS or [])
+
+    def verify_paystack_webhook_signature(self, signature, payload_bytes):
         if not signature:
-            logger.error("Webhook signature is missing")
             raise InvalidWebhookSignature("Missing webhook signature")
-        
         if not payload_bytes:
-            logger.error("Webhook payload is empty")
             raise InvalidWebhookSignature("Empty webhook payload")
-        
-        # Compute HMAC SHA512
-        computed_hmac = hmac.new(
-            key=self._secret_key.encode('utf-8'),
-            msg=payload_bytes,
-            digestmod=hashlib.sha512
-        ).hexdigest()
-        
-        # Compare signatures using constant-time comparison
-        if not hmac.compare_digest(computed_hmac, signature):
-            logger.error(
-                "Invalid webhook signature received. "
-                f"Expected: {computed_hmac[:10]}..., Got: {signature[:10]}..."
-            )
-            raise InvalidWebhookSignature("Invalid webhook signature")
-        
-        logger.debug("Webhook signature verified successfully")
+        if not verify_signature(payload_bytes, signature, self.paystack.secret_key):
+            raise InvalidWebhookSignature()
         return True
-    
-    # ==================== Webhook Processing ====================
-    
-    @db_transaction.atomic
-    def process_paystack_webhook(
-        self, 
-        payload_bytes: bytes, 
-        signature: str
-    ) -> WebhookEvent:
+
+    # ------------------------------------------------------------------
+    # Entry point
+    # ------------------------------------------------------------------
+
+    def handle_webhook(self, payload_bytes, signature, ip_address=None):
         """
-        Process a webhook event from Paystack.
-        
-        This method:
-        1. Verifies the webhook signature
-        2. Parses the JSON payload
-        3. Creates a WebhookEvent record
-        4. Processes the event based on event type
-        5. Forwards the event to custom endpoints
-        
-        Args:
-            payload_bytes: Raw request body
-            signature: X-Paystack-Signature header value
-            
-        Returns:
-            Created WebhookEvent instance
-            
-        Raises:
-            InvalidWebhookSignature: If the signature is invalid
-            ValueError: If the payload is invalid
+        Verify, store and process a webhook. Returns ``(event, created)``;
+        ``created`` is False for a duplicate delivery.
         """
-        # Verify signature first
+        if not self.is_allowed_ip(ip_address):
+            raise InvalidWebhookSignature(f"Webhook from unexpected IP {ip_address}")
         self.verify_paystack_webhook_signature(signature, payload_bytes)
-        
-        # Decode JSON payload
+
         try:
             payload = json.loads(payload_bytes.decode('utf-8'))
-        except UnicodeDecodeError as e:
-            logger.error(f"Failed to decode webhook payload: {str(e)}")
-            raise ValueError(f"Invalid webhook payload encoding: {str(e)}")
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse webhook JSON: {str(e)}")
-            raise ValueError(f"Invalid webhook JSON payload: {str(e)}")
-        
-        # Extract event data
-        event_type = payload.get('event')
-        if not event_type:
-            logger.error("Webhook payload missing event type")
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ValueError(f"Invalid webhook payload: {exc}") from exc
+        if not isinstance(payload, dict) or not payload.get('event'):
             raise ValueError("Missing event type in webhook payload")
-        
-        data = payload.get('data', {})
-        reference = data.get('reference') or data.get('transfer_code') or data.get('id')
-        
-        logger.info(
-            f"Received webhook event: type={event_type}, "
-            f"reference={reference}"
-        )
-        
-        # Create webhook event record
-        webhook_event = WebhookEvent.objects.create(
-            event_type=event_type,
-            payload=payload,
-            reference=reference,
-            signature=signature,
-            is_valid=True
-        )
-        
-        logger.info(f"Created webhook event record: id={webhook_event.id}")
-        
-        # Process webhook event (outside the transaction to prevent rollback issues)
-        try:
-            self._process_event(webhook_event)
-        except Exception as e:
-            logger.error(
-                f"Error processing webhook event {webhook_event.id}: {str(e)}",
-                exc_info=True
-            )
-            # Don't re-raise - we've already saved the webhook event
-            # This allows us to retry processing later
-        
-        return webhook_event
-    
-    def _process_event(self, webhook_event: WebhookEvent) -> bool:
-        """
-        Process a webhook event by delegating to appropriate service.
-        
-        Args:
-            webhook_event: Webhook event to process
-            
-        Returns:
-            True if processed successfully, False otherwise
-        """
-        event_type = webhook_event.event_type
-        data = webhook_event.payload.get('data', {})
-        
-        logger.info(
-            f"Processing webhook event {webhook_event.id}: "
-            f"type={event_type}"
-        )
-        
-        processed = False
-        
-        # Try to process with transaction service (charge events)
-        try:
-            transaction_processed = self.transaction_service.process_paystack_webhook(
-                event_type, 
-                data,
-                webhook_event  # ✅ FIX: Now passing webhook_event!
-            )
-            if transaction_processed:
-                processed = True
-                logger.info(
-                    f"Webhook event {webhook_event.id} processed by TransactionService"
-                )
-        except Exception as e:
-            logger.error(
-                f"Error in TransactionService.process_paystack_webhook: {str(e)}",
-                exc_info=True
-            )
-        
-        # Try to process with settlement service (transfer events)
-        try:
-            settlement_processed = self.settlement_service.process_paystack_webhook(
-                event_type, 
-                data,
-                webhook_event  # ✅ FIX: Now passing webhook_event!
-            )
-            if settlement_processed:
-                processed = True
-                logger.info(
-                    f"Webhook event {webhook_event.id} processed by SettlementService"
-                )
-        except Exception as e:
-            logger.error(
-                f"Error in SettlementService.process_paystack_webhook: {str(e)}",
-                exc_info=True
-            )
-        
-        # Mark as processed if either service handled it
-        if processed:
-            webhook_event.processed = True
-            webhook_event.processed_at = timezone.now()
-            webhook_event.save(update_fields=['processed', 'processed_at'])
-            logger.info(f"Webhook event {webhook_event.id} marked as processed")
-        else:
-            logger.warning(
-                f"Webhook event {webhook_event.id} was not processed by any service. "
-                f"Event type: {event_type}"
-            )
-        
-        # Forward event to custom webhook endpoints
-        try:
-            self._forward_to_endpoints(webhook_event)
-        except Exception as e:
-            logger.error(
-                f"Error forwarding webhook event {webhook_event.id}: {str(e)}",
-                exc_info=True
-            )
-        
-        return processed
 
-    # ==================== Webhook Forwarding ====================
-    
-    def _forward_to_endpoints(self, webhook_event: WebhookEvent) -> None:
-        """
-        Forward a webhook event to custom webhook endpoints.
-        
-        Args:
-            webhook_event: Webhook event to forward
-        """
-        # Get all active webhook endpoints
-        endpoints = WebhookEndpoint.objects.filter(is_active=True)
-        
-        if not endpoints.exists():
-            logger.debug("No active webhook endpoints to forward to")
-            return
-        
-        logger.info(
-            f"Forwarding webhook event {webhook_event.id} to "
-            f"{endpoints.count()} endpoints"
-        )
-        
-        for endpoint in endpoints:
-            try:
-                self.forward_webhook_to_endpoint(webhook_event, endpoint)
-            except Exception as e:
-                logger.error(
-                    f"Error forwarding webhook {webhook_event.id} to "
-                    f"endpoint {endpoint.id}: {str(e)}",
-                    exc_info=True
+        data = payload.get('data')
+        reference = None
+        if isinstance(data, dict):
+            customer = data.get('customer') if isinstance(data.get('customer'), dict) else {}
+            reference = (
+                data.get('reference') or data.get('transfer_code') or data.get('transaction_reference')
+                or customer.get('customer_code')
+            )
+        key = hashlib.sha256(payload_bytes).hexdigest()
+
+        try:
+            with db_transaction.atomic():
+                event, created = WebhookEvent.objects.get_or_create(
+                    idempotency_key=key,
+                    defaults={
+                        'event_type': payload['event'], 'payload': payload,
+                        'reference': str(reference)[:150] if reference else None,
+                        'signature': signature[:255], 'is_valid': True,
+                    },
                 )
-    
-    def forward_webhook_to_endpoint(
-        self, 
-        webhook_event: WebhookEvent, 
-        endpoint: WebhookEndpoint
-    ) -> WebhookDeliveryAttempt:
-        """
-        Forward a webhook event to a specific endpoint.
-        
-        Args:
-            webhook_event: Webhook event to forward
-            endpoint: Webhook endpoint to forward to
-            
-        Returns:
-            WebhookDeliveryAttempt instance
-        """
-        # Get the latest attempt number for this event and endpoint
-        latest_attempt = WebhookDeliveryAttempt.objects.filter(
-            webhook_event=webhook_event,
-            webhook_endpoint=endpoint
-        ).order_by('-attempt_number').first()
-        
-        attempt_number = (latest_attempt.attempt_number + 1) if latest_attempt else 1
-        
-        logger.info(
-            f"Forwarding webhook {webhook_event.id} to {endpoint.url} "
-            f"(attempt {attempt_number})"
-        )
-        
-        # Prepare request data
+        except IntegrityError:
+            event, created = WebhookEvent.objects.get(idempotency_key=key), False
+
+        if not created and event.processed:
+            logger.info("Duplicate webhook %s ignored", event.pk)
+            return event, False
+
+        if wallet_settings.USE_CELERY:
+            from wallet.tasks import process_webhook_event_task
+            event_pk = str(event.pk)
+            db_transaction.on_commit(lambda: process_webhook_event_task.delay(event_pk))
+        else:
+            self.process_event(event)
+        return event, created
+
+    # Backwards compatible entry point
+    def process_paystack_webhook(self, payload_bytes, signature):
+        event, _created = self.handle_webhook(payload_bytes, signature)
+        return event
+
+    # ------------------------------------------------------------------
+    # Processing
+    # ------------------------------------------------------------------
+
+    def process_event(self, event):
+        """Run the built-in handler for ``event``. Never raises; errors are stored on the event."""
+        data = event.data if isinstance(event.data, dict) else {}
+        handler = self._handlers.get(event.event_type)
+        handled = False
+        error = ''
+        event.processing_attempts += 1
+        try:
+            if handler is not None:
+                result = handler(event.event_type, data, event)
+                handled = result is not None
+        except Exception as exc:  # recorded for replay; must not bubble up to Paystack
+            logger.exception("Error processing webhook %s (%s)", event.pk, event.event_type)
+            error = f"{type(exc).__name__}: {exc}"
+            # The handler may have linked a transaction that was then rolled back
+            if event.transaction_id and not Transaction.objects.filter(pk=event.transaction_id).exists():
+                event.transaction = None
+
+        event.processing_error = error
+        event.processed = not error
+        event.processed_at = timezone.now() if not error else None
+        event.save(update_fields=['processed', 'processed_at', 'processing_error', 'processing_attempts',
+                                  'transaction', 'updated_at'])
+
+        if not error:
+            send_on_commit(paystack_webhook_received, sender=WebhookEvent, event=event.event_type, data=data,
+                           webhook_event=event, handled=handled)
+            if wallet_settings.ENABLE_WEBHOOK_FORWARDING:
+                self._forward(event)
+        return not error
+
+    def reprocess_webhook_event(self, event_id):
+        event = WebhookEvent.objects.get(pk=event_id)
+        return self.process_event(event)
+
+    # ------------------------------------------------------------------
+    # Built-in handlers
+    # ------------------------------------------------------------------
+
+    def _handle_charge(self, event_type, data, event):
+        from wallet.services.deposit_service import DepositService
+
+        if event_type == WEBHOOK_EVENT_CHARGE_FAILED and not data.get('status'):
+            data = {**data, 'status': 'failed'}
+        return DepositService(paystack=self.paystack).process_charge(data, webhook_event=event)
+
+    def _handle_transfer(self, event_type, data, event):
+        from wallet.services.withdrawal_service import WithdrawalService
+
+        return WithdrawalService(paystack=self.paystack).process_transfer_event(event_type, data, webhook_event=event)
+
+    def _handle_refund(self, event_type, data, event):
+        from wallet.services.transaction_service import TransactionService
+
+        return TransactionService(paystack=self.paystack).process_refund_event(event_type, data, webhook_event=event)
+
+    def _handle_dedicated_account(self, event_type, data, event):
+        from wallet.services.customer_service import CustomerService
+
+        return CustomerService(paystack=self.paystack).process_dedicated_account_event(event_type, data)
+
+    def _handle_identification(self, event_type, data, event):
+        from wallet.services.customer_service import CustomerService
+
+        return CustomerService(paystack=self.paystack).process_identification_event(event_type, data)
+
+    def _handle_dispute(self, event_type, data, event):
+        transaction_data = data.get('transaction') if isinstance(data.get('transaction'), dict) else {}
+        reference = transaction_data.get('reference')
+        txn = Transaction.objects.filter(reference=reference).first() if reference else None
+        if txn is not None and event.transaction_id is None:
+            event.transaction = txn
+        send_on_commit(dispute_event, sender=WebhookEvent, event=event_type, data=data, transaction=txn)
+        return txn or data
+
+    # ------------------------------------------------------------------
+    # Forwarding to your own endpoints
+    # ------------------------------------------------------------------
+
+    def _endpoints_for(self, event):
+        endpoints = WebhookEndpoint.objects.filter(is_active=True).prefetch_related('wallets')
+        wallet_id = event.transaction.wallet_id if event.transaction_id else None
+        selected = []
+        for endpoint in endpoints:
+            if not endpoint.accepts(event.event_type):
+                continue
+            scoped = {w.pk for w in endpoint.wallets.all()}
+            if scoped and wallet_id not in scoped:
+                continue
+            selected.append(endpoint)
+        return selected
+
+    def _forward(self, event):
+        for endpoint in self._endpoints_for(event):
+            if wallet_settings.USE_CELERY:
+                from wallet.tasks import deliver_webhook_task
+                event_pk, endpoint_pk = str(event.pk), str(endpoint.pk)
+                db_transaction.on_commit(lambda e=event_pk, p=endpoint_pk: deliver_webhook_task.delay(e, p))
+            else:
+                try:
+                    self.forward_webhook_to_endpoint(event, endpoint)
+                except Exception:
+                    logger.exception("Forwarding webhook %s to %s failed", event.pk, endpoint.url)
+
+    @staticmethod
+    def sign_payload(body, secret):
+        return hmac.new((secret or '').encode('utf-8'), body, hashlib.sha512).hexdigest()
+
+    def forward_webhook_to_endpoint(self, event, endpoint):
+        attempt_number = WebhookDeliveryAttempt.objects.filter(
+            webhook_event=event, webhook_endpoint=endpoint,
+        ).count() + 1
+        body = json.dumps(event.payload, separators=(',', ':'), sort_keys=True).encode('utf-8')
         headers = {
             'Content-Type': 'application/json',
-            'X-Webhook-Event-ID': str(webhook_event.id),
-            'X-Webhook-Event-Type': webhook_event.event_type,
+            'User-Agent': 'django-paystack-wallet',
+            'X-Wallet-Event': event.event_type,
+            'X-Wallet-Event-Id': str(event.pk),
+            'X-Wallet-Delivery-Attempt': str(attempt_number),
         }
-        
-        if webhook_event.signature:
-            headers['X-Paystack-Signature'] = webhook_event.signature
-        
-        # Add custom headers from endpoint
-        if endpoint.headers:
-            headers.update(endpoint.headers)
-        
-        # Make HTTP request
-        attempt = WebhookDeliveryAttempt.objects.create(
-            webhook_event=webhook_event,
-            webhook_endpoint=endpoint,
-            attempt_number=attempt_number
+        if endpoint.secret:
+            headers['X-Wallet-Signature'] = self.sign_payload(body, endpoint.secret)
+        headers.update({str(k): str(v) for k, v in (endpoint.headers or {}).items()})
+
+        attempt = WebhookDeliveryAttempt(
+            webhook_event=event, webhook_endpoint=endpoint, attempt_number=attempt_number,
+            request_data={'url': endpoint.url, 'headers': {k: v for k, v in headers.items()
+                                                           if k != 'X-Wallet-Signature'}},
         )
-        
         try:
-            response = requests.post(
-                url=endpoint.url,
-                json=webhook_event.payload,
-                headers=headers,
-                timeout=endpoint.timeout or 30
-            )
-            
-            # Record response
+            response = requests.post(endpoint.url, data=body, headers=headers, timeout=endpoint.timeout or 10)
             attempt.response_code = response.status_code
-            attempt.response_body = response.text[:5000]  # Limit size
+            attempt.response_body = (response.text or '')[:5000]
             attempt.is_success = 200 <= response.status_code < 300
-            
-            if attempt.is_success:
-                logger.info(
-                    f"Successfully forwarded webhook {webhook_event.id} to "
-                    f"{endpoint.url}: status={response.status_code}"
-                )
-            else:
-                logger.warning(
-                    f"Failed to forward webhook {webhook_event.id} to "
-                    f"{endpoint.url}: status={response.status_code}"
-                )
-            
-        except requests.RequestException as e:
-            logger.error(
-                f"Request exception forwarding webhook {webhook_event.id} to "
-                f"{endpoint.url}: {str(e)}",
-                exc_info=True
-            )
-            attempt.response_body = str(e)[:5000]
+        except requests.RequestException as exc:
+            attempt.response_body = str(exc)[:5000]
             attempt.is_success = False
-        except Exception as e:
-            logger.error(
-                f"Unexpected error forwarding webhook {webhook_event.id} to "
-                f"{endpoint.url}: {str(e)}",
-                exc_info=True
-            )
-            attempt.response_body = str(e)[:5000]
-            attempt.is_success = False
-        
         attempt.save()
         return attempt
-    
-    # ==================== Retry Logic ====================
-    
-    def retry_failed_webhook_delivery(
-        self, 
-        delivery_attempt: WebhookDeliveryAttempt
-    ) -> WebhookDeliveryAttempt:
-        """
-        Retry a failed webhook delivery.
-        
-        Args:
-            delivery_attempt: Failed delivery attempt to retry
-            
-        Returns:
-            New WebhookDeliveryAttempt instance
-            
-        Raises:
-            ValueError: If the delivery was successful or max retries exceeded
-        """
+
+    def retry_failed_webhook_delivery(self, delivery_attempt):
         if delivery_attempt.is_success:
-            raise ValueError("Cannot retry successful delivery")
-        
+            raise WalletError("Cannot retry a successful delivery")
         endpoint = delivery_attempt.webhook_endpoint
-        if delivery_attempt.attempt_number >= endpoint.retry_count:
-            raise ValueError("Maximum retry attempts exceeded")
-        
-        logger.info(
-            f"Retrying failed webhook delivery {delivery_attempt.id}"
+        deliveries = WebhookDeliveryAttempt.objects.filter(
+            webhook_event=delivery_attempt.webhook_event, webhook_endpoint=endpoint,
         )
-        
-        return self.forward_webhook_to_endpoint(
-            delivery_attempt.webhook_event,
-            endpoint
-        )
-    
-    def retry_all_failed_deliveries(
-        self, 
-        max_attempts: Optional[int] = None
-    ) -> int:
-        """
-        Retry all failed webhook deliveries that haven't exceeded retry count.
-        
-        Args:
-            max_attempts: Maximum number of deliveries to retry (None for all)
-            
-        Returns:
-            Number of deliveries retried
-        """
-        logger.info("Starting bulk retry of failed webhook deliveries")
-        
-        # Get failed deliveries that can be retried
-        failed_deliveries = WebhookDeliveryAttempt.objects.filter(
-            is_success=False
-        ).select_related('webhook_event', 'webhook_endpoint')
-        
-        if max_attempts:
-            failed_deliveries = failed_deliveries[:max_attempts]
-        
-        retried_count = 0
-        
-        for delivery in failed_deliveries:
-            try:
-                # Check if we can retry
-                if delivery.attempt_number >= delivery.webhook_endpoint.retry_count:
-                    continue
-                
-                self.retry_failed_webhook_delivery(delivery)
-                retried_count += 1
-                
-            except Exception as e:
-                logger.error(
-                    f"Error retrying delivery {delivery.id}: {str(e)}",
-                    exc_info=True
-                )
-        
-        logger.info(f"Retried {retried_count} failed webhook deliveries")
-        return retried_count
-    
-    # ==================== Webhook Endpoint Management ====================
-    
-    def register_webhook_endpoint(
-        self,
-        name: str,
-        url: str,
-        wallets: Optional[List] = None,
-        headers: Optional[Dict[str, str]] = None,
-        retry_count: int = 3,
-        timeout: int = 30
-    ) -> WebhookEndpoint:
-        """
-        Register a new webhook endpoint.
-        
-        Args:
-            name: Endpoint name
-            url: Endpoint URL
-            wallets: Optional list of wallet instances to filter events
-            headers: Optional custom headers to include
-            retry_count: Number of retry attempts on failure
-            timeout: Request timeout in seconds
-            
-        Returns:
-            Created WebhookEndpoint instance
-        """
-        logger.info(f"Registering webhook endpoint: {name} -> {url}")
-        
+        if deliveries.filter(is_success=True).exists():
+            raise WalletError("This event was already delivered to the endpoint")
+        if deliveries.count() >= endpoint.retry_count:
+            raise WalletError("Maximum retry attempts exceeded")
+        return self.forward_webhook_to_endpoint(delivery_attempt.webhook_event, endpoint)
+
+    def retry_all_failed_deliveries(self, limit=None):
+        """Retry every event/endpoint pair whose deliveries all failed and that has attempts left."""
+        retried = 0
+        seen = set()
+        window_start = timezone.now() - timedelta(hours=int(wallet_settings.WEBHOOK_RETRY_WINDOW_HOURS))
+        failed = WebhookDeliveryAttempt.objects.filter(is_success=False, created_at__gte=window_start).select_related(
+            'webhook_event', 'webhook_endpoint',
+        ).order_by('-created_at')
+        for attempt in failed:
+            pair = (attempt.webhook_event_id, attempt.webhook_endpoint_id)
+            if pair in seen:
+                continue
+            seen.add(pair)
+            deliveries = WebhookDeliveryAttempt.objects.filter(
+                webhook_event_id=pair[0], webhook_endpoint_id=pair[1],
+            )
+            if deliveries.filter(is_success=True).exists():
+                continue
+            if deliveries.count() >= attempt.webhook_endpoint.retry_count or not attempt.webhook_endpoint.is_active:
+                continue
+            self.forward_webhook_to_endpoint(attempt.webhook_event, attempt.webhook_endpoint)
+            retried += 1
+            if limit and retried >= limit:
+                break
+        return retried
+
+    # ------------------------------------------------------------------
+    # Endpoint management
+    # ------------------------------------------------------------------
+
+    def register_webhook_endpoint(self, name, url, wallets=None, headers=None, retry_count=3, timeout=10,
+                                  secret='', event_types=None):
         endpoint = WebhookEndpoint.objects.create(
-            name=name,
-            url=url,
-            headers=headers or {},
-            retry_count=retry_count,
-            timeout=timeout,
-            is_active=True
+            name=name, url=url, headers=headers or {}, retry_count=retry_count, timeout=timeout,
+            secret=secret or '', event_types=list(event_types or []),
         )
-        
         if wallets:
             endpoint.wallets.set(wallets)
-        
-        logger.info(f"Registered webhook endpoint: id={endpoint.id}")
         return endpoint
-    
-    def get_webhook_event(self, event_id: str) -> Optional[WebhookEvent]:
+
+    @staticmethod
+    def prune(retention_days=None):
         """
-        Get a webhook event by ID.
-        
-        Args:
-            event_id: Webhook event ID
-            
-        Returns:
-            WebhookEvent instance or None if not found
+        Delete old operational data so tables stay small: processed webhook events
+        (and their deliveries) and delivery attempts older than
+        ``WALLET_WEBHOOK_RETENTION_DAYS``, plus expired idempotency records.
+        Unprocessed events and all ledger data are always kept.
         """
-        try:
-            return WebhookEvent.objects.get(id=event_id)
-        except WebhookEvent.DoesNotExist:
-            logger.warning(f"Webhook event not found: {event_id}")
-            return None
-    
-    def list_webhook_events(
-        self,
-        event_type: Optional[str] = None,
-        processed: Optional[bool] = None,
-        limit: int = 100
-    ) -> List[WebhookEvent]:
-        """
-        List webhook events with optional filtering.
-        
-        Args:
-            event_type: Filter by event type
-            processed: Filter by processed status
-            limit: Maximum number of events to return
-            
-        Returns:
-            List of WebhookEvent instances
-        """
+        from wallet.models import IdempotencyRecord
+
+        result = {'webhook_events': 0, 'delivery_attempts': 0, 'idempotency_records': 0}
+        days = retention_days if retention_days is not None else wallet_settings.WEBHOOK_RETENTION_DAYS
+        if days is not None:
+            cutoff = timezone.now() - timedelta(days=int(days))
+            result['delivery_attempts'] = WebhookDeliveryAttempt.objects.filter(created_at__lt=cutoff).delete()[0]
+            result['webhook_events'] = WebhookEvent.objects.filter(
+                processed=True, created_at__lt=cutoff,
+            ).delete()[1].get('wallet.WebhookEvent', 0)
+        expired = timezone.now() - timedelta(hours=int(wallet_settings.IDEMPOTENCY_TTL_HOURS))
+        result['idempotency_records'] = IdempotencyRecord.objects.filter(created_at__lt=expired).delete()[0]
+        return result
+
+    def get_webhook_event(self, event_id):
+        return WebhookEvent.objects.filter(pk=event_id).first()
+
+    def list_webhook_events(self, event_type=None, processed=None, limit=100):
         queryset = WebhookEvent.objects.all()
-        
         if event_type:
             queryset = queryset.filter(event_type=event_type)
-        
         if processed is not None:
             queryset = queryset.filter(processed=processed)
-        
         return list(queryset.order_by('-created_at')[:limit])
-    
-    def reprocess_webhook_event(self, event_id: str) -> bool:
-        """
-        Reprocess a webhook event.
-        
-        Args:
-            event_id: Webhook event ID
-            
-        Returns:
-            True if reprocessed successfully
-            
-        Raises:
-            ValueError: If event not found
-        """
-        webhook_event = self.get_webhook_event(event_id)
-        if not webhook_event:
-            raise ValueError(f"Webhook event not found: {event_id}")
-        
-        logger.info(f"Reprocessing webhook event {event_id}")
-        
-        # Reset processed status
-        webhook_event.processed = False
-        webhook_event.processed_at = None
-        webhook_event.save(update_fields=['processed', 'processed_at'])
-        
-        # Process the event
-        return self._process_event(webhook_event)
