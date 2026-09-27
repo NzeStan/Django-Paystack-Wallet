@@ -13,6 +13,7 @@ only asks Paystack for the truth (the webhook does the same independently).
 import logging
 from urllib.parse import urlencode
 
+from django.core.exceptions import DisallowedRedirect
 from django.http import HttpResponseRedirect
 from django.shortcuts import render
 from django.views import View
@@ -45,7 +46,13 @@ class PaymentCallbackView(View):
         redirect_to = wallet_settings.CALLBACK_REDIRECT_URL
         if redirect_to:
             separator = '&' if '?' in redirect_to else '?'
-            return HttpResponseRedirect(f"{redirect_to}{separator}{urlencode({'reference': reference or '', 'status': state})}")
+            target = f"{redirect_to}{separator}{urlencode({'reference': reference or '', 'status': state})}"
+            try:
+                return HttpResponseRedirect(target)
+            except DisallowedRedirect:
+                # A misconfigured setting must never break the page a paying customer lands on
+                logger.error("WALLET_CALLBACK_REDIRECT_URL=%r is not a valid redirect; rendering the page instead",
+                             redirect_to)
 
         return render(request, self.template_name, {'transaction': txn, 'reference': reference, 'status': state},
                       status=200 if txn is not None else 404)

@@ -78,6 +78,18 @@ webhook URL to `https://your-domain.com/wallet/webhook/`.
 
 That's it: every user gets a wallet automatically, and the API is live under `/wallet/api/`.
 
+## Try it in 5 minutes
+
+The [`demo/`](demo/README.md) folder is a small Django site built on the package: fund a
+wallet through real Paystack test checkout, send money by phone number, withdraw to a
+bank, save cards, buy from a mini marketplace with escrow, and watch webhooks arrive.
+
+```bash
+pip install -e ".[all]"
+cd demo && cp .env.example .env      # add your Paystack TEST keys
+python manage.py migrate && python manage.py seed_demo && python manage.py runserver
+```
+
 ## A quick tour
 
 ```python

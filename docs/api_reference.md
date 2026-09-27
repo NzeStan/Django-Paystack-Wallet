@@ -35,7 +35,8 @@ Validation errors (standard DRF):
 | 409 | `duplicate_reference`, `invalid_transaction_state`, `idempotency_in_progress` |
 | 422 | `idempotency_key_reused` |
 | 429 | rate limited (`Retry-After` header) |
-| 502 | `paystack_error` (Paystack's own message is shown when it rejected the request) |
+| 400 | `paystack_rejected`: Paystack refused the request (e.g. wrong OTP, invalid account); `detail` is Paystack's message |
+| 502 | `paystack_error`: Paystack was unreachable or failed; the outcome may be unknown, so check the transaction before retrying |
 
 When `WALLET_REQUIRE_TRANSACTION_PIN` is on, send `"pin": "1234"` with withdraw, transfer,
 pay, charge-card and settlement requests.
@@ -203,7 +204,7 @@ Response (`200` success, `202` processing / OTP needed, `400` failed):
 ```
 
 Identify the withdrawal with `transaction_id`, `reference` or `transfer_code`. A wrong
-OTP returns `502` with Paystack's message; the withdrawal stays pending.
+OTP returns `400 paystack_rejected` with Paystack's message; the withdrawal stays pending.
 
 ### `POST /wallet/api/wallets/me/resend-otp/`
 

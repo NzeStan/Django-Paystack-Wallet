@@ -61,6 +61,15 @@ def check_wallet_settings(app_configs, **kwargs):
         messages.append(Error(f"Unknown WALLET_TRANSFER_RECIPIENT_LOOKUP_FIELDS: {sorted(unknown)}",
                               id='wallet.E005'))
 
+    redirect_url = wallet_settings.CALLBACK_REDIRECT_URL
+    if redirect_url and not (str(redirect_url).startswith('/') or str(redirect_url).startswith(('http://', 'https://'))):
+        messages.append(Warning(
+            f"WALLET_CALLBACK_REDIRECT_URL={redirect_url!r} is not a path or http(s) URL.",
+            hint="Use e.g. '/wallet/funded/' or 'https://app.example.com/funded'. (On Windows, Git Bash rewrites "
+                 "values starting with '/' in exported variables; put them in a .env file instead.)",
+            id='wallet.W005',
+        ))
+
     for name in ('FEE_CALCULATOR', 'PHONE_NUMBER_NORMALIZER'):
         try:
             wallet_settings.import_from(name)

@@ -189,7 +189,8 @@ def test_withdraw_errors(api_client, paystack, funded_wallet, bank_account):
     assert poor.status_code == 400 and poor.json()['code'] == 'insufficient_funds'
     paystack.error('POST', 'transfer', 'Insufficient Paystack balance')
     rejected = api_client.post(f'{API}/wallets/me/withdraw/', {'amount': '5000'}, format='json')
-    assert rejected.status_code == 502 and rejected.json()['detail'] == 'Insufficient Paystack balance'
+    assert rejected.status_code == 400 and rejected.json()['detail'] == 'Insufficient Paystack balance'
+    assert rejected.json()['code'] == 'paystack_rejected'
     assert api_client.get(f'{API}/wallets/me/balance/').json()['balance'] == '100000.00'
 
 
@@ -387,3 +388,14 @@ def test_staff_can_release_any_escrow(api_client, staff_client, funded_wallet, o
     other.force_authenticate(other_wallet.user)
     assert other.post(f"{API}/transactions/{payment['id']}/release/").status_code == 404   # seller can't self-release
     assert staff_client.post(f"{API}/transactions/{payment['id']}/release/").json()['status'] == 'success'
+
+
+def test_bad_callback_redirect_setting_never_breaks_the_page(client, paystack, service, wallet, settings):
+    from wallet.checks import check_wallet_settings
+    paystack.add('POST', 'transaction/initialize', {'authorization_url': 'u', 'access_code': 'a'})
+    reference = service.initialize_deposit(wallet, 1000)['reference']
+    paystack.add('GET', f'transaction/verify/{reference}', charge_data(reference, 100000))
+    settings.WALLET_CALLBACK_REDIRECT_URL = 'C:/Program Files/Git/'
+    response = client.get('/wallet/callback/', {'reference': reference})
+    assert response.status_code == 200 and b'Payment successful' in response.content
+    assert 'wallet.W005' in {m.id for m in check_wallet_settings(None)}

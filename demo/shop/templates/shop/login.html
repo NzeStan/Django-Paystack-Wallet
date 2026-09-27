@@ -1,0 +1,26 @@
+{% extends 'shop/base.html' %}
+{% block title %}Log in{% endblock %}
+{% block content %}
+<div class="grid" style="max-width:760px">
+  <div class="card">
+    <h2>Log in</h2>
+    <form method="post">{% csrf_token %}
+      <label>Username</label><input name="username" autofocus required>
+      <label>Password</label><input name="password" type="password" required>
+      {% if form.errors %}<div class="result error">Wrong username or password.</div>{% endif %}
+      <button>Log in</button>
+    </form>
+    <p class="muted">No account? <a href="{% url 'signup' %}">Sign up</a></p>
+  </div>
+  <div class="card">
+    <h2>Demo accounts</h2>
+    <p class="muted">Created by <code>python manage.py seed_demo</code>. Password for all: <code>demo12345</code></p>
+    <dl class="kv">
+      <dt>ada</dt><dd>buyer · phone 08031111111</dd>
+      <dt>bola</dt><dd>buyer · phone 08032222222</dd>
+      <dt>seller</dt><dd>marketplace seller</dd>
+      <dt>admin</dt><dd>staff · password <code>admin12345</code></dd>
+    </dl>
+  </div>
+</div>
+{% endblock %}

@@ -187,14 +187,21 @@ class PaystackAPIError(WalletError):
         self.status_code = status_code
         self.response = response
 
-    http_status = 502
-
     @property
     def is_definitive(self):
         return self.status_code is not None and 400 <= self.status_code < 500
 
+    @property
+    def http_status(self):
+        """400 when Paystack rejected the request (e.g. wrong OTP); 502 when it was unreachable or failed."""
+        return 400 if self.is_definitive else 502
+
+    @property
+    def api_code(self):
+        return 'paystack_rejected' if self.is_definitive else self.code
+
     def as_dict(self):
-        return {'detail': self.message, 'code': self.code}
+        return {'detail': self.message, 'code': self.api_code}
 
 
 class InvalidPaystackResponse(PaystackAPIError):

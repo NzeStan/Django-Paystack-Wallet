@@ -1,0 +1,17 @@
+{% extends 'shop/base.html' %}
+{% block title %}Sign up{% endblock %}
+{% block content %}
+<div class="card" style="max-width:480px">
+  <h2>Create an account</h2>
+  <p class="muted">A wallet is created automatically (and a Paystack customer, when keys are set).</p>
+  <form method="post">{% csrf_token %}
+    {% for field in form %}
+      <label for="{{ field.id_for_label }}">{{ field.label }}</label>
+      {{ field }}
+      {% if field.errors %}<div class="result error">{{ field.errors|join:" " }}</div>{% endif %}
+    {% endfor %}
+    <button>Sign up</button>
+  </form>
+  <p class="muted">Have an account? <a href="{% url 'login' %}">Log in</a></p>
+</div>
+{% endblock %}

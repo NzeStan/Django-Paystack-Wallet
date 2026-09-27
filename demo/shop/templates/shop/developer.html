@@ -1,0 +1,53 @@
+{% extends 'shop/base.html' %}
+{% block title %}Developer{% endblock %}
+{% block content %}
+<div class="grid">
+  <div class="card">
+    <h2>Paystack dashboard setup</h2>
+    <p class="muted">Settings → API Keys &amp; Webhooks (Test Mode):</p>
+    <dl class="kv">
+      <dt>Webhook URL</dt><dd class="mono">{{ webhook_url }}</dd>
+      <dt>Callback URL</dt><dd class="mono">{{ callback_url }}</dd>
+      <dt>Mode</dt><dd>{{ paystack_mode }}</dd>
+    </dl>
+    <p class="hint">Paystack can't reach <code>localhost</code>. Start a tunnel (see demo/README.md), open the demo
+      through the tunnel URL, and paste the webhook URL shown here into Paystack.</p>
+  </div>
+  <div class="card">
+    <h2>Tools</h2>
+    <form method="post">{% csrf_token %}
+      <button name="action" value="reconcile">Reconcile pending with Paystack</button>
+      <p class="muted">Verifies every pending deposit/withdrawal now: the safety net when webhooks don't arrive.</p>
+      <button name="action" value="sync_banks" class="secondary">Sync banks</button>
+      <p class="muted">Loads Paystack's bank list (needed for withdrawals).</p>
+    </form>
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h2>Webhooks received (latest 25)</h2>
+  <table>
+    <thead><tr><th>When</th><th>Event</th><th>Reference</th><th>Processed</th><th>Transaction</th><th></th></tr></thead>
+    <tbody>
+    {% for event in events %}
+      <tr>
+        <td>{{ event.created_at|date:"M j, H:i:s" }}</td>
+        <td>{{ event.event_type }}</td>
+        <td class="mono">{{ event.reference|default:"-" }}</td>
+        <td>{% if event.processed %}<span class="badge success">yes</span>{% else %}<span class="badge failed">no</span>
+          <div class="muted">{{ event.processing_error|truncatechars:80 }}</div>{% endif %}</td>
+        <td class="mono">{{ event.transaction.reference|default:"-" }}</td>
+        <td><form method="post">{% csrf_token %}<input type="hidden" name="event_id" value="{{ event.pk }}">
+          <button name="action" value="reprocess" class="secondary" style="margin:0;padding:4px 10px">Replay</button></form></td>
+      </tr>
+    {% empty %}<tr><td colspan="6" class="muted">No webhooks yet. Set up the tunnel and make a payment.</td></tr>{% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h2>Resolved wallet settings</h2>
+  <p class="muted">From demo/settings.py → demo/.env → package defaults (secrets masked).</p>
+  <table><tbody>{% for name, value in settings_rows %}<tr><td class="mono">{{ name }}</td><td class="mono">{{ value }}</td></tr>{% endfor %}</tbody></table>
+</div>
+{% endblock %}

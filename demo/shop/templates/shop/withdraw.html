@@ -1,0 +1,150 @@
+{% extends 'shop/base.html' %}
+{% block title %}Withdraw{% endblock %}
+{% block content %}
+{% if not features.withdrawals %}<div class="banner">Withdrawals are disabled (WALLET_ENABLE_WITHDRAWALS=false).</div>{% endif %}
+<div class="grid">
+  <div class="card">
+    <h2>1. Add a bank account</h2>
+    <form id="account-form">
+      <label>Bank</label>
+      <select name="bank_code" id="banks" required><option value="">Loading banks…</option></select>
+      <div class="muted" id="bank-hint"></div>
+      <label>Account number</label>
+      <input name="account_number" inputmode="numeric" maxlength="10" required>
+      <div id="resolve-result" class="result"></div>
+      <button type="button" id="resolve" class="secondary">Verify name</button>
+      <button>Save account</button>
+    </form>
+    <div id="account-result" class="result"></div>
+    <p class="hint">Account names are resolved by Paystack against real banks, so use a real account
+      number (your own). Test-mode transfers never move real money. Paystack may limit how many
+      resolves a test integration can make per day.</p>
+  </div>
+
+  <div class="card">
+    <h2>2. Withdraw</h2>
+    <form id="withdraw-form">
+      <label>To account</label>
+      <select name="bank_account_id" id="accounts"></select>
+      <label>Amount (NGN)</label>
+      <input name="amount" type="number" min="100" step="0.01" required>
+      <div class="muted" id="withdraw-quote"></div>
+      {% if require_pin %}<label>Transaction PIN</label><input name="pin" type="password" inputmode="numeric" maxlength="4" required>{% endif %}
+      <button>Withdraw</button>
+    </form>
+    <div id="withdraw-result" class="result"></div>
+    <form id="otp-form" style="display:none">
+      <label>OTP sent by Paystack to the business owner</label>
+      <div class="row"><div><input name="otp" inputmode="numeric" required></div>
+        <div style="flex:0 0 auto"><button style="margin-top:0">Confirm</button></div></div>
+      <button type="button" class="secondary" id="resend">Resend OTP</button>
+    </form>
+    <p class="hint">Transfers complete on Paystack's <code>transfer.success</code> webhook (see the README for
+      receiving webhooks locally), or press "Reconcile" on the Developer page.</p>
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h2>Saved accounts</h2>
+  <table><tbody id="account-list"></tbody></table>
+</div>
+<div class="card" style="margin-top:16px">
+  <h2>Withdrawals</h2>
+  <table><tbody id="withdrawals"></tbody></table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let pendingTransaction = null;
+
+async function loadBanks() {
+  const select = document.getElementById('banks');
+  let url = 'banks/?page_size=100', banks = [];
+  while (url) {
+    const res = await Wallet.call('GET', url);
+    if (!res.ok) break;
+    banks = banks.concat(res.data.results);
+    url = res.data.next ? res.data.next.split('/wallet/api/')[1] : null;
+  }
+  select.innerHTML = '<option value="">Choose a bank</option>' +
+    banks.map((b) => `<option value="${b.code}">${b.name} (${b.code})</option>`).join('');
+  document.getElementById('bank-hint').textContent = banks.length ? '' :
+    'No banks yet: a staff user can press "Sync banks" on the Developer page (or run manage.py sync_banks).';
+}
+
+async function loadAccounts() {
+  const res = await Wallet.call('GET', 'bank-accounts/');
+  const accounts = res.ok ? res.data.results : [];
+  document.getElementById('accounts').innerHTML = accounts.map((a) =>
+    `<option value="${a.id}">${a.bank.name} · ${a.masked_account_number} · ${a.account_name}</option>`).join('');
+  document.getElementById('account-list').innerHTML = accounts.length ? accounts.map((a) => `<tr>
+    <td>${a.bank.name}</td><td>${a.account_number}</td><td>${a.account_name}</td>
+    <td>${a.is_default ? '<span class="badge success">default</span>' : ''} ${a.can_receive_transfers ? '' : '<span class="badge pending">no recipient yet</span>'}</td>
+    <td><button class="danger" style="margin:0;padding:4px 10px" onclick="removeAccount('${a.id}')">Remove</button></td></tr>`).join('')
+    : '<tr><td class="muted">No bank accounts yet.</td></tr>';
+}
+
+async function removeAccount(id) {
+  await Wallet.call('DELETE', `bank-accounts/${id}/`);
+  loadAccounts();
+}
+
+async function loadWithdrawals() {
+  const res = await Wallet.call('GET', 'wallets/me/transactions/?type=withdrawal&page_size=10');
+  document.getElementById('withdrawals').innerHTML = res.ok && res.data.results.length
+    ? res.data.results.map(Wallet.txnRow).join('') : '<tr><td class="muted">No withdrawals yet.</td></tr>';
+}
+
+loadBanks(); loadAccounts(); loadWithdrawals();
+setInterval(loadWithdrawals, 5000);
+
+const accountForm = document.getElementById('account-form');
+document.getElementById('resolve').addEventListener('click', async () => {
+  const res = await Wallet.call('POST', 'bank-accounts/resolve/', Wallet.formData(accountForm));
+  Wallet.notify('#resolve-result', res, res.ok ? `Account name: ${res.data.account_name}` : '');
+});
+accountForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const res = await Wallet.call('POST', 'bank-accounts/', Wallet.formData(accountForm));
+  Wallet.notify('#account-result', res, res.ok ? `Saved ${res.data.account_name}` : '');
+  loadAccounts();
+});
+
+const withdrawForm = document.getElementById('withdraw-form');
+withdrawForm.amount.addEventListener('input', async () => {
+  const amount = withdrawForm.amount.value;
+  if (!amount) return;
+  const res = await Wallet.call('POST', 'wallets/fee-quote/', { amount, transaction_type: 'withdrawal' });
+  document.getElementById('withdraw-quote').textContent = res.ok
+    ? `Wallet is debited ${Wallet.money(res.data.customer_pays)} · bank receives ${Wallet.money(res.data.merchant_receives)} · fee ${Wallet.money(res.data.fee_amount)}` : '';
+});
+
+function showWithdrawal(res) {
+  const el = document.getElementById('withdraw-result');
+  if (res.data && res.data.status) {
+    el.className = 'result ' + (res.data.status === 'failed' ? 'error' : res.data.status === 'success' ? 'ok' : 'info');
+    el.textContent = `${res.data.message} (${res.data.transaction.reference})`;
+    pendingTransaction = res.data.status === 'pending_otp' ? res.data.transaction.id : null;
+    document.getElementById('otp-form').style.display = pendingTransaction ? 'block' : 'none';
+  } else {
+    Wallet.notify(el, res);
+  }
+  loadWithdrawals();
+}
+
+withdrawForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  showWithdrawal(await Wallet.call('POST', 'wallets/me/withdraw/', Wallet.formData(withdrawForm)));
+});
+document.getElementById('otp-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  showWithdrawal(await Wallet.call('POST', 'wallets/me/finalize-withdrawal/',
+    { otp: event.target.otp.value, transaction_id: pendingTransaction }));
+});
+document.getElementById('resend').addEventListener('click', async () => {
+  const res = await Wallet.call('POST', 'wallets/me/resend-otp/', { transaction_id: pendingTransaction });
+  Wallet.notify('#withdraw-result', res, 'OTP resent');
+});
+</script>
+{% endblock %}

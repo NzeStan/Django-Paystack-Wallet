@@ -120,7 +120,7 @@ class WalletAPIMixin:
             logger.warning("Paystack error in %s: %s", type(self).__name__, exc)
             detail = exc.paystack_message if exc.is_definitive and exc.paystack_message else \
                 'Payment provider error. Please try again.'
-            return error_response(detail, exc.http_status, exc.code)
+            return error_response(detail, exc.http_status, exc.api_code)
         if isinstance(exc, WalletError):
             return Response(exc.as_dict(), status=exc.http_status)
         if isinstance(exc, DjangoValidationError):

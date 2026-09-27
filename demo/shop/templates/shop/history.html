@@ -1,0 +1,62 @@
+{% extends 'shop/base.html' %}
+{% block title %}History{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>Transaction history</h2>
+  <form id="filters" class="row">
+    <div><label>Type</label><select name="type"><option value="">All</option>
+      <option>deposit</option><option>withdrawal</option><option>transfer</option><option>payment</option>
+      <option>refund</option><option>reversal</option><option>commission</option></select></div>
+    <div><label>Status</label><select name="status"><option value="">All</option>
+      <option>pending</option><option>success</option><option>failed</option><option>cancelled</option><option>reversed</option></select></div>
+    <div><label>Direction</label><select name="direction"><option value="">All</option><option>credit</option><option>debit</option></select></div>
+    <div><label>Search</label><input name="search" placeholder="reference or description"></div>
+  </form>
+  <table>
+    <thead><tr><th>Date</th><th>What</th><th>Amount</th><th>Status</th><th>Fee</th><th>Reference</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div class="row" style="justify-content:space-between">
+    <div><button class="secondary" id="prev">Previous</button> <button class="secondary" id="next">Next</button></div>
+    <div style="text-align:right"><a class="button" href="/wallet/api/transactions/export/?export_format=csv">Export CSV</a></div>
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h2>Statement (ledger order)</h2>
+  <p class="muted">Only entries that changed the balance, with the balance after each one.</p>
+  <table><thead><tr><th>#</th><th>What</th><th>Amount</th><th>Balance after</th></tr></thead><tbody id="statement"></tbody></table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let page = 1;
+const filters = document.getElementById('filters');
+
+async function load() {
+  const params = new URLSearchParams({ ...Wallet.formData(filters), page, page_size: 15 });
+  const res = await Wallet.call('GET', 'wallets/me/transactions/?' + params);
+  const rows = res.ok ? res.data.results : [];
+  document.getElementById('rows').innerHTML = rows.length ? rows.map(Wallet.txnRow).join('')
+    : '<tr><td class="muted" colspan="6">Nothing here.</td></tr>';
+  document.getElementById('prev').disabled = !(res.ok && res.data.previous);
+  document.getElementById('next').disabled = !(res.ok && res.data.next);
+}
+
+async function loadStatement() {
+  const res = await Wallet.call('GET', 'wallets/me/statement/?page_size=100');
+  const rows = res.ok ? res.data.results : [];
+  document.getElementById('statement').innerHTML = rows.map((t) => `<tr>
+    <td>${t.ledger_sequence}</td><td>${t.transaction_type_display}<div class="muted">${t.description || ''}</div></td>
+    <td class="amount ${t.direction}">${t.direction === 'credit' ? '+' : '-'}${Wallet.money(t.total_amount)}</td>
+    <td>${Wallet.money(t.balance_after)}</td></tr>`).join('') || '<tr><td class="muted">Empty.</td></tr>';
+}
+
+filters.addEventListener('change', () => { page = 1; load(); });
+filters.search.addEventListener('input', () => { clearTimeout(window._s); window._s = setTimeout(() => { page = 1; load(); }, 300); });
+document.getElementById('prev').addEventListener('click', () => { page -= 1; load(); });
+document.getElementById('next').addEventListener('click', () => { page += 1; load(); });
+load(); loadStatement();
+</script>
+{% endblock %}
