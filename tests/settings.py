@@ -46,8 +46,9 @@ REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': ['rest_framework.authentication.SessionAuthentication'],
 }
 
-PAYSTACK_SECRET_KEY = 'sk_test_0000000000000000000000000000000000000000'
-PAYSTACK_PUBLIC_KEY = 'pk_test_0000000000000000000000000000000000000000'
+# Deliberately NOT shaped like a real key, so secret scanners (GitGuardian etc.) don't flag it.
+PAYSTACK_SECRET_KEY = 'sk_test_dummy-key-for-tests'
+PAYSTACK_PUBLIC_KEY = 'pk_test_dummy-key-for-tests'
 PAYSTACK_MAX_RETRIES = 0
 # Keep tests offline and deterministic; individual tests turn these on.
 WALLET_AUTO_CREATE_PAYSTACK_CUSTOMER = False

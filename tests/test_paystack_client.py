@@ -183,7 +183,8 @@ def test_every_endpoint(rsps, resource, method, args, kwargs, http_method, path)
     result = getattr(getattr(client, resource), method)(*args, **kwargs)
     assert result == {'ok': 1}
     request = rsps.calls[0].request
-    assert request.headers['Authorization'] == 'Bearer sk_test_0000000000000000000000000000000000000000'
+    from django.conf import settings
+    assert request.headers['Authorization'] == f'Bearer {settings.PAYSTACK_SECRET_KEY}'
     if request.body:
         assert None not in json.loads(request.body).values() if isinstance(json.loads(request.body), dict) else True
 

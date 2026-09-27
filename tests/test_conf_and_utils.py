@@ -98,7 +98,8 @@ def test_feature_switches():
 def test_as_dict_masks_secret():
     resolved = wallet_settings.as_dict()
     assert '...' in resolved['PAYSTACK_SECRET_KEY']
-    assert 'sk_test_0000000000000000000000000000000000000000' not in str(resolved)
+    from django.conf import settings
+    assert settings.PAYSTACK_SECRET_KEY not in str(resolved)
 
 
 def test_import_from_reports_bad_path():
