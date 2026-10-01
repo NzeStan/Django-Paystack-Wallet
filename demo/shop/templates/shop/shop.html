@@ -1,0 +1,35 @@
+{% extends 'shop/base.html' %}
+{% block title %}Shop{% endblock %}
+{% block content %}
+<p class="hint">A mini marketplace built on the service layer (see <code>demo/shop/views.py</code>). Paying takes the
+  money from your wallet into <strong>escrow</strong>; the seller is paid when you confirm delivery on the Orders page.
+  The platform keeps a 5% commission (<code>WALLET_PAYMENT_PERCENTAGE_FEE</code>, paid by the seller).</p>
+<div class="grid">
+  {% for product in products %}
+  <div class="card product">
+    <h2>{{ product.name }}</h2>
+    <div class="muted">{{ product.description }}</div>
+    <div class="price">NGN {{ product.price|floatformat:2 }}</div>
+    <div class="muted">Sold by @{{ product.seller.wallet.tag|default:product.seller.username }}</div>
+    {% if product.seller_id != user.pk %}
+    <form method="post" action="{% url 'buy' product.pk %}">{% csrf_token %}
+      {% if require_pin %}<label>Transaction PIN</label><input name="pin" type="password" inputmode="numeric" maxlength="4" required>{% endif %}
+      <button>Buy with wallet</button>
+    </form>
+    {% else %}<p class="muted">This is your product.</p>{% endif %}
+  </div>
+  {% empty %}
+  <div class="card"><p class="muted">No products yet. Run <code>python manage.py seed_demo</code> or list one below.</p></div>
+  {% endfor %}
+</div>
+
+<div class="card" style="margin-top:16px;max-width:480px">
+  <h2>Sell something</h2>
+  <form method="post" action="{% url 'sell' %}">{% csrf_token %}
+    <label>Name</label><input name="name" required>
+    <label>Description</label><input name="description">
+    <label>Price (NGN)</label><input name="price" type="number" min="1" step="0.01" required>
+    <button>List product</button>
+  </form>
+</div>
+{% endblock %}

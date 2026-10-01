@@ -1,649 +1,471 @@
 """
-Fee Calculation Service
+Fee calculation.
 
-Handles all fee calculations for wallet transactions including:
-- Deposit fees (card, DVA, USSD, etc.)
-- Withdrawal/transfer fees
-- Wallet-to-wallet transfer fees
-- Fee bearer logic (customer, merchant, platform, split)
-- Custom fee configurations from database
+Fees are part of the core because every money movement must know exactly how
+much leaves the payer and how much reaches the receiver. *Pricing* is
+pluggable:
+
+* settings-based pricing (defaults mirror Paystack Nigeria's published rates)
+* database pricing via :class:`~wallet.models.FeeConfiguration`
+  (``WALLET_USE_DATABASE_FEE_CONFIG = True``), per wallet or global
+* your own calculator: subclass :class:`FeeCalculator`, override
+  :meth:`FeeCalculator.get_fee` (and/or :meth:`get_default_bearer`) and point
+  ``WALLET_FEE_CALCULATOR`` at it
+
+Bearer semantics are the same for every operation:
+
+============  ===========================================================
+customer      the payer pays the fee on top of the amount
+merchant      the receiver absorbs the fee (it is deducted from what they get)
+platform      the platform absorbs the fee; nobody is charged
+split         shared between payer and receiver (WALLET_FEE_SPLIT_*)
+============  ===========================================================
+
+For each operation the "payer" and "receiver" are:
+
+* deposit    - card/bank payer -> the wallet
+* withdrawal - the wallet -> the bank account
+* transfer   - the sending wallet -> the receiving wallet
+* payment    - the buyer's wallet -> the merchant (wallet or platform)
 """
-
 import logging
 from decimal import Decimal
-from typing import Dict, Optional, Tuple, Any
+
 from djmoney.money import Money
 
-from wallet.settings import get_wallet_setting
+from wallet.conf import wallet_settings
 from wallet.constants import (
-    TRANSACTION_TYPE_DEPOSIT,
-    TRANSACTION_TYPE_WITHDRAWAL,
-    TRANSACTION_TYPE_TRANSFER,
     FEE_BEARER_CUSTOMER,
     FEE_BEARER_MERCHANT,
     FEE_BEARER_PLATFORM,
     FEE_BEARER_SPLIT,
-    PAYMENT_CHANNEL_LOCAL_CARD,
-    PAYMENT_CHANNEL_INTL_CARD,
-    PAYMENT_CHANNEL_DVA,
+    FEE_BEARERS,
+    PAYMENT_CHANNEL_BANK,
     PAYMENT_CHANNEL_BANK_TRANSFER,
+    PAYMENT_CHANNEL_DVA,
+    PAYMENT_CHANNEL_INTL_CARD,
+    PAYMENT_CHANNEL_LOCAL_CARD,
+    PAYMENT_CHANNEL_MOBILE_MONEY,
+    PAYMENT_CHANNEL_QR,
+    PAYMENT_CHANNEL_USSD,
+    TRANSACTION_TYPE_DEPOSIT,
+    TRANSACTION_TYPE_PAYMENT,
+    TRANSACTION_TYPE_TRANSFER,
+    TRANSACTION_TYPE_WITHDRAWAL,
 )
+from wallet.exceptions import InvalidAmount
+from wallet.utils.money import ZERO, quantize, to_decimal
 
 logger = logging.getLogger(__name__)
+
+VALID_BEARERS = {choice for choice, _label in FEE_BEARERS}
+
+SOURCE_DISABLED = 'disabled'
+SOURCE_SETTINGS = 'settings'
+SOURCE_DATABASE = 'database'
+SOURCE_CUSTOM = 'custom'
+
+
+def _dec(value, default='0'):
+    return Decimal(str(value if value is not None else default))
 
 
 class FeeCalculationResult:
     """
-    Result object for fee calculations
-    
-    Attributes:
-        original_amount: The original transaction amount
-        fee_amount: Calculated fee amount
-        net_amount: Amount after fee deduction (amount - fee)
-        total_amount: Total amount to charge (amount + fee for customer bearer)
-        bearer: Who bears the fee
-        customer_pays: Amount customer needs to pay
-        merchant_receives: Amount merchant receives in wallet
-        fee_breakdown: Detailed breakdown of fee calculation
+    Outcome of a fee calculation.
+
+    ``customer_pays`` is what leaves the payer; ``merchant_receives`` is what
+    reaches the receiver. ``total_amount`` / ``net_amount`` are aliases kept for
+    backwards compatibility.
     """
-    
-    def __init__(
-        self,
-        original_amount: Money,
-        fee_amount: Money,
-        bearer: str,
-        transaction_type: str
-    ):
+
+    def __init__(self, original_amount, fee_amount, bearer, transaction_type, payment_channel=None,
+                 source=SOURCE_SETTINGS, configuration=None, details=None, split_ratio=None):
+        currency = original_amount.currency
         self.original_amount = original_amount
-        self.fee_amount = fee_amount
+        self.fee_amount = Money(quantize(fee_amount.amount), currency)
         self.bearer = bearer
         self.transaction_type = transaction_type
-        
-        # Calculate based on bearer
-        self._calculate_amounts()
-    
-    def _calculate_amounts(self):
-        """Calculate all amounts based on bearer logic"""
-        currency = self.original_amount.currency
-        
-        if self.bearer == FEE_BEARER_CUSTOMER:
-            # Customer pays amount + fee
-            self.customer_pays = self.original_amount + self.fee_amount
-            self.merchant_receives = self.original_amount
-            self.net_amount = self.original_amount
-            self.total_amount = self.customer_pays
-            
-        elif self.bearer == FEE_BEARER_MERCHANT:
-            # Merchant receives amount - fee
-            self.customer_pays = self.original_amount
-            self.merchant_receives = self.original_amount - self.fee_amount
-            self.net_amount = self.merchant_receives
-            self.total_amount = self.original_amount
-            
-        elif self.bearer == FEE_BEARER_PLATFORM:
-            # Platform absorbs fee, no change to amounts
-            self.customer_pays = self.original_amount
-            self.merchant_receives = self.original_amount
-            self.net_amount = self.original_amount
-            self.total_amount = self.original_amount
-            
-        elif self.bearer == FEE_BEARER_SPLIT:
-            # Split fee between customer and merchant
-            customer_percentage = get_wallet_setting('FEE_SPLIT_CUSTOMER_PERCENTAGE')
-            merchant_percentage = get_wallet_setting('FEE_SPLIT_MERCHANT_PERCENTAGE')
-            
-            customer_fee = Money(
-                (self.fee_amount.amount * Decimal(customer_percentage) / 100),
-                currency
+        self.payment_channel = payment_channel
+        self.source = source
+        self.configuration = configuration
+        self.details = details or {}
+
+        fee = self.fee_amount.amount
+        customer_fee, merchant_fee = ZERO, ZERO
+        if bearer == FEE_BEARER_CUSTOMER:
+            customer_fee = fee
+        elif bearer == FEE_BEARER_MERCHANT:
+            merchant_fee = fee
+        elif bearer == FEE_BEARER_SPLIT:
+            customer_pct, merchant_pct = split_ratio or (
+                _dec(wallet_settings.FEE_SPLIT_CUSTOMER_PERCENTAGE),
+                _dec(wallet_settings.FEE_SPLIT_MERCHANT_PERCENTAGE),
             )
-            merchant_fee = Money(
-                (self.fee_amount.amount * Decimal(merchant_percentage) / 100),
-                currency
-            )
-            
-            self.customer_pays = self.original_amount + customer_fee
-            self.merchant_receives = self.original_amount - merchant_fee
-            self.net_amount = self.merchant_receives
-            self.total_amount = self.customer_pays
-            
+            customer_fee = quantize(fee * _dec(customer_pct) / 100)
+            merchant_fee = fee - customer_fee
             self.split_details = {
-                'customer_fee': customer_fee,
-                'merchant_fee': merchant_fee,
-                'customer_percentage': customer_percentage,
-                'merchant_percentage': merchant_percentage
+                'customer_fee': Money(customer_fee, currency),
+                'merchant_fee': Money(merchant_fee, currency),
+                'customer_percentage': _dec(customer_pct),
+                'merchant_percentage': _dec(merchant_pct),
             }
-        else:
-            # Default to platform bearer
-            self.customer_pays = self.original_amount
-            self.merchant_receives = self.original_amount
-            self.net_amount = self.original_amount
-            self.total_amount = self.original_amount
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for API responses"""
+
+        self.customer_fee = Money(customer_fee, currency)
+        self.merchant_fee = Money(merchant_fee, currency)
+        self.platform_fee = Money(fee if bearer == FEE_BEARER_PLATFORM else ZERO, currency)
+        self.customer_pays = original_amount + self.customer_fee
+        self.merchant_receives = original_amount - self.merchant_fee
+
+        if self.merchant_receives.amount <= 0:
+            raise InvalidAmount(
+                message=f"Amount {original_amount} is too small to cover the fee of {self.fee_amount}"
+            )
+
+    # Aliases
+    @property
+    def payer_amount(self):
+        return self.customer_pays
+
+    @property
+    def recipient_amount(self):
+        return self.merchant_receives
+
+    @property
+    def total_amount(self):
+        return self.customer_pays
+
+    @property
+    def net_amount(self):
+        return self.merchant_receives
+
+    @property
+    def has_fee(self):
+        return self.fee_amount.amount > 0
+
+    def to_dict(self):
         result = {
-            'original_amount': float(self.original_amount.amount),
-            'fee_amount': float(self.fee_amount.amount),
-            'net_amount': float(self.net_amount.amount),
-            'total_amount': float(self.total_amount.amount),
+            'original_amount': str(self.original_amount.amount),
+            'fee_amount': str(self.fee_amount.amount),
             'currency': str(self.original_amount.currency),
             'bearer': self.bearer,
-            'customer_pays': float(self.customer_pays.amount),
-            'merchant_receives': float(self.merchant_receives.amount),
+            'transaction_type': self.transaction_type,
+            'payment_channel': self.payment_channel,
+            'customer_fee': str(self.customer_fee.amount),
+            'merchant_fee': str(self.merchant_fee.amount),
+            'customer_pays': str(self.customer_pays.amount),
+            'merchant_receives': str(self.merchant_receives.amount),
+            'total_amount': str(self.total_amount.amount),
+            'net_amount': str(self.net_amount.amount),
+            'source': self.source,
         }
-        
         if hasattr(self, 'split_details'):
             result['split_details'] = {
-                'customer_fee': float(self.split_details['customer_fee'].amount),
-                'merchant_fee': float(self.split_details['merchant_fee'].amount),
-                'customer_percentage': self.split_details['customer_percentage'],
-                'merchant_percentage': self.split_details['merchant_percentage'],
+                'customer_fee': str(self.split_details['customer_fee'].amount),
+                'merchant_fee': str(self.split_details['merchant_fee'].amount),
+                'customer_percentage': str(self.split_details['customer_percentage']),
+                'merchant_percentage': str(self.split_details['merchant_percentage']),
             }
-        
         return result
+
+    def __repr__(self):
+        return (
+            f"<FeeCalculationResult {self.transaction_type} amount={self.original_amount} "
+            f"fee={self.fee_amount} bearer={self.bearer}>"
+        )
 
 
 class FeeCalculator:
     """
-    Main fee calculation service
-    
-    Handles all fee calculations with support for:
-    - Percentage fees
-    - Flat fees
-    - Hybrid (percentage + flat) fees
-    - Fee caps
-    - Fee waivers based on thresholds
-    - Multiple bearer models
-    - Database-driven custom configurations
+    Default fee calculator. Subclass and override :meth:`get_fee` for custom pricing.
     """
-    
+
     def __init__(self, wallet=None, user=None):
-        """
-        Initialize fee calculator
-        
-        Args:
-            wallet: Wallet instance (for custom fee lookups)
-            user: User instance (for custom fee lookups)
-        """
         self.wallet = wallet
-        self.user = user or (wallet.user if wallet else None)
-        self.use_database_config = get_wallet_setting('USE_DATABASE_FEE_CONFIG')
-    
-    # ==========================================
-    # PUBLIC METHODS
-    # ==========================================
-    
-    def calculate_deposit_fee(
-        self,
-        amount: Money,
-        payment_channel: str = PAYMENT_CHANNEL_LOCAL_CARD,
-        is_international: bool = False,
-        bearer: Optional[str] = None
-    ) -> FeeCalculationResult:
-        """
-        Calculate fee for deposit transactions
-        
-        Args:
-            amount: Deposit amount
-            payment_channel: Payment channel (card, dva, ussd, etc.)
-            is_international: Whether it's an international transaction
-            bearer: Who bears the fee (customer, merchant, platform, split)
-            
-        Returns:
-            FeeCalculationResult with all calculated amounts
-        """
-        if not get_wallet_setting('ENABLE_FEES'):
-            return self._zero_fee_result(amount, bearer or get_wallet_setting('DEFAULT_FEE_BEARER'))
-        
-        # Check for custom database configuration
-        if self.use_database_config and self.wallet:
-            custom_fee = self._get_database_fee_config(
-                transaction_type=TRANSACTION_TYPE_DEPOSIT,
-                payment_channel=payment_channel
-            )
-            if custom_fee:
-                fee_amount = self._calculate_from_config(amount, custom_fee)
-                return FeeCalculationResult(
-                    amount,
-                    fee_amount,
-                    bearer or custom_fee.get('bearer', get_wallet_setting('DEFAULT_FEE_BEARER')),
-                    TRANSACTION_TYPE_DEPOSIT
-                )
-        
-        # Use settings-based configuration
-        if is_international or payment_channel == PAYMENT_CHANNEL_INTL_CARD:
-            fee_amount = self._calculate_international_card_fee(amount)
-        elif payment_channel == PAYMENT_CHANNEL_DVA:
-            fee_amount = self._calculate_dva_fee(amount)
-        else:
-            # Default to local card/USSD fees
-            fee_amount = self._calculate_local_card_fee(amount)
-        
-        return FeeCalculationResult(
-            amount,
-            fee_amount,
-            bearer or get_wallet_setting('DEFAULT_FEE_BEARER'),
-            TRANSACTION_TYPE_DEPOSIT
-        )
-    
-    def calculate_withdrawal_fee(
-        self,
-        amount: Money,
-        bearer: Optional[str] = None
-    ) -> FeeCalculationResult:
-        """
-        Calculate fee for withdrawal/transfer to bank
-        
-        Uses tiered fee structure based on amount
-        
-        Args:
-            amount: Withdrawal amount
-            bearer: Who bears the fee (usually merchant or platform)
-            
-        Returns:
-            FeeCalculationResult with all calculated amounts
-        """
-        if not get_wallet_setting('ENABLE_FEES') or not get_wallet_setting('ENABLE_TRANSFER_FEES'):
-            return self._zero_fee_result(amount, bearer or get_wallet_setting('DEFAULT_FEE_BEARER'))
-        
-        # Check for custom database configuration
-        if self.use_database_config and self.wallet:
-            custom_fee = self._get_database_fee_config(
-                transaction_type=TRANSACTION_TYPE_WITHDRAWAL
-            )
-            if custom_fee:
-                fee_amount = self._calculate_from_config(amount, custom_fee)
-                return FeeCalculationResult(
-                    amount,
-                    fee_amount,
-                    bearer or custom_fee.get('bearer', FEE_BEARER_MERCHANT),
-                    TRANSACTION_TYPE_WITHDRAWAL
-                )
-        
-        # Use tiered fee structure
-        fee_amount = self._calculate_tiered_transfer_fee(amount)
-        
-        return FeeCalculationResult(
-            amount,
-            fee_amount,
-            bearer or FEE_BEARER_MERCHANT,  # Default: merchant bears withdrawal fees
-            TRANSACTION_TYPE_WITHDRAWAL
-        )
-    
-    def calculate_transfer_fee(
-        self,
-        amount: Money,
-        bearer: Optional[str] = None
-    ) -> FeeCalculationResult:
-        """
-        Calculate fee for wallet-to-wallet transfers
-        
-        Args:
-            amount: Transfer amount
-            bearer: Who bears the fee (sender, receiver, platform, split)
-            
-        Returns:
-            FeeCalculationResult with all calculated amounts
-        """
-        if not get_wallet_setting('ENABLE_FEES') or not get_wallet_setting('ENABLE_INTERNAL_TRANSFER_FEES'):
-            return self._zero_fee_result(amount, bearer or get_wallet_setting('DEFAULT_FEE_BEARER'))
-        
-        # Check for custom database configuration
-        if self.use_database_config and self.wallet:
-            custom_fee = self._get_database_fee_config(
-                transaction_type=TRANSACTION_TYPE_TRANSFER
-            )
-            if custom_fee:
-                fee_amount = self._calculate_from_config(amount, custom_fee)
-                return FeeCalculationResult(
-                    amount,
-                    fee_amount,
-                    bearer or custom_fee.get('bearer', get_wallet_setting('DEFAULT_FEE_BEARER')),
-                    TRANSACTION_TYPE_TRANSFER
-                )
-        
-        # Use settings-based configuration
-        fee_amount = self._calculate_internal_transfer_fee(amount)
-        
-        return FeeCalculationResult(
-            amount,
-            fee_amount,
-            bearer or get_wallet_setting('DEFAULT_FEE_BEARER'),
-            TRANSACTION_TYPE_TRANSFER
-        )
-    
-    def calculate_amount_with_fees(
-        self,
-        amount: Money,
-        transaction_type: str,
-        payment_channel: Optional[str] = None,
-        is_international: bool = False,
-        bearer: Optional[str] = None
-    ) -> FeeCalculationResult:
-        """
-        Calculate total amount including fees
-        
-        This is useful when you want to know how much to charge a customer
-        to ensure a specific amount is credited to the merchant
-        
-        Args:
-            amount: Desired amount to be received
-            transaction_type: Type of transaction
-            payment_channel: Payment channel (for deposits)
-            is_international: Whether international
-            bearer: Who bears the fee
-            
-        Returns:
-            FeeCalculationResult with all calculated amounts
-        """
+        self._user = user
+
+    @property
+    def user(self):
+        """The paying user (loaded lazily - most pricing never needs it)."""
+        if self._user is None and self.wallet is not None:
+            self._user = self.wallet.user
+        return self._user
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def calculate(self, amount, transaction_type, payment_channel=None, is_international=False, bearer=None):
+        amount = self._to_money(amount)
         if transaction_type == TRANSACTION_TYPE_DEPOSIT:
-            return self.calculate_deposit_fee(
-                amount, payment_channel or PAYMENT_CHANNEL_LOCAL_CARD, is_international, bearer
+            if is_international:
+                payment_channel = PAYMENT_CHANNEL_INTL_CARD
+            payment_channel = payment_channel or PAYMENT_CHANNEL_LOCAL_CARD
+
+        if not self.is_enabled(transaction_type, payment_channel):
+            return FeeCalculationResult(
+                amount, Money(ZERO, amount.currency),
+                self.resolve_bearer(bearer, transaction_type, payment_channel), transaction_type,
+                payment_channel, source=SOURCE_DISABLED,
             )
-        elif transaction_type == TRANSACTION_TYPE_WITHDRAWAL:
-            return self.calculate_withdrawal_fee(amount, bearer)
-        elif transaction_type == TRANSACTION_TYPE_TRANSFER:
-            return self.calculate_transfer_fee(amount, bearer)
+
+        fee, source, configuration, details = self.get_fee(amount.amount, transaction_type, payment_channel)
+        chosen_bearer = self.resolve_bearer(bearer, transaction_type, payment_channel, configuration)
+        split_ratio = None
+        if configuration is not None and chosen_bearer == FEE_BEARER_SPLIT:
+            split_ratio = (configuration.customer_percentage, configuration.merchant_percentage)
+
+        # Paystack takes its percentage from the *total* charged, so a
+        # customer-borne deposit fee must be grossed up to leave `amount` intact.
+        if (transaction_type == TRANSACTION_TYPE_DEPOSIT and chosen_bearer == FEE_BEARER_CUSTOMER
+                and wallet_settings.DEPOSIT_FEE_GROSS_UP):
+            fee = self._gross_up(amount.amount, transaction_type, payment_channel)
+            details = {**details, 'grossed_up': True}
+
+        return FeeCalculationResult(
+            amount, Money(fee, amount.currency), chosen_bearer, transaction_type, payment_channel,
+            source=source, configuration=configuration, details=details, split_ratio=split_ratio,
+        )
+
+    # Backwards compatible entry points
+    def calculate_amount_with_fees(self, amount, transaction_type, payment_channel=None, is_international=False,
+                                   bearer=None):
+        return self.calculate(amount, transaction_type, payment_channel, is_international, bearer)
+
+    def calculate_deposit_fee(self, amount, payment_channel=PAYMENT_CHANNEL_LOCAL_CARD, is_international=False,
+                              bearer=None):
+        return self.calculate(amount, TRANSACTION_TYPE_DEPOSIT, payment_channel, is_international, bearer)
+
+    def calculate_withdrawal_fee(self, amount, bearer=None):
+        return self.calculate(amount, TRANSACTION_TYPE_WITHDRAWAL, bearer=bearer)
+
+    def calculate_transfer_fee(self, amount, bearer=None):
+        return self.calculate(amount, TRANSACTION_TYPE_TRANSFER, bearer=bearer)
+
+    def calculate_payment_fee(self, amount, bearer=None):
+        return self.calculate(amount, TRANSACTION_TYPE_PAYMENT, bearer=bearer)
+
+    # ------------------------------------------------------------------
+    # Extension points
+    # ------------------------------------------------------------------
+
+    def is_enabled(self, transaction_type, payment_channel=None):
+        if not wallet_settings.ENABLE_FEES:
+            return False
+        if wallet_settings.USE_DATABASE_FEE_CONFIG and self._database_config(transaction_type, payment_channel):
+            return True
+        flags = {
+            TRANSACTION_TYPE_DEPOSIT: 'ENABLE_DEPOSIT_FEES',
+            TRANSACTION_TYPE_WITHDRAWAL: 'ENABLE_TRANSFER_FEES',
+            TRANSACTION_TYPE_TRANSFER: 'ENABLE_INTERNAL_TRANSFER_FEES',
+            TRANSACTION_TYPE_PAYMENT: 'ENABLE_PAYMENT_FEES',
+        }
+        flag = flags.get(transaction_type)
+        return bool(flag and wallet_settings.get(flag))
+
+    def get_fee(self, amount, transaction_type, payment_channel=None):
+        """
+        Return ``(fee: Decimal, source: str, configuration, details: dict)`` for ``amount`` (Decimal).
+
+        Override this in a subclass to implement your own pricing.
+        """
+        if wallet_settings.USE_DATABASE_FEE_CONFIG:
+            configuration = self._database_config(transaction_type, payment_channel)
+            if configuration is not None:
+                fee = configuration.calculate_fee(amount)
+                return fee, SOURCE_DATABASE, configuration, {'configuration': str(configuration.id)}
+
+        fee = self.settings_fee(amount, transaction_type, payment_channel)
+        return fee, SOURCE_SETTINGS, None, {}
+
+    def get_default_bearer(self, transaction_type, payment_channel=None):
+        per_type = {
+            TRANSACTION_TYPE_DEPOSIT: 'DEPOSIT_FEE_BEARER',
+            TRANSACTION_TYPE_WITHDRAWAL: 'WITHDRAWAL_FEE_BEARER',
+            TRANSACTION_TYPE_TRANSFER: 'TRANSFER_FEE_BEARER',
+            TRANSACTION_TYPE_PAYMENT: 'PAYMENT_FEE_BEARER',
+        }
+        if transaction_type == TRANSACTION_TYPE_DEPOSIT and payment_channel == PAYMENT_CHANNEL_DVA:
+            if wallet_settings.DVA_FEE_BEARER:
+                return wallet_settings.DVA_FEE_BEARER
+        name = per_type.get(transaction_type)
+        return (wallet_settings.get(name) if name else None) or wallet_settings.DEFAULT_FEE_BEARER
+
+    def resolve_bearer(self, bearer, transaction_type, payment_channel=None, configuration=None):
+        if bearer:
+            chosen = bearer
+        elif configuration is not None and configuration.fee_bearer:
+            chosen = configuration.fee_bearer
         else:
-            return self._zero_fee_result(amount, bearer or get_wallet_setting('DEFAULT_FEE_BEARER'))
-    
-    # ==========================================
-    # PRIVATE CALCULATION METHODS
-    # ==========================================
-    
-    def _calculate_local_card_fee(self, amount: Money) -> Money:
-        """
-        Calculate local card/USSD fee (1.5% + NGN 100, capped at NGN 2000)
-        
-        Special rule: NGN 100 waived for transactions under NGN 2500
-        """
-        currency = amount.currency
-        amount_value = amount.amount
-        
-        # Check for educational pricing
-        if get_wallet_setting('ENABLE_EDUCATIONAL_PRICING'):
-            percentage = Decimal(get_wallet_setting('EDUCATIONAL_CARD_PERCENTAGE_FEE')) / 100
-            fee = amount_value * percentage
-            cap = get_wallet_setting('EDUCATIONAL_CARD_FEE_CAP')
-            return Money(min(fee, cap), currency)
-        
-        # Standard pricing
-        percentage = Decimal(get_wallet_setting('LOCAL_CARD_PERCENTAGE_FEE')) / 100
-        flat_fee = Decimal(get_wallet_setting('LOCAL_CARD_FLAT_FEE'))
-        cap = Decimal(get_wallet_setting('LOCAL_CARD_FEE_CAP'))
-        waiver_threshold = Decimal(get_wallet_setting('LOCAL_CARD_FEE_WAIVER_THRESHOLD'))
-        
-        # Calculate base fee
-        percentage_fee = amount_value * percentage
-        
-        # Apply flat fee (unless waived)
-        if amount_value < waiver_threshold:
-            total_fee = percentage_fee  # Flat fee waived
-        else:
-            total_fee = percentage_fee + flat_fee
-        
-        # Apply cap
-        total_fee = min(total_fee, cap)
-        
-        return Money(total_fee, currency)
-    
-    def _calculate_international_card_fee(self, amount: Money) -> Money:
-        """
-        Calculate international card fee (3.9% + NGN 100)
-        """
-        currency = amount.currency
-        amount_value = amount.amount
-        
-        percentage = Decimal(get_wallet_setting('INTL_CARD_PERCENTAGE_FEE')) / 100
-        flat_fee = Decimal(get_wallet_setting('INTL_CARD_FLAT_FEE'))
-        
-        fee = (amount_value * percentage) + flat_fee
-        
-        # Apply cap if set
-        cap = get_wallet_setting('INTL_CARD_FEE_CAP')
-        if cap:
-            fee = min(fee, Decimal(cap))
-        
-        return Money(fee, currency)
-    
-    def _calculate_dva_fee(self, amount: Money) -> Money:
-        """
-        Calculate DVA (Dedicated Virtual Account) fee (1% capped at NGN 300)
-        """
-        currency = amount.currency
-        amount_value = amount.amount
-        
-        percentage = Decimal(get_wallet_setting('DVA_PERCENTAGE_FEE')) / 100
-        flat_fee = Decimal(get_wallet_setting('DVA_FLAT_FEE'))
-        cap = Decimal(get_wallet_setting('DVA_FEE_CAP'))
-        
-        fee = (amount_value * percentage) + flat_fee
-        fee = min(fee, cap)
-        
-        return Money(fee, currency)
-    
-    def _calculate_tiered_transfer_fee(self, amount: Money) -> Money:
-        """
-        Calculate tiered transfer fee based on amount ranges
-        
-        Default tiers (Paystack):
-        - ≤ 5,000: NGN 10
-        - 5,001 - 50,000: NGN 25
-        - > 50,000: NGN 50
-        """
-        currency = amount.currency
-        amount_value = amount.amount
-        
-        tiers = get_wallet_setting('TRANSFER_FEE_TIERS')
-        
+            chosen = self.get_default_bearer(transaction_type, payment_channel)
+        if chosen not in VALID_BEARERS:
+            raise InvalidAmount(message=f"Unknown fee bearer '{chosen}'")
+        return chosen
+
+    # ------------------------------------------------------------------
+    # Settings based pricing
+    # ------------------------------------------------------------------
+
+    def settings_fee(self, amount, transaction_type, payment_channel=None):
+        if transaction_type == TRANSACTION_TYPE_DEPOSIT:
+            return self.deposit_fee(amount, payment_channel)
+        if transaction_type == TRANSACTION_TYPE_WITHDRAWAL:
+            return self.tiered_transfer_fee(amount)
+        if transaction_type == TRANSACTION_TYPE_TRANSFER:
+            return self._percentage_flat_cap(
+                amount, wallet_settings.INTERNAL_TRANSFER_PERCENTAGE_FEE, wallet_settings.INTERNAL_TRANSFER_FLAT_FEE,
+                wallet_settings.INTERNAL_TRANSFER_FEE_CAP,
+            )
+        if transaction_type == TRANSACTION_TYPE_PAYMENT:
+            return self._percentage_flat_cap(
+                amount, wallet_settings.PAYMENT_PERCENTAGE_FEE, wallet_settings.PAYMENT_FLAT_FEE,
+                wallet_settings.PAYMENT_FEE_CAP,
+            )
+        return ZERO
+
+    def deposit_fee(self, amount, payment_channel=None):
+        channel = payment_channel or PAYMENT_CHANNEL_LOCAL_CARD
+        if channel == PAYMENT_CHANNEL_INTL_CARD:
+            return self._percentage_flat_cap(
+                amount, wallet_settings.INTL_CARD_PERCENTAGE_FEE, wallet_settings.INTL_CARD_FLAT_FEE,
+                wallet_settings.INTL_CARD_FEE_CAP,
+            )
+        if channel in (PAYMENT_CHANNEL_DVA, PAYMENT_CHANNEL_BANK_TRANSFER):
+            return self._percentage_flat_cap(
+                amount, wallet_settings.DVA_PERCENTAGE_FEE, wallet_settings.DVA_FLAT_FEE, wallet_settings.DVA_FEE_CAP,
+            )
+        if channel == PAYMENT_CHANNEL_MOBILE_MONEY:
+            return self._percentage_flat_cap(
+                amount, wallet_settings.MOBILE_MONEY_PERCENTAGE_FEE, wallet_settings.MOBILE_MONEY_FLAT_FEE,
+                wallet_settings.MOBILE_MONEY_FEE_CAP,
+            )
+        # Local card, pay-with-bank, USSD, QR
+        if wallet_settings.ENABLE_EDUCATIONAL_PRICING and channel in (
+            PAYMENT_CHANNEL_LOCAL_CARD, PAYMENT_CHANNEL_BANK, PAYMENT_CHANNEL_USSD, PAYMENT_CHANNEL_QR,
+        ):
+            return self._percentage_flat_cap(
+                amount, wallet_settings.EDUCATIONAL_CARD_PERCENTAGE_FEE, 0, wallet_settings.EDUCATIONAL_CARD_FEE_CAP,
+            )
+        threshold = wallet_settings.LOCAL_CARD_FEE_WAIVER_THRESHOLD
+        flat = wallet_settings.LOCAL_CARD_FLAT_FEE
+        if threshold is not None and amount < _dec(threshold):
+            flat = 0
+        return self._percentage_flat_cap(
+            amount, wallet_settings.LOCAL_CARD_PERCENTAGE_FEE, flat, wallet_settings.LOCAL_CARD_FEE_CAP,
+        )
+
+    def tiered_transfer_fee(self, amount):
+        tiers = sorted(
+            wallet_settings.TRANSFER_FEE_TIERS or [],
+            key=lambda tier: (tier.get('max_amount') is None, _dec(tier.get('max_amount') or 0)),
+        )
         for tier in tiers:
             max_amount = tier.get('max_amount')
-            fee = tier.get('fee')
-            
-            if max_amount is None or amount_value <= Decimal(max_amount):
-                return Money(fee, currency)
-        
-        # Fallback (should not reach here if tiers are configured correctly)
-        return Money(50, currency)
-    
-    def _calculate_internal_transfer_fee(self, amount: Money) -> Money:
-        """
-        Calculate wallet-to-wallet transfer fee
-        """
-        currency = amount.currency
-        amount_value = amount.amount
-        
-        percentage = Decimal(get_wallet_setting('INTERNAL_TRANSFER_PERCENTAGE_FEE')) / 100
-        flat_fee = Decimal(get_wallet_setting('INTERNAL_TRANSFER_FLAT_FEE'))
-        
-        fee = (amount_value * percentage) + flat_fee
-        
-        # Apply cap if set
-        cap = get_wallet_setting('INTERNAL_TRANSFER_FEE_CAP')
-        if cap:
-            fee = min(fee, Decimal(cap))
-        
-        return Money(fee, currency)
-    
-    def _calculate_from_config(self, amount: Money, config: Dict) -> Money:
-        """
-        Calculate fee from custom database configuration
-        
-        Args:
-            amount: Transaction amount
-            config: Database fee configuration
-            
-        Returns:
-            Calculated fee amount
-        """
-        currency = amount.currency
-        amount_value = amount.amount
-        
-        fee_type = config.get('fee_type')
-        percentage = Decimal(config.get('percentage_fee', 0)) / 100
-        flat_fee = Decimal(config.get('flat_fee', 0))
-        cap = config.get('fee_cap')
-        
-        if fee_type == 'percentage':
-            fee = amount_value * percentage
-        elif fee_type == 'flat':
-            fee = flat_fee
-        else:  # hybrid
-            fee = (amount_value * percentage) + flat_fee
-        
-        # Apply cap if set
-        if cap:
-            fee = min(fee, Decimal(cap))
-        
-        return Money(fee, currency)
-    
-    def _get_database_fee_config(
-        self,
-        transaction_type: str,
-        payment_channel: Optional[str] = None
-    ) -> Optional[Dict]:
-        """
-        Retrieve custom fee configuration from database
-        
-        This method will be implemented when FeeConfiguration model is available
-        
-        Args:
-            transaction_type: Type of transaction
-            payment_channel: Payment channel (optional)
-            
-        Returns:
-            Fee configuration dict or None
-        """
-        # TODO: Implement database lookup when FeeConfiguration model is ready
-        # For now, return None to fallback to settings
-        try:
-            from wallet.models.fee_config import FeeConfiguration
-            
-            # Try to find specific config for wallet/user
-            config = FeeConfiguration.objects.filter(
-                wallet=self.wallet,
-                transaction_type=transaction_type,
-                payment_channel=payment_channel,
-                is_active=True
-            ).first()
-            
-            if config:
-                return {
-                    'fee_type': config.fee_type,
-                    'percentage_fee': config.percentage_fee,
-                    'flat_fee': config.flat_fee.amount if config.flat_fee else 0,
-                    'fee_cap': config.fee_cap.amount if config.fee_cap else None,
-                    'bearer': config.fee_bearer,
-                }
-            
+            if max_amount is None or amount <= _dec(max_amount):
+                fee = _dec(tier.get('fee', 0))
+                if tier.get('percentage'):
+                    fee += amount * _dec(tier['percentage']) / 100
+                return quantize(fee)
+        return ZERO
+
+    @staticmethod
+    def _percentage_flat_cap(amount, percentage, flat, cap):
+        fee = amount * _dec(percentage) / 100 + _dec(flat)
+        if cap not in (None, '', 0) and fee > _dec(cap):
+            fee = _dec(cap)
+        return quantize(max(fee, ZERO))
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _gross_up(self, amount, transaction_type, payment_channel):
+        """Smallest fee F such that fee(amount + F) <= F (the payer covers the fee on the fee)."""
+        def fee_on(total):
+            return self.get_fee(total, transaction_type, payment_channel)[0]
+
+        total = amount + fee_on(amount)
+        for _ in range(50):
+            needed = amount + fee_on(total)
+            if needed <= total:
+                break
+            total = needed
+        return quantize(total - amount)
+
+    def _database_config(self, transaction_type, payment_channel=None):
+        from wallet.models import FeeConfiguration
+
+        cache = self.__dict__.setdefault('_config_cache', {})
+        key = (transaction_type, payment_channel)
+        if key not in cache:
+            cache[key] = FeeConfiguration.objects.for_transaction(self.wallet, transaction_type, payment_channel)
+        return cache[key]
+
+    def _to_money(self, amount):
+        if isinstance(amount, Money):
+            return Money(to_decimal(amount.amount), amount.currency)
+        currency = self.wallet.currency if self.wallet is not None else wallet_settings.CURRENCY
+        return Money(to_decimal(amount), currency)
+
+    # ------------------------------------------------------------------
+    # Audit
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def record_fee_history(transaction, fee_result):
+        """Store how a transaction's fee was calculated. Never raises."""
+        if fee_result is None or not fee_result.has_fee:
             return None
-            
-        except ImportError:
-            # Model not available yet
-            return None
-    
-    def _zero_fee_result(self, amount: Money, bearer: str) -> FeeCalculationResult:
-        """Return a zero-fee result"""
-        return FeeCalculationResult(
-            amount,
-            Money(0, amount.currency),
-            bearer,
-            TRANSACTION_TYPE_DEPOSIT
-        )
-    
-    def _create_fee_history(
-        self,
-        transaction,
-        fee_result,
-        calculation_method: str = 'settings',
-        config_used=None
-    ):
-        """
-        Create a FeeHistory record for audit trail
-        
-        Args:
-            transaction: Transaction instance
-            fee_result: FeeCalculationResult instance
-            calculation_method: Method used ('settings', 'database', 'custom')
-            config_used: FeeConfiguration instance if database-driven
-        """
+        from wallet.models import FeeHistory
+
         try:
-            from wallet.models.fee_config import FeeHistory
-            
-            # Prepare calculation details
-            calculation_details = {
-                'original_amount': float(fee_result.original_amount.amount),
-                'calculated_fee': float(fee_result.fee_amount.amount),
-                'net_amount': float(fee_result.net_amount.amount),
-                'total_amount': float(fee_result.total_amount.amount),
-                'bearer': fee_result.bearer,
-                'transaction_type': fee_result.transaction_type,
-                'calculation_method': calculation_method,
-                'timestamp': timezone.now().isoformat(),
-            }
-            
-            # Add bearer-specific details
-            if fee_result.bearer == 'split':
-                calculation_details.update({
-                    'customer_pays': float(fee_result.customer_pays.amount),
-                    'merchant_receives': float(fee_result.merchant_receives.amount),
-                    'split_details': fee_result.split_details,
-                })
-            
-            # Create history record
-            FeeHistory.objects.create(
+            return FeeHistory.objects.create(
                 transaction=transaction,
-                configuration_used=config_used,
-                calculation_method=calculation_method,
+                configuration_used=fee_result.configuration,
+                calculation_method=fee_result.source,
                 original_amount=fee_result.original_amount,
                 calculated_fee=fee_result.fee_amount,
                 fee_bearer=fee_result.bearer,
-                calculation_details=calculation_details
+                calculation_details={**fee_result.to_dict(), **{
+                    k: str(v) for k, v in fee_result.details.items()
+                }},
             )
-            
-            logger.debug(
-                f"Created fee history for transaction {transaction.id}: "
-                f"fee={fee_result.fee_amount.amount}, bearer={fee_result.bearer}"
-            )
-            
-        except Exception as e:
-            # Log error but don't fail the transaction
-            logger.error(
-                f"Failed to create fee history for transaction {transaction.id}: {str(e)}",
-                exc_info=True
-            )
+        except Exception:  # pragma: no cover - audit must never break a payment
+            logger.exception("Could not record fee history for transaction %s", transaction.pk)
+            return None
+
+    # Old private name
+    _create_fee_history = record_fee_history
 
 
-# ==========================================
-# CONVENIENCE FUNCTIONS
-# ==========================================
+def get_fee_calculator(wallet=None, user=None):
+    """Instantiate the calculator configured in ``WALLET_FEE_CALCULATOR``."""
+    calculator_class = wallet_settings.import_from('FEE_CALCULATOR') or FeeCalculator
+    return calculator_class(wallet=wallet, user=user)
 
-def calculate_fee(
-    amount: Money,
-    transaction_type: str,
-    payment_channel: Optional[str] = None,
-    is_international: bool = False,
-    bearer: Optional[str] = None,
-    wallet=None,
-    user=None
-) -> FeeCalculationResult:
-    """
-    Convenience function for fee calculation
-    
-    Args:
-        amount: Transaction amount
-        transaction_type: Type of transaction
-        payment_channel: Payment channel (for deposits)
-        is_international: Whether international
-        bearer: Who bears the fee
-        wallet: Wallet instance (optional)
-        user: User instance (optional)
-        
-    Returns:
-        FeeCalculationResult
-    """
-    calculator = FeeCalculator(wallet=wallet, user=user)
-    return calculator.calculate_amount_with_fees(
-        amount, transaction_type, payment_channel, is_international, bearer
+
+def calculate_fee(amount, transaction_type, payment_channel=None, is_international=False, bearer=None, wallet=None,
+                  user=None):
+    """Convenience wrapper around the configured calculator."""
+    return get_fee_calculator(wallet=wallet, user=user).calculate(
+        amount, transaction_type, payment_channel, is_international, bearer,
     )
 
+
+def paystack_channel_to_fee_channel(channel, authorization=None, integration_country=None):
+    """Map a Paystack charge ``channel`` (+ card country) to the channel used for pricing."""
+    country = (integration_country or wallet_settings.COUNTRY or '').upper()
+    channel = (channel or '').lower()
+    if channel == 'card':
+        card_country = ((authorization or {}).get('country_code') or '').upper()
+        if card_country and country and card_country != country:
+            return PAYMENT_CHANNEL_INTL_CARD
+        return PAYMENT_CHANNEL_LOCAL_CARD
+    return {
+        'dedicated_nuban': PAYMENT_CHANNEL_DVA,
+        'bank_transfer': PAYMENT_CHANNEL_BANK_TRANSFER,
+        'ussd': PAYMENT_CHANNEL_USSD,
+        'qr': PAYMENT_CHANNEL_QR,
+        'mobile_money': PAYMENT_CHANNEL_MOBILE_MONEY,
+        'bank': PAYMENT_CHANNEL_BANK,
+    }.get(channel, PAYMENT_CHANNEL_LOCAL_CARD)

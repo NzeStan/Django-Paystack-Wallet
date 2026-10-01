@@ -1,0 +1,50 @@
+{% load static %}<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Wallet demo{% endblock %} · django-paystack-wallet</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='4' fill='%230b8f6a'/></svg>">
+  <link rel="stylesheet" href="{% static 'shop/style.css' %}">
+  <script src="{% static 'shop/app.js' %}"></script>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <span class="logo">Wallet demo</span>
+    {% if user.is_authenticated %}
+      {% with name=request.resolver_match.url_name %}
+      <a href="{% url 'dashboard' %}" class="{% if name == 'dashboard' %}active{% endif %}">Dashboard</a>
+      <a href="{% url 'send' %}" class="{% if name == 'send' %}active{% endif %}">Send</a>
+      <a href="{% url 'withdraw' %}" class="{% if name == 'withdraw' %}active{% endif %}">Withdraw</a>
+      <a href="{% url 'cards' %}" class="{% if name == 'cards' %}active{% endif %}">Cards</a>
+      <a href="{% url 'history' %}" class="{% if name == 'history' %}active{% endif %}">History</a>
+      <a href="{% url 'shop' %}" class="{% if name == 'shop' %}active{% endif %}">Shop</a>
+      <a href="{% url 'orders' %}" class="{% if name == 'orders' %}active{% endif %}">Orders</a>
+      {% endwith %}
+      <span class="right">
+        {% if user.is_staff %}<a href="{% url 'developer' %}">Developer</a><a href="/admin/">Admin</a>{% endif %}
+        <a href="/wallet/api/">API</a>
+        <span class="muted">{{ user.username }}</span>
+        <form method="post" action="{% url 'logout' %}" style="display:inline">{% csrf_token %}
+          <button class="secondary" style="margin:0;padding:5px 10px">Log out</button>
+        </form>
+      </span>
+    {% endif %}
+  </div>
+</header>
+<main class="wrap">
+  {% if paystack_mode == 'missing' %}
+    <div class="banner">Paystack keys are not set. Copy <code>demo/.env.example</code> to <code>demo/.env</code>
+      and add your <strong>test</strong> keys. Wallet-to-wallet features still work.</div>
+  {% elif paystack_mode == 'live' %}
+    <div class="banner"><strong>LIVE Paystack keys detected.</strong> Real money will move. Use test keys for the demo.</div>
+  {% endif %}
+  {% if messages %}
+    <ul class="messages">{% for message in messages %}<li class="{{ message.tags }}">{{ message }}</li>{% endfor %}</ul>
+  {% endif %}
+  {% block content %}{% endblock %}
+</main>
+{% block scripts %}{% endblock %}
+</body>
+</html>

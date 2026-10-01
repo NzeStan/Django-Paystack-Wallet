@@ -1,0 +1,2 @@
+# Installs the wallet package from this repository in editable mode, with all extras
+-e ..[all]

@@ -1,0 +1,2 @@
+{% load i18n %}{% blocktrans with sender=sender_wallet.tag %}You received {{ total_amount }} from {{ sender }}.{% endblocktrans %}
+{% blocktrans %}New balance: {{ balance }}{% endblocktrans %}

@@ -1,33 +1,27 @@
-"""
-Permissions for Django Paystack Wallet
-
-This module provides custom permissions for the wallet API.
-"""
-
+"""Reusable DRF permissions."""
 from rest_framework import permissions
 
 
-class IsWebhookEndpointOwner(permissions.BasePermission):
-    """
-    Permission class to ensure only webhook endpoint owners can modify their endpoints.
-    """
-    
+class IsWalletOwner(permissions.BasePermission):
+    """Object belongs to the requesting user's wallet (works for Wallet and anything with ``.wallet``)."""
+
     def has_object_permission(self, request, view, obj):
-        """
-        Check if the user has permission to access the webhook endpoint.
-        
-        Args:
-            request: The request object
-            view: The view object
-            obj: The webhook endpoint object
-            
-        Returns:
-            True if the user has permission, False otherwise
-        """
-        # Staff users can access all endpoints
+        wallet = obj if hasattr(obj, 'user_id') and not hasattr(obj, 'wallet_id') else getattr(obj, 'wallet', None)
+        return bool(wallet is not None and wallet.user_id == request.user.pk)
+
+
+class HasOperationalWallet(permissions.BasePermission):
+    """The user has a wallet that is active and not locked."""
+
+    message = 'Your wallet is locked or inactive'
+
+    def has_permission(self, request, view):
+        wallet = getattr(request.user, 'wallet', None) if request.user.is_authenticated else None
+        return bool(wallet is not None and wallet.is_operational)
+
+
+class IsWebhookEndpointOwner(permissions.BasePermission):
+    def has_object_permission(self, request, view, obj):
         if request.user.is_staff:
             return True
-        
-        # Check if the endpoint is associated with any of the user's wallets
-        user_wallets = request.user.wallets.all()
-        return obj.wallets.filter(id__in=user_wallets).exists()
+        return obj.wallets.filter(user=request.user).exists()

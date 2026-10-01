@@ -1,45 +1,32 @@
 """
-Management command to sync banks from Paystack
+Sync the Bank table from Paystack.
 
-Usage:
     python manage.py sync_banks
-    python manage.py sync_banks --force
+    python manage.py sync_banks --country ghana --currency GHS
 """
-from django.core.management.base import BaseCommand
-from wallet.utils.bank_sync import sync_banks_from_paystack
+from django.core.management.base import BaseCommand, CommandError
+
+from wallet.exceptions import WalletError
 from wallet.models import Bank
+from wallet.services.bank_account_service import BankAccountService
 
 
 class Command(BaseCommand):
     help = 'Sync banks from Paystack (works with or without Celery)'
 
     def add_arguments(self, parser):
-        parser.add_argument(
-            '--force',
-            action='store_true',
-            help='Force update existing banks',
-        )
+        parser.add_argument('--country', help='Paystack country name, e.g. nigeria, ghana, kenya, south africa')
+        parser.add_argument('--currency', help='Currency code, e.g. NGN, GHS')
+        parser.add_argument('--no-update', action='store_true', help='Only add new banks')
 
     def handle(self, *args, **options):
-        force = options['force']
-        
-        self.stdout.write(
-            self.style.WARNING('Syncing banks from Paystack...')
-        )
-        
         try:
-            created, updated, errors = sync_banks_from_paystack(force_update=force)
-            
-            self.stdout.write(self.style.SUCCESS(
-                f'\n✅ Sync complete!\n'
-                f'   Created: {created}\n'
-                f'   Updated: {updated}\n'
-                f'   Errors:  {errors}\n'
-                f'   Total banks in DB: {Bank.objects.count()}'
-            ))
-            
-        except Exception as e:
-            self.stdout.write(
-                self.style.ERROR(f'❌ Error: {str(e)}')
+            created, updated, errors = BankAccountService().sync_banks(
+                country=options.get('country'), currency=options.get('currency'),
+                force_update=not options['no_update'],
             )
-            raise
+        except WalletError as exc:
+            raise CommandError(exc.message) from exc
+        self.stdout.write(self.style.SUCCESS(
+            f"Created {created}, updated {updated}, errors {errors}. Banks in database: {Bank.objects.count()}"
+        ))

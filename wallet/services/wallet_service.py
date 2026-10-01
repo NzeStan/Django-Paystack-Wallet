@@ -1,1090 +1,257 @@
+"""
+``WalletService`` - one entry point for everything a wallet can do.
+
+It combines the focused services (deposits, withdrawals, transfers, cards,
+bank accounts, customers/DVA, refunds) so application code only needs::
+
+    from wallet.services import WalletService
+
+    service = WalletService()
+    wallet = service.get_wallet(request.user)
+    checkout = service.initialize_deposit(wallet, 5000)
+    service.transfer(wallet, '08031234567', 1500)          # by phone number
+    txn, data = service.withdraw_to_bank(wallet, 2000, bank_account)
+"""
 import logging
-from decimal import Decimal
-from typing import Optional, Dict, Any, Tuple
-from django.db import transaction
+import re
+
+from django.db import IntegrityError, transaction as db_transaction
 from django.utils import timezone
-import time
 from django.utils.translation import gettext_lazy as _
-from djmoney.money import Money
-from wallet.models import Wallet, Transaction, Card, BankAccount, TransferRecipient, Bank
-from wallet.exceptions import (
-    BankAccountError,
-    PaystackAPIError,
-    InsufficientFunds,
-    WalletLocked
-)
-from wallet.services.fee_service import FeeCalculator
+
+from wallet.conf import wallet_settings
 from wallet.constants import (
-    TRANSACTION_TYPE_DEPOSIT,
-    TRANSACTION_TYPE_WITHDRAWAL,
-    TRANSACTION_TYPE_TRANSFER,
-    TRANSACTION_STATUS_PENDING,
+    DIRECTION_CREDIT,
+    DIRECTION_DEBIT,
     TRANSACTION_STATUS_SUCCESS,
-    TRANSACTION_STATUS_FAILED,
-    FEE_BEARER_CUSTOMER, 
-    FEE_BEARER_MERCHANT,
-    PAYMENT_CHANNEL_LOCAL_CARD
+    TRANSACTION_TYPE_DEPOSIT,
+    TRANSACTION_TYPE_FEE,
 )
-from django.db import transaction as db_transaction
-from wallet.settings import get_wallet_setting
-from wallet.services.paystack_service import PaystackService
-from wallet.utils.id_generators import generate_transaction_reference, generate_wallet_tag
+from wallet.exceptions import InvalidPhoneNumber, PaystackAPIError, RecipientError, WalletError
+from wallet.models import Transaction, Wallet
+from wallet.services.bank_account_service import BankAccountService
+from wallet.services.card_service import CardService
+from wallet.services.customer_service import CustomerService
+from wallet.services.deposit_service import DepositService
+from wallet.services.transaction_service import TransactionService
+from wallet.services.transfer_service import TransferService
+from wallet.services.withdrawal_service import WithdrawalService
+from wallet.signals import send_on_commit, wallet_created, wallet_locked, wallet_unlocked
+from wallet.utils.id_generators import generate_random_string, generate_wallet_tag
+from wallet.utils.phone import normalize_phone_number
+
+logger = logging.getLogger('wallet')
+
+_TAG_RE = re.compile(r'^[a-z0-9][a-z0-9_.-]{2,29}$')
 
 
-logger = logging.getLogger(__name__)
+def _resolve_attr(obj, dotted):
+    for part in dotted.split('.'):
+        obj = getattr(obj, part, None)
+        if obj is None:
+            return None
+    return obj
 
 
-class WalletService:
-    """
-    Service layer for wallet operations
-    
-    This service encapsulates all business logic related to wallet operations,
-    including deposits, withdrawals, transfers, and Paystack integrations.
-    
-    """
-    
-    def __init__(self):
-        """Initialize wallet service with Paystack integration"""
-        self.paystack = PaystackService()
-    
-    # ==========================================
-    # WALLET MANAGEMENT
-    # ==========================================
-    
-    def get_wallet(self, user) -> Wallet:
-        """
-        Get or create a wallet for a user
-        
-        This method ensures every user has a wallet and sets up necessary
-        Paystack integrations (customer code, dedicated virtual account).
-        
-        Args:
-            user: User instance
-            
-        Returns:
-            Wallet: User's wallet instance
-            
-        Raises:
-            PaystackAPIError: If Paystack integration fails (non-critical)
-        """
-        wallet, created = Wallet.objects.select_related('user').get_or_create(
-            user=user
-        )
-        
-        if created:
-            # Generate unique wallet tag
-            wallet.tag = generate_wallet_tag(user)
-            wallet.save(update_fields=['tag', 'updated_at'])
-            
-            logger.info(f"Created new wallet {wallet.id} for user {user.id}")
-            
-            # Set up Paystack customer
-            self._setup_paystack_customer(wallet)
-        
-        return wallet
-    
-    def _setup_paystack_customer(self, wallet: Wallet) -> None:
-        """
-        Set up Paystack customer and dedicated account for wallet
-        
-        This is an internal method that handles Paystack customer creation
-        and dedicated virtual account setup. Failures are logged but don't
-        prevent wallet creation.
-        
-        Args:
-            wallet (Wallet): Wallet instance to set up
-        """
+class WalletService(
+    DepositService,
+    WithdrawalService,
+    TransferService,
+    CustomerService,
+    BankAccountService,
+    CardService,
+):
+    """Facade over all wallet operations."""
+
+    # ------------------------------------------------------------------
+    # Wallet lifecycle
+    # ------------------------------------------------------------------
+
+    def get_wallet(self, user):
+        """Return the user's wallet, creating (and provisioning) it if needed."""
+        wallet = Wallet.objects.select_related('user').filter(user=user).first()
+        if wallet is not None:
+            return wallet
+        return self.create_wallet(user)
+
+    def create_wallet(self, user, tag=None, phone_number=None):
+        phone_number = phone_number or self._phone_from_user(user)
         try:
-            # Create Paystack customer
-            customer_data = self.paystack.create_customer(
-                email=wallet.user.email,
-                first_name=getattr(wallet.user, 'first_name', ''),
-                last_name=getattr(wallet.user, 'last_name', ''),
-                phone=getattr(wallet.user, 'phone', None)
-            )
-            
-            if customer_data and 'customer_code' in customer_data:
-                wallet.paystack_customer_code = customer_data['customer_code']
-                wallet.save(update_fields=['paystack_customer_code', 'updated_at'])
-                
-                logger.info(
-                    f"Created Paystack customer {wallet.paystack_customer_code} "
-                    f"for wallet {wallet.id}"
-                )
-                
-                # Create dedicated virtual account
-                self.create_dedicated_account(wallet)
-        
-        except Exception as e:
-            logger.error(
-                f"Error setting up Paystack customer for wallet {wallet.id}: {str(e)}",
-                exc_info=True
-            )
-    
-    def create_dedicated_account(self, wallet: Wallet) -> bool:
-        """
-        Create a dedicated virtual account for a wallet
-        
-        Dedicated accounts allow users to fund their wallets via direct
-        bank transfers to a unique account number.
-        
-        Args:
-            wallet (Wallet): Wallet instance
-            
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        if not wallet.paystack_customer_code:
-            logger.error(
-                f"Cannot create dedicated account for wallet {wallet.id}: "
-                "No Paystack customer code"
-            )
-            return False
-        
-        try:
-            account_data = self.paystack.create_dedicated_account(
-                wallet.paystack_customer_code
-            )
-            
-            if account_data and 'account_number' in account_data:
-                wallet.dedicated_account_number = account_data['account_number']
-                wallet.dedicated_account_bank = account_data.get('bank', {}).get('name')
-                wallet.save(update_fields=[
-                    'dedicated_account_number',
-                    'dedicated_account_bank',
-                    'updated_at'
-                ])
-                
-                logger.info(
-                    f"Created dedicated account {wallet.dedicated_account_number} "
-                    f"for wallet {wallet.id}"
-                )
-                return True
-            
-            logger.warning(
-                f"Incomplete account data received for wallet {wallet.id}: {account_data}"
-            )
-            return False
-        
-        except Exception as e:
-            logger.error(
-                f"Error creating dedicated account for wallet {wallet.id}: {str(e)}",
-                exc_info=True
-            )
-            return False
-    
-    def get_balance(self, wallet: Wallet) -> Money:
-        """
-        Get the current balance of a wallet
-        
-        Args:
-            wallet (Wallet): Wallet instance
-            
-        Returns:
-            Money: Current wallet balance
-        """
-        # Refresh from database to ensure we have the latest balance
-        wallet.refresh_from_db(fields=['balance', 'balance_currency'])
-        return wallet.balance
-    
-    # ==========================================
-    # DEPOSIT OPERATIONS
-    # ==========================================
-    
-    def deposit(
-        self,
-        wallet: Wallet,
-        amount: Decimal,
-        description: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        transaction_reference: Optional[str] = None
-    ) -> Transaction:
-        """
-        Deposit funds into a wallet
-        
-        This method creates a transaction record and updates the wallet balance.
-        Uses a two-phase approach: create transaction first, then update balance
-        in a nested transaction to ensure failed transactions are still recorded.
-        
-        Args:
-            wallet (Wallet): Wallet to deposit into
-            amount (Decimal): Amount to deposit
-            description (str, optional): Transaction description
-            metadata (dict, optional): Additional transaction metadata
-            transaction_reference (str, optional): Custom transaction reference
-            
-        Returns:
-            Transaction: Created transaction record
-            
-        Raises:
-            WalletLocked: If wallet is locked or inactive
-            InvalidAmount: If amount is invalid
-        """
-        if not description:
-            description = _("Deposit to wallet")
-        
-        if not transaction_reference:
-            transaction_reference = generate_transaction_reference()
-        
-        txn = Transaction.objects.create(
-            wallet=wallet,
-            amount=amount,
-            transaction_type=TRANSACTION_TYPE_DEPOSIT,
-            status=TRANSACTION_STATUS_PENDING,
-            description=description,
-            metadata=metadata or {},
-            reference=transaction_reference
-        )
-        
-        logger.info(
-            f"Created deposit transaction {txn.id} for wallet {wallet.id}: "
-            f"amount={amount}, reference={transaction_reference}"
-        )
-        
-        try:
-            # Use atomic block for the balance update
-            with transaction.atomic():
-                # Add funds to wallet
-                wallet.deposit(amount)
-            
-            # Mark transaction as successful
-            txn.status = TRANSACTION_STATUS_SUCCESS
-            txn.completed_at = timezone.now()
-            txn.save(update_fields=['status', 'completed_at', 'updated_at'])
-            
-            logger.info(f"Deposit transaction {txn.id} completed successfully")
-            
-            return txn
-        
-        except Exception as e:
-            # Mark transaction as failed
-            txn.status = TRANSACTION_STATUS_FAILED
-            txn.failed_reason = str(e)
-            txn.save(update_fields=['status', 'failed_reason', 'updated_at'])
-            
-            logger.error(
-                f"Deposit transaction {txn.id} failed: {str(e)}",
-                exc_info=True
-            )
-            
-            # Re-raise the exception
-            raise
-    
-    def initialize_card_charge(
-        self,
-        wallet: Wallet,
-        amount: Decimal,
-        email: Optional[str] = None,
-        reference: Optional[str] = None,
-        callback_url: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        payment_channel: str = PAYMENT_CHANNEL_LOCAL_CARD,  # ✅ NEW
-        is_international: bool = False,  # ✅ NEW
-        fee_bearer: Optional[str] = None  # ✅ NEW
-    ) -> Dict[str, Any]:
-        """
-        Initialize a Paystack card charge
-
-        Creates a PENDING transaction first, then initializes Paystack.
-        """
-
-        # Ensure we have the customer's email
-        email = email or wallet.user.email
-        if not email:
-            raise ValueError(_("Email is required for card charge"))
-
-        # Generate reference if not provided
-        if not reference:
-            reference = generate_transaction_reference()
-
-        # ✅ NEW: Calculate fees
-        fee_calculator = FeeCalculator(wallet=wallet)
-        fee_result = fee_calculator.calculate_deposit_fee(
-            amount=Money(amount, get_wallet_setting('CURRENCY')),
-            payment_channel=payment_channel,
-            is_international=is_international,
-            bearer=fee_bearer
-        )
-
-        # ✅ NEW: Determine charge amount based on fee bearer
-        if fee_result.bearer == FEE_BEARER_CUSTOMER:
-            amount_to_charge = fee_result.total_amount.amount
-        else:
-            amount_to_charge = amount
-
-        # Convert amount to minor units
-        amount_in_minor_unit = int(Decimal(amount_to_charge) * 100)
-
-        # Prepare metadata
-        charge_metadata = metadata.copy() if metadata else {}
-        charge_metadata.update({
-            'wallet_id': str(wallet.id),
-            'user_id': str(wallet.user.id),
-            'transaction_type': 'wallet_deposit',
-            'fee_amount': float(fee_result.fee_amount.amount),  # ✅ NEW
-            'fee_bearer': fee_result.bearer,  # ✅ NEW
-            'original_amount': float(amount),  # ✅ NEW
-        })
-
-        logger.info(
-            f"Initializing card charge for wallet {wallet.id}: "
-            f"amount={amount}, fee={fee_result.fee_amount.amount}, "
-            f"total_charge={amount_to_charge}, bearer={fee_result.bearer}"
-        )
-
-        # ✅ UPDATED: Create transaction with fee data
-        transaction = Transaction.objects.create(
-            wallet=wallet,
-            amount=Money(amount, get_wallet_setting('CURRENCY')),
-            fees=fee_result.fee_amount,  # ✅ NEW
-            fee_bearer=fee_result.bearer,  # ✅ NEW
-            transaction_type=TRANSACTION_TYPE_DEPOSIT,
-            status=TRANSACTION_STATUS_PENDING,
-            description=f"Card deposit of {amount}",
-            metadata=charge_metadata,
-            reference=reference,
-            payment_method='card'
-        )
-
-        logger.info(
-            f"Created PENDING transaction {transaction.id} for card charge: "
-            f"reference={reference}, amount={amount}, fee={fee_result.fee_amount.amount}"
-        )
-
-        try:
-            # Initialize transaction with Paystack
-            charge_data = self.paystack.initialize_transaction(
-                amount=amount_in_minor_unit,
-                email=email,
-                reference=reference,
-                callback_url=callback_url,
-                metadata=charge_metadata
-            )
-
-            logger.info(
-                f"Card charge initialized for wallet {wallet.id}: "
-                f"reference={reference}, authorization_url={charge_data.get('authorization_url')}"
-            )
-
-            # ✅ NEW: return fee breakdown
-            return {
-                **charge_data,
-                'fee_breakdown': fee_result.to_dict(),
-                'transaction_id': str(transaction.id),
-            }
-
-        except Exception as e:
-            transaction.status = TRANSACTION_STATUS_FAILED
-            transaction.failed_reason = f"Paystack initialization failed: {str(e)}"
-            transaction.save(update_fields=['status', 'failed_reason', 'updated_at'])
-
-            logger.error(
-                f"Failed to initialize card charge: {str(e)}",
-                exc_info=True
-            )
-            raise
-
-    
-    # ==========================================
-    # WITHDRAWAL OPERATIONS
-    # ==========================================
-    
-    def withdraw(
-        self,
-        wallet: Wallet,
-        amount: Decimal,
-        description: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        transaction_reference: Optional[str] = None
-    ) -> Transaction:
-        """
-        Withdraw funds from a wallet
-        
-        This method creates a transaction record and updates the wallet balance.
-        Uses a two-phase approach: create transaction first, then update balance
-        in a nested transaction to ensure failed transactions are still recorded.
-        
-        Args:
-            wallet (Wallet): Wallet to withdraw from
-            amount (Decimal): Amount to withdraw
-            description (str, optional): Transaction description
-            metadata (dict, optional): Additional transaction metadata
-            transaction_reference (str, optional): Custom transaction reference
-            
-        Returns:
-            Transaction: Created transaction record
-            
-        Raises:
-            WalletLocked: If wallet is locked or inactive
-            InvalidAmount: If amount is invalid
-            InsufficientFunds: If wallet has insufficient funds
-        """
-        if not description:
-            description = _("Withdrawal from wallet")
-        
-        if not transaction_reference:
-            transaction_reference = generate_transaction_reference()
-        
-        # Create pending transaction (outside the atomic block to persist even on failure)
-        txn = Transaction.objects.create(
-            wallet=wallet,
-            amount=amount,
-            transaction_type=TRANSACTION_TYPE_WITHDRAWAL,
-            status=TRANSACTION_STATUS_PENDING,
-            description=description,
-            metadata=metadata or {},
-            reference=transaction_reference
-        )
-        
-        logger.info(
-            f"Created withdrawal transaction {txn.id} for wallet {wallet.id}: "
-            f"amount={amount}, reference={transaction_reference}"
-        )
-        
-        try:
-            # Use atomic block for the balance update
-            with transaction.atomic():
-                # Remove funds from wallet
-                wallet.withdraw(amount)
-            
-            # Mark transaction as successful
-            txn.status = TRANSACTION_STATUS_SUCCESS
-            txn.completed_at = timezone.now()
-            txn.save(update_fields=['status', 'completed_at', 'updated_at'])
-            
-            logger.info(f"Withdrawal transaction {txn.id} completed successfully")
-            
-            return txn
-        
-        except Exception as e:
-            # Mark transaction as failed
-            txn.status = TRANSACTION_STATUS_FAILED
-            txn.failed_reason = str(e)
-            txn.save(update_fields=['status', 'failed_reason', 'updated_at'])
-            
-            logger.error(
-                f"Withdrawal transaction {txn.id} failed: {str(e)}",
-                exc_info=True
-            )
-            
-            # Re-raise the exception
-            raise
-
-    def withdraw_to_bank(
-        self,
-        wallet: Wallet,
-        amount: Decimal,
-        bank_account: BankAccount,
-        reason: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        reference: Optional[str] = None,
-        fee_bearer: Optional[str] = None  # ✅ NEW
-    ) -> Tuple[Transaction, Dict[str, Any]]:
-        """
-        Withdraw funds from wallet to a bank account
-        
-        This initiates a bank transfer via Paystack and creates a withdrawal
-        transaction. The method follows a two-phase approach:
-        1. Create transaction in PENDING status
-        2. Call Paystack API
-        3a. If successful: Withdraw from wallet and update transaction
-        3b. If failed: Mark transaction as failed (don't touch wallet balance)
-        
-        Args:
-            wallet (Wallet): Wallet to withdraw from
-            amount (Decimal): Amount to withdraw
-            bank_account (BankAccount): Bank account to send funds to
-            reason (str, optional): Reason for withdrawal
-            metadata (dict, optional): Additional metadata
-            reference (str, optional): Custom transaction reference
-            fee_bearer (str, optional): Who bears the withdrawal fee (NEW)
-            
-        Returns:
-            Tuple[Transaction, Dict]: (transaction, paystack_response)
-            
-        Raises:
-            BankAccountError: If bank account is invalid
-            InsufficientFunds: If wallet has insufficient funds
-            WalletLocked: If wallet is locked
-            PaystackAPIError: If Paystack API call fails
-        """
-        # Validate bank account
-        if not bank_account:
-            raise BankAccountError(_("Bank account is required"))
-        
-        if bank_account.wallet_id != wallet.id:
-            raise BankAccountError(
-                _("Bank account does not belong to this wallet")
-            )
-        
-        if not bank_account.is_active:
-            raise BankAccountError(_("Bank account is not active"))
-        
-        if not bank_account.paystack_recipient_code:
-            raise BankAccountError(
-                _("Bank account is not configured for withdrawals. "
-                  "Missing recipient code.")
-            )
-        
-        # Validate amount
-        if amount <= 0:
-            raise ValueError(_("Amount must be greater than zero"))
-        
-        # ✅ NEW: Calculate withdrawal fee
-        fee_calculator = FeeCalculator(wallet=wallet)
-        fee_result = fee_calculator.calculate_withdrawal_fee(
-            amount=Money(amount, wallet.balance.currency),
-            bearer=fee_bearer or FEE_BEARER_MERCHANT  # Default: merchant pays withdrawal fee
-        )
-        
-        # ✅ NEW: Calculate total amount to deduct from wallet
-        if fee_result.bearer == FEE_BEARER_MERCHANT:
-            # Merchant pays fee, deduct amount + fee
-            total_debit = amount + fee_result.fee_amount.amount
-        elif fee_result.bearer == FEE_BEARER_CUSTOMER:
-            # In withdrawal context, "customer" is the wallet owner
-            total_debit = amount + fee_result.fee_amount.amount
-        else:
-            # Platform pays fee, only deduct amount
-            total_debit = amount
-        
-        logger.info(
-            f"Processing withdrawal for wallet {wallet.id}: "
-            f"amount={amount}, fee={fee_result.fee_amount.amount}, "
-            f"total_debit={total_debit}, bearer={fee_result.bearer}"
-        )
-        
-        # Check if wallet has sufficient funds (before creating transaction)
-        if wallet.balance < Money(total_debit, wallet.balance.currency):  # ✅ UPDATED: use total_debit
-            raise InsufficientFunds(
-                _("Insufficient funds. Available: {}, Required: {}").format(
-                    wallet.balance,
-                    Money(total_debit, wallet.balance.currency)  # ✅ UPDATED: use total_debit
-                )
-            )
-        
-        # Check if wallet is active and not locked
-        if not wallet.is_active:
-            raise WalletLocked(_("Wallet is not active"))
-        
-        metadata = metadata if isinstance(metadata, dict) else {}
-        
-        # Generate reference if not provided
-        if not reference:
-            reference = generate_transaction_reference()
-        
-        if not reason:
-            reason = "Bank withdrawal"
-        
-        # Convert amount to minor units for Paystack
-        amount_in_minor_unit = int(Decimal(amount) * 100)
-
-        # Extract IP and User-Agent from metadata (if present)
-        ip_address = metadata.get('ip_address') or None
-        user_agent = metadata.get('user_agent') or None
-        
-        # ✅ UPDATED: Create withdrawal transaction in PENDING status with fee
-        txn = Transaction.objects.create(
-            wallet=wallet,
-            amount=Money(amount, wallet.balance.currency),
-            fees=fee_result.fee_amount,  # ✅ NEW: Store fee
-            fee_bearer=fee_result.bearer,  # ✅ NEW: Store bearer
-            transaction_type=TRANSACTION_TYPE_WITHDRAWAL,
-            status=TRANSACTION_STATUS_PENDING,
-            description=reason,
-            metadata=metadata or {},
-            reference=reference,
-            recipient_bank_account=bank_account,
-            ip_address=ip_address, 
-            user_agent=user_agent
-        )
-        
-        logger.info(
-            f"Created pending withdrawal transaction {txn.id} for wallet {wallet.id}: "
-            f"amount={amount}, bank_account={bank_account.id}, "
-            f"reference={reference}, fee={fee_result.fee_amount.amount}"  # ✅ UPDATED: log fee
-        )
-        
-        try:
-            # Initiate Paystack transfer
-            logger.info(
-                f"Calling Paystack API to initiate transfer for transaction {txn.id}"
-            )
-            
-            transfer_data = self.paystack.initiate_transfer(
-                amount=amount_in_minor_unit,
-                recipient_code=bank_account.paystack_recipient_code,
-                reason=reason,
-                reference=reference
-            )
-            
-            logger.info(
-                f"Paystack transfer initiated for transaction {txn.id}: "
-                f"transfer_code={transfer_data.get('transfer_code')}, "
-                f"status={transfer_data.get('status')}"
-            )
-            
-            # Store the transfer code in paystack_reference
-            transfer_code = transfer_data.get('transfer_code')
-            if not transfer_code:
-                raise PaystackAPIError(
-                    "Paystack did not return a transfer code"
-                )
-            
-            # Check if OTP is required
-            requires_otp = transfer_data.get('requires_otp', False)
-            transfer_status = transfer_data.get('status', 'pending')
-            
-            if requires_otp or transfer_status == 'otp':
-                # OTP is required - keep transaction in PENDING
-                # Don't withdraw from wallet yet
-                txn.paystack_reference = transfer_code
-                txn.paystack_response = transfer_data
-                txn.save(update_fields=[
-                    'paystack_reference',
-                    'paystack_response',
-                    'updated_at'
-                ])
-                
-                logger.info(
-                    f"Transaction {txn.id} requires OTP verification. "
-                    f"Wallet balance not yet withdrawn."
-                )
-                
-                return txn, transfer_data
-            
-            # Transfer was successful without OTP - proceed with withdrawal
-            # Use atomic block for wallet balance update
             with db_transaction.atomic():
-                # Lock the wallet row to prevent race conditions
-                locked_wallet = Wallet.objects.select_for_update().get(id=wallet.id)
-                
-                # ✅ UPDATED: Withdraw total_debit (amount + fee if merchant pays)
-                locked_wallet.withdraw(Money(total_debit, wallet.balance.currency))
-            
-            # Update transaction as successful 
-            txn.paystack_reference = transfer_code
-            txn.paystack_response = transfer_data
-            txn.status = TRANSACTION_STATUS_SUCCESS
-            txn.completed_at = timezone.now()
-            txn.save(update_fields=[
-                'paystack_reference',
-                'paystack_response',
-                'status',
-                'completed_at',
-                'updated_at'
-            ])
-            
-            logger.info(
-                f"Withdrawal transaction {txn.id} completed successfully without OTP"
-            )
-            
-            return txn, transfer_data
-        
-        except PaystackAPIError as e:
-            # Paystack API call failed - mark transaction as failed
-            txn.status = TRANSACTION_STATUS_FAILED
-            txn.failed_reason = str(e)
-            txn.save(update_fields=['status', 'failed_reason', 'updated_at'])
-            
-            logger.error(
-                f"Paystack API error for transaction {txn.id}: {str(e)}",
-                exc_info=True
-            )
-            
-            # Re-raise the exception
-            raise
-        
-        except Exception as e:
-            # Any other error - mark transaction as failed
-            txn.status = TRANSACTION_STATUS_FAILED
-            txn.failed_reason = str(e)
-            txn.save(update_fields=['status', 'failed_reason', 'updated_at'])
-            
-            # ✅ UPDATED: Refund wallet if debited
-            try:
-                wallet.deposit(Money(total_debit, wallet.balance.currency))
-                logger.info(f"Refunded wallet {wallet.id} after withdrawal failure")
-            except Exception as refund_error:
-                logger.error(f"Failed to refund wallet after withdrawal failure: {refund_error}")
-            
-            logger.error(
-                f"Error processing withdrawal transaction {txn.id}: {str(e)}",
-                exc_info=True
-            )
-            
-            # Re-raise the exception
-            raise
-    
-    
-    # ==========================================
-    # TRANSFER OPERATIONS
-    # ==========================================
-    
-    @transaction.atomic
-    def transfer(
-        self,
-        source_wallet: Wallet,
-        destination_wallet: Wallet,
-        amount: Decimal,
-        description: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        transaction_reference: Optional[str] = None
-    ) -> Transaction:
-        """
-        Transfer funds between wallets
-        
-        This creates a transfer transaction and moves funds from source to
-        destination wallet. The operation is atomic - either both wallets
-        are updated or neither is.
-        
-        Args:
-            source_wallet (Wallet): Wallet to transfer from
-            destination_wallet (Wallet): Wallet to transfer to
-            amount (Decimal): Amount to transfer
-            description (str, optional): Transfer description
-            metadata (dict, optional): Additional metadata
-            transaction_reference (str, optional): Transaction reference
-            
-        Returns:
-            Transaction: Created transaction record
-            
-        Raises:
-            WalletLocked: If either wallet is locked or inactive
-            InvalidAmount: If amount is invalid
-            InsufficientFunds: If source wallet has insufficient funds
-            ValueError: If source and destination wallets are the same
-        """
-        if source_wallet.id == destination_wallet.id:
-            raise ValueError(_("Cannot transfer to the same wallet"))
-        
-        # Default description
-        if not description:
-            destination_user = getattr(destination_wallet.user, 'email', str(destination_wallet.user))
-            description = _("Transfer to {recipient}").format(recipient=destination_user)
-        
-        if not transaction_reference:
-            transaction_reference = generate_transaction_reference()
-        
-        # Create pending transaction
-        txn = Transaction.objects.create(
-            wallet=source_wallet,
-            recipient_wallet=destination_wallet,
-            amount=amount,
-            transaction_type=TRANSACTION_TYPE_TRANSFER,
-            status=TRANSACTION_STATUS_PENDING,
-            description=description,
-            metadata=metadata or {},
-            reference=transaction_reference
-        )
-        
-        logger.info(
-            f"Created transfer transaction {txn.id}: "
-            f"from_wallet={source_wallet.id}, to_wallet={destination_wallet.id}, "
-            f"amount={amount}, reference={transaction_reference}"
-        )
-        
-        try:
-            # Execute transfer
-            source_wallet.transfer(destination_wallet, amount, description)
-            
-            # Mark transaction as successful
-            txn.status = TRANSACTION_STATUS_SUCCESS
-            txn.completed_at = timezone.now()
-            txn.save(update_fields=['status', 'completed_at', 'updated_at'])
-            
-            logger.info(f"Transfer transaction {txn.id} completed successfully")
-            
-            return txn
-        
-        except Exception as e:
-            # Mark transaction as failed
-            txn.status = TRANSACTION_STATUS_FAILED
-            txn.failed_reason = str(e)
-            txn.save(update_fields=['status', 'failed_reason', 'updated_at'])
-            
-            logger.error(
-                f"Transfer transaction {txn.id} failed: {str(e)}",
-                exc_info=True
-            )
-            
-            # Re-raise the exception
-            raise
-    
-    # ==========================================
-    # CARD OPERATIONS
-    # ==========================================
-    
-    def charge_saved_card(
-        self,
-        card: Card,
-        amount: Decimal,
-        reference: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """
-        Charge a saved card
-        
-        This charges a previously saved card using its authorization code.
-        Useful for recurring payments or quick checkouts.
-        
-        Args:
-            card (Card): Card to charge
-            amount (Decimal): Amount to charge
-            reference (str, optional): Transaction reference
-            metadata (dict, optional): Additional metadata
-            
-        Returns:
-            dict: Charge response data from Paystack
-            
-        Raises:
-            PaystackAPIError: If charge fails
-        """
-        # Generate reference if not provided
-        if not reference:
-            reference = generate_transaction_reference()
-        
-        # Convert amount to minor units
-        amount_in_minor_unit = int(Decimal(amount) * 100)
-        
-        # Prepare metadata
-        charge_metadata = metadata.copy() if metadata else {}
-        charge_metadata.update({
-            'wallet_id': str(card.wallet.id),
-            'user_id': str(card.wallet.user.id),
-            'card_id': str(card.id)
-        })
-        
-        # Get email for the charge
-        email = card.email or card.wallet.user.email
-        
-        logger.info(
-            f"Charging saved card {card.id} for wallet {card.wallet.id}: "
-            f"amount={amount}, reference={reference}"
-        )
-        
-        # Charge the card via Paystack
-        charge_data = self.paystack.charge_authorization(
-            amount=amount_in_minor_unit,
-            email=email,
-            authorization_code=card.paystack_authorization_code,
-            reference=reference,
-            metadata=charge_metadata
-        )
-        
-        logger.info(
-            f"Card {card.id} charged: reference={reference}, "
-            f"status={charge_data.get('status')}"
-        )
-        
-        return charge_data
-    
-    # ==========================================
-    # BANK ACCOUNT OPERATIONS
-    # ==========================================
-    
-    def list_banks(self) -> list:
-        """
-        List available banks
-        
-        Returns:
-            list: List of bank dictionaries from Paystack
-        """
-        return self.paystack.list_banks()
-    
-    def verify_bank_account(
-        self,
-        account_number: str,
-        bank_code: str
-    ) -> Dict[str, Any]:
-        """
-        Verify bank account details
-        
-        Args:
-            account_number (str): Account number
-            bank_code (str): Bank code
-            
-        Returns:
-            dict: Account verification data
-            
-        Raises:
-            PaystackAPIError: If verification fails
-        """
-        return self.paystack.resolve_account_number(account_number, bank_code)
-    
-    @transaction.atomic
-    def add_bank_account(
-        self,
-        wallet: Wallet,
-        bank_code: str,
-        account_number: str,
-        account_name: Optional[str] = None,
-        account_type: Optional[str] = None,
-        bvn: Optional[str] = None
-    ) -> BankAccount:
-        """
-        Add a bank account to a wallet
-        
-        This verifies the account with Paystack, creates a transfer recipient,
-        and stores the bank account details.
-        
-        Args:
-            wallet (Wallet): Wallet to add account to
-            bank_code (str): Bank code
-            account_number (str): Account number
-            account_name (str, optional): Account holder name
-            account_type (str, optional): Account type
-            bvn (str, optional): Bank Verification Number
-            
-        Returns:
-            BankAccount: Created bank account instance
-            
-        Raises:
-            BankAccountError: If account verification or creation fails
-        """
-        # Verify account details if name not provided
-        if not account_name:
-            try:
-                account_data = self.verify_bank_account(account_number, bank_code)
-                account_name = account_data.get('account_name')
-                
-                if not account_name:
-                    raise BankAccountError("Could not verify account name")
-            
-            except Exception as e:
-                logger.error(f"Account verification failed: {str(e)}")
-                raise BankAccountError(f"Account verification failed: {str(e)}")
-        
-        # Get bank details
-        try:
-            bank = Bank.objects.get(code=bank_code)
-        except Bank.DoesNotExist:
-            raise BankAccountError(f"Bank with code {bank_code} not found")
-        
-        # Prepare data for bank account creation
-        bank_account_data = {
-            'wallet': wallet,
-            'bank': bank,
-            'account_number': account_number,
-            'account_name': account_name,
-            'is_verified': True,
-            'bvn': bvn
-        }
-        
-        # Only add account_type if it's provided (otherwise use model default)
-        if account_type:
-            bank_account_data['account_type'] = account_type
-        
-        # Create bank account
-        bank_account = BankAccount.objects.create(**bank_account_data)
-        
-        logger.info(
-            f"Created bank account {bank_account.id} for wallet {wallet.id}: "
-            f"{bank.name} - {account_number}"
-        )
-        
-        # Create Paystack transfer recipient
-        try:
-            recipient_data = self.paystack.create_transfer_recipient(
-                account_type='nuban',
-                account_number=account_number,
-                bank_code=bank_code,
-                name=account_name,
-                currency=get_wallet_setting('CURRENCY')
-            )
-            
-            if recipient_data and 'recipient_code' in recipient_data:
-                # Save recipient code to bank account
-                bank_account.paystack_recipient_code = recipient_data['recipient_code']
-                bank_account.paystack_recipient_data = recipient_data
-                bank_account.save(update_fields=[
-                    'paystack_recipient_code',
-                    'paystack_recipient_data',
-                    'updated_at'
-                ])
-                
-                # Also create TransferRecipient record
-                TransferRecipient.objects.create(
-                    wallet=wallet,
-                    recipient_code=recipient_data['recipient_code'],
-                    type='nuban',
-                    name=account_name,
-                    account_number=account_number,
-                    bank_code=bank_code,
-                    bank_name=bank.name,
-                    currency=get_wallet_setting('CURRENCY'),
-                    paystack_data=recipient_data,
-                    description=recipient_data.get('description', ''),
-                    metadata=recipient_data.get('metadata', {}),
-                    email=wallet.user.email
+                wallet = Wallet.objects.create(
+                    user=user,
+                    tag=self._unique_tag(tag or generate_wallet_tag(user)),
+                    phone_number=self._available_phone(phone_number),
                 )
-                
-                logger.info(
-                    f"Created transfer recipient for bank account {bank_account.id}: "
-                    f"{recipient_data['recipient_code']}"
-                )
-        
-        except Exception as e:
-            logger.error(
-                f"Error creating transfer recipient for bank account {bank_account.id}: {str(e)}",
-                exc_info=True
-            )
-            # Continue anyway - we can create recipient later
-        
-        # Set as default if this is the first account
-        if wallet.bank_accounts.count() == 1:
-            bank_account.set_as_default()
-        
-        return bank_account
-    
-    # ==========================================
-    # TRANSACTION HISTORY
-    # ==========================================
-    
-    def get_transaction_history(
-        self,
-        wallet: Wallet,
-        transaction_type: Optional[str] = None,
-        status: Optional[str] = None,
-        start_date: Optional[Any] = None,
-        end_date: Optional[Any] = None
-    ):
-        """
-        Get transaction history for a wallet
-        
-        This method provides filtered access to a wallet's transaction history
-        with query optimization using select_related and prefetch_related.
-        
-        Args:
-            wallet (Wallet): Wallet instance
-            transaction_type (str, optional): Filter by transaction type
-            status (str, optional): Filter by status
-            start_date (datetime, optional): Filter by start date
-            end_date (datetime, optional): Filter by end date
-            
-        Returns:
-            QuerySet: Filtered and optimized transaction queryset
-        """
-        # Start with optimized base query
-        transactions = Transaction.objects.filter(wallet=wallet).select_related(
-            'wallet__user',
-            'recipient_wallet__user',
-            'recipient_bank_account__bank',
-            'card'
+        except IntegrityError:
+            # Created concurrently by another request
+            return Wallet.objects.select_related('user').get(user=user)
+
+        send_on_commit(wallet_created, sender=Wallet, wallet=wallet)
+        self._provision(wallet)
+        return wallet
+
+    def _provision(self, wallet):
+        """Create the Paystack customer/DVA after commit. Failures never block wallet creation."""
+        if not (wallet_settings.AUTO_CREATE_PAYSTACK_CUSTOMER and wallet_settings.PAYSTACK_SECRET_KEY):
+            return
+        wallet_pk = wallet.pk
+        create_dva = wallet_settings.AUTO_CREATE_DEDICATED_ACCOUNT and wallet_settings.ENABLE_DEDICATED_ACCOUNTS
+
+        def _run():
+            if wallet_settings.USE_CELERY:
+                from wallet.tasks import setup_paystack_customer_task
+                setup_paystack_customer_task.delay(str(wallet_pk), create_dva)
+                return
+            self.provision_wallet(Wallet.objects.get(pk=wallet_pk), create_dva)
+
+        db_transaction.on_commit(_run)
+
+    def provision_wallet(self, wallet, create_dedicated_account=False):
+        try:
+            self.ensure_customer(wallet)
+            if create_dedicated_account and not wallet.dedicated_account_number:
+                self.create_dedicated_account(wallet)
+        except (PaystackAPIError, WalletError) as exc:
+            logger.warning("Paystack provisioning for wallet %s failed: %s", wallet.pk, exc)
+        return wallet
+
+    @staticmethod
+    def _unique_tag(base):
+        base = re.sub(r'[^a-z0-9_.-]', '', str(base).lower())[:24] or 'wallet'
+        if len(base) < 3:
+            base = f"{base}{generate_random_string(4).lower()}"
+        candidate = base
+        for _attempt in range(20):
+            if not Wallet.objects.filter(tag__iexact=candidate).exists():
+                return candidate
+            candidate = f"{base}{generate_random_string(4, include_uppercase=False)}"
+        return f"{base}{generate_random_string(8).lower()}"
+
+    @staticmethod
+    def _phone_from_user(user):
+        field = wallet_settings.USER_PHONE_FIELD
+        return _resolve_attr(user, field) if field else None
+
+    @staticmethod
+    def _available_phone(phone_number):
+        if not phone_number:
+            return None
+        try:
+            normalized = normalize_phone_number(phone_number)
+        except InvalidPhoneNumber:
+            logger.warning("Ignoring invalid phone number on user profile: %r", phone_number)
+            return None
+        if Wallet.objects.filter(phone_number=normalized).exists():
+            logger.warning("Phone number %s already belongs to another wallet", normalized)
+            return None
+        return normalized
+
+    # ------------------------------------------------------------------
+    # Identity (tag & phone used for receiving transfers)
+    # ------------------------------------------------------------------
+
+    def set_phone_number(self, wallet, phone_number):
+        """Attach a phone number (normalised to E.164) so others can send money to it."""
+        if not phone_number:
+            wallet.phone_number = None
+        else:
+            normalized = normalize_phone_number(phone_number)
+            if Wallet.objects.filter(phone_number=normalized).exclude(pk=wallet.pk).exists():
+                raise RecipientError(_("This phone number is already linked to another wallet"))
+            wallet.phone_number = normalized
+        wallet.save(update_fields=['phone_number', 'updated_at'])
+        return wallet
+
+    def set_tag(self, wallet, tag):
+        tag = str(tag or '').strip().lstrip('@').lower()
+        if not _TAG_RE.match(tag):
+            raise RecipientError(_("Tags are 3-30 characters: letters, digits, '.', '-' or '_'"))
+        if Wallet.objects.filter(tag__iexact=tag).exclude(pk=wallet.pk).exists():
+            raise RecipientError(_("This tag is already taken"))
+        wallet.tag = tag
+        wallet.save(update_fields=['tag', 'updated_at'])
+        return wallet
+
+    # ------------------------------------------------------------------
+    # Status
+    # ------------------------------------------------------------------
+
+    def lock_wallet_account(self, wallet, reason='', performed_by=None):
+        wallet.lock(reason)
+        self.audit('wallet.lock', performed_by, wallet=wallet.pk, reason=reason)
+        send_on_commit(wallet_locked, sender=Wallet, wallet=wallet, reason=reason)
+        return wallet
+
+    def unlock_wallet_account(self, wallet, performed_by=None):
+        wallet.unlock()
+        self.audit('wallet.unlock', performed_by, wallet=wallet.pk)
+        send_on_commit(wallet_unlocked, sender=Wallet, wallet=wallet)
+        return wallet
+
+    def get_balance(self, wallet):
+        return wallet.refresh_balance()
+
+    # ------------------------------------------------------------------
+    # History
+    # ------------------------------------------------------------------
+
+    def get_transaction_history(self, wallet, transaction_type=None, status=None, start_date=None, end_date=None,
+                                direction=None):
+        return TransactionService(paystack=self.paystack).list_transactions(
+            wallet=wallet, status=status, transaction_type=transaction_type, direction=direction,
+            start_date=start_date, end_date=end_date,
         )
-        
-        # Apply filters
-        if transaction_type:
-            transactions = transactions.filter(transaction_type=transaction_type)
-        
-        if status:
-            transactions = transactions.filter(status=status)
-        
-        if start_date:
-            transactions = transactions.filter(created_at__gte=start_date)
-        
-        if end_date:
-            transactions = transactions.filter(created_at__lte=end_date)
-        
-        # Order by most recent first
-        return transactions.order_by('-created_at')
+
+    def get_statement(self, wallet, start_date=None, end_date=None):
+        """Posted ledger entries (those that changed the balance) in chronological order."""
+        return Transaction.objects.filter(wallet=wallet, ledger_sequence__isnull=False).in_date_range(
+            start_date, end_date,
+        ).order_by('ledger_sequence')
+
+    # ------------------------------------------------------------------
+    # Backwards-compatible helpers
+    # ------------------------------------------------------------------
+
+    def deposit(self, wallet, amount, description=None, metadata=None, transaction_reference=None):
+        """
+        Credit a wallet directly (no Paystack) - for bonuses, cash-back,
+        manual top-ups by staff, etc.
+        """
+        return self.credit_wallet(wallet, amount, description=description, metadata=metadata,
+                                  reference=transaction_reference)
+
+    def withdraw(self, wallet, amount, description=None, metadata=None, transaction_reference=None):
+        """Debit a wallet directly (no Paystack) - e.g. a platform charge."""
+        return self.debit_wallet(wallet, amount, description=description, metadata=metadata,
+                                 reference=transaction_reference)
+
+    def credit_wallet(self, wallet, amount, description=None, metadata=None, reference=None,
+                      transaction_type=None):
+        amount = wallet.validate_amount(amount)
+        reference = self.validate_reference(reference) or None
+        with db_transaction.atomic():
+            balance = wallet.credit(amount)
+            txn = Transaction.objects.create(
+                wallet=wallet, amount=amount, total_amount=amount, balance_after=balance,
+                transaction_type=transaction_type or TRANSACTION_TYPE_DEPOSIT, direction=DIRECTION_CREDIT,
+                status=TRANSACTION_STATUS_SUCCESS, completed_at=timezone.now(), reference=reference or '',
+                description=description or str(_("Wallet credit")), metadata=metadata or {},
+            )
+        self.after_credit(wallet)
+        return txn
+
+    def debit_wallet(self, wallet, amount, description=None, metadata=None, reference=None, transaction_type=None):
+        amount = wallet.validate_amount(amount)
+        reference = self.validate_reference(reference) or None
+        with db_transaction.atomic():
+            balance = wallet.debit(amount)
+            return Transaction.objects.create(
+                wallet=wallet, amount=amount, total_amount=amount, balance_after=balance,
+                transaction_type=transaction_type or TRANSACTION_TYPE_FEE, direction=DIRECTION_DEBIT,
+                status=TRANSACTION_STATUS_SUCCESS, completed_at=timezone.now(), reference=reference or '',
+                description=description or str(_("Wallet debit")), metadata=metadata or {},
+            )
+
+    def list_banks(self, country=None, currency=None):
+        return BankAccountService.list_banks(self, country, currency)

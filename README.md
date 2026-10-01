@@ -1,176 +1,185 @@
 # Django Paystack Wallet
 
-A sophisticated Django wallet system integrated with Paystack payment gateway.
+A pluggable, production-grade wallet for Django, backed by [Paystack](https://paystack.com).
+Drop it into an e-commerce site, marketplace, fintech or any app that needs users to hold,
+send and receive money — and switch off anything you don't need.
 
-## Features
+- **Fund wallets** with card, bank, USSD, QR, mobile money, bank transfer or a
+  **dedicated virtual account** (a personal NUBAN per user)
+- **Withdraw** to bank accounts (Paystack Transfers) with OTP support
+- **Send money between wallets** by wallet ID, **tag**, **phone number** or **email**
+- **Pay with wallet** at checkout, with optional **escrow** for marketplaces
+- **Fees** that are fully configurable: who pays (customer / merchant / platform / split),
+  Paystack-accurate defaults, database-driven pricing per wallet, or your own calculator
+- **Refunds** back to the payer's card, staff **reversals**, **settlements** (scheduled payouts)
+- **Transaction PIN**, daily limits, minimum balances, webhook signature + IP checks
+- **Every Paystack API** wrapped in one client (`wallet.paystack.PaystackClient`)
+- **Signals** for every money movement, **pluggable notifications**, optional **Celery**
+- REST API (Django REST Framework), Django admin, management commands, `.env` configuration
 
-- 💰 **Wallet Management**: Create and manage digital wallets for users
-- 💳 **Payment Processing**: Deposit funds using Paystack payment gateway
-- 🏦 **Bank Transfers**: Withdraw funds to bank accounts
-- 👥 **Peer Transfers**: Transfer funds between wallets
-- 📊 **Transaction History**: Track all financial activities
-- 💼 **Virtual Accounts**: Dedicated virtual accounts via Paystack
-- 📱 **Card Management**: Save and charge cards for future payments
-- 🏦 **Bank Account Management**: Add and verify bank accounts
-- 🔄 **Settlements**: Automated wallet funds settlement to bank accounts
-- 🔔 **Webhooks**: Process Paystack webhooks and forward to custom endpoints
-- 📊 **Admin Dashboard**: Rich admin interface with analytics and exports
-- 🌐 **REST API**: Complete API for all wallet operations
-- 🔒 **Secure**: Built with security best practices
-- 📋 **Comprehensive Logging**: Detailed logs for all operations
-- 🌍 **Internationalization**: Built-in translation support
+## Why it's safe with money
+
+| Rule | What it prevents |
+| --- | --- |
+| Every balance change locks the wallet row (`SELECT … FOR UPDATE`) and is recorded as a ledger entry with `balance_after` | Double spending under concurrent requests; unexplained balances |
+| Withdrawals debit **before** calling Paystack and reverse automatically on failure | Spending the same money twice while a transfer is in flight |
+| Only a Paystack **rejection** reverses a withdrawal; timeouts stay pending and are reconciled | Paying out twice when Paystack succeeded but the response was lost |
+| Webhooks are signature-checked, stored, de-duplicated and processed idempotently | Double credits from Paystack retries or a webhook racing a manual verify |
+| Wallets are credited from what Paystack **actually collected**, never from the client | Under-payment and tampered amounts |
+| Signals fire only after the database commits | Sending "you've been paid" for a transaction that rolled back |
+| `Idempotency-Key` support on every money-moving endpoint | Double charges when a mobile app retries after a timeout |
+| Per-user rate limits on lookups, PINs, OTPs and payments | Phone-number enumeration, PIN/OTP guessing, abuse |
+| Audit log of every refund, reversal, escrow decision and lock | "Who did this?" |
+
+These are covered by 520+ tests, including race-condition tests against PostgreSQL, and
+[a ledger benchmark](loadtest/README.md) that proves the books balance under load.
 
 ## Installation
 
 ```bash
-pip install django-paystack-wallet
+pip install django-paystack-wallet            # core
+pip install "django-paystack-wallet[celery]"  # + background tasks
+pip install "django-paystack-wallet[export]"  # + Excel/PDF exports
 ```
 
-## Quick Start
-
-1. Add `wallet` to your `INSTALLED_APPS` in `settings.py`:
-
 ```python
+# settings.py
+from pathlib import Path
+from wallet.conf import load_env_file
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+load_env_file(BASE_DIR / '.env')          # optional: or use python-dotenv / django-environ
+
 INSTALLED_APPS = [
-    ...
-    'wallet',
+    # ...
     'rest_framework',
+    'djmoney',
+    'wallet',
 ]
 ```
 
-2. Configure your Paystack API keys:
-
 ```python
-# Paystack Configuration
-PAYSTACK_SECRET_KEY = 'sk_test_your_secret_key'
-PAYSTACK_PUBLIC_KEY = 'pk_test_your_public_key'
-```
-
-3. Run migrations:
-
-```bash
-python manage.py migrate
-```
-
-4. Include wallet URLs in your project's `urls.py`:
-
-```python
+# urls.py
 urlpatterns = [
-    ...
+    # ...
     path('wallet/', include('wallet.urls')),
 ]
 ```
 
-5. Configure your webhook URL in Paystack dashboard:
-   - Go to Paystack dashboard > Settings > API Keys & Webhooks
-   - Add webhook URL: `https://your-domain.com/wallet/webhook/`
-
-## Settings
-
-The wallet system can be customized using the following settings in your `settings.py`:
-
-```python
-# Wallet Settings
-WALLET_USE_UUID = True  # Use UUID instead of ID as primary key
-WALLET_CURRENCY = 'NGN'  # Default currency
-WALLET_AUTO_CREATE_WALLET = True  # Auto-create wallet for new users
-WALLET_TRANSACTION_CHARGE_PERCENT = 1.5  # Default transaction charge
-WALLET_MINIMUM_BALANCE = 0  # Minimum balance to maintain
-WALLET_MAXIMUM_DAILY_TRANSACTION = 1000000  # Maximum daily transaction limit
-WALLET_AUTO_SETTLEMENT = False  # Auto-settlement of wallet funds
+```bash
+cp .env.example .env        # then set PAYSTACK_SECRET_KEY / PAYSTACK_PUBLIC_KEY
+python manage.py migrate
+python manage.py sync_banks
+python manage.py check      # the package validates its own configuration
 ```
 
-## Usage Examples
+In the [Paystack dashboard](https://dashboard.paystack.com/#/settings/developers) set the
+webhook URL to `https://your-domain.com/wallet/webhook/`.
 
-### Creating a wallet
+That's it: every user gets a wallet automatically, and the API is live under `/wallet/api/`.
 
-Wallets are automatically created for new users when `WALLET_AUTO_CREATE_WALLET = True`. You can also create a wallet manually:
+## Try it in 5 minutes
 
-```python
-from wallet.services.wallet_service import WalletService
+The [`demo/`](demo/README.md) folder is a small Django site built on the package: fund a
+wallet through real Paystack test checkout, send money by phone number, withdraw to a
+bank, save cards, buy from a mini marketplace with escrow, and watch webhooks arrive.
 
-wallet_service = WalletService()
-wallet = wallet_service.get_wallet(user)
+```bash
+pip install -e ".[all]"
+cd demo && cp .env.example .env      # add your Paystack TEST keys
+python manage.py migrate && python manage.py seed_demo && python manage.py runserver
 ```
 
-### Deposit funds
+## A quick tour
 
 ```python
-# Initialize a card charge
-charge_data = wallet_service.initialize_card_charge(
-    wallet=wallet,
-    amount=1000.00,
-    email=user.email
-)
+from wallet.services import WalletService
 
-# Get authorization URL from charge_data
-auth_url = charge_data.get('authorization_url')
-# Redirect user to auth_url to complete payment
+service = WalletService()
+wallet = service.get_wallet(request.user)
+
+# Fund it (redirect the user to checkout['authorization_url'])
+checkout = service.initialize_deposit(wallet, 5000, callback_url='https://shop.com/paid')
+
+# Send money — by phone number, tag, email or wallet id
+service.set_phone_number(wallet, '0803 123 4567')
+service.transfer(wallet, '08099998888', 1500, description='Lunch')
+service.transfer(wallet, '@ada', 2000)
+
+# Pay a seller, held in escrow until delivery
+order_payment = service.pay(buyer_wallet, 25000, merchant_wallet=seller_wallet, escrow=True)
+service.release_payment(order_payment)          # or service.cancel_payment(order_payment)
+
+# Withdraw to a bank account
+account = service.add_bank_account(wallet, bank_code='058', account_number='0123456789')
+txn, transfer = service.withdraw_to_bank(wallet, 10000, account)
+if txn.requires_otp:
+    service.finalize_withdrawal(txn, otp='123456')
+
+# Anything else Paystack offers
+from wallet.paystack import get_paystack_client
+paystack = get_paystack_client()
+paystack.subscriptions.create(customer='CUS_xxx', plan='PLN_xxx')
 ```
 
-### Transfer between wallets
+React to money movement with signals:
 
 ```python
-# Transfer funds between wallets
-wallet_service.transfer(
-    source_wallet=source_wallet,
-    destination_wallet=destination_wallet,
-    amount=500.00,
-    description="Transfer to friend"
-)
+from django.dispatch import receiver
+from wallet.signals import deposit_completed, transfer_completed
+
+@receiver(deposit_completed)
+def fulfil(sender, transaction, wallet, **kwargs):
+    ...
 ```
 
-### Withdraw to bank
+## Use only what you need
 
-```python
-# Add a bank account
-bank_account = wallet_service.add_bank_account(
-    wallet=wallet,
-    bank_code="058",  # GTBank code
-    account_number="0123456789",
-    account_name="John Doe"
-)
+Everything is switchable with a setting or environment variable:
 
-# Withdraw to bank account
-transaction, transfer_data = wallet_service.withdraw_to_bank(
-    wallet=wallet,
-    amount=2000.00,
-    bank_account=bank_account,
-    reason="Withdrawal to my account"
-)
+```bash
+WALLET_ENABLE_WITHDRAWALS=false
+WALLET_ENABLE_INTERNAL_TRANSFERS=true
+WALLET_ENABLE_PAYMENTS=true
+WALLET_ENABLE_DEDICATED_ACCOUNTS=false
+WALLET_ENABLE_SETTLEMENTS=false
+WALLET_ENABLE_FEES=true
+WALLET_REQUIRE_TRANSACTION_PIN=true
 ```
 
-## API Endpoints
+What is core and what is pluggable:
 
-The wallet system provides a comprehensive REST API:
+| Core (always there) | Pluggable (opt in / replace) |
+| --- | --- |
+| Ledger, wallets, transactions, locking | Notifications (`WALLET_NOTIFICATION_BACKENDS`) |
+| Paystack client & webhook handling | Fee pricing (`WALLET_FEE_CALCULATOR`, DB configs) |
+| Fee *mechanics* (who pays, how much moves) | Phone normalisation (`WALLET_PHONE_NUMBER_NORMALIZER`) |
+| Signals | Background processing (Celery) |
+| | REST API permissions (`WALLET_API_PERMISSION_CLASSES`), URLs, admin |
+| | Webhook forwarding to other services, Excel/PDF export |
 
-- `/api/wallets/` - Wallet operations
-- `/api/transactions/` - Transaction operations
-- `/api/cards/` - Card operations
-- `/api/bank-accounts/` - Bank account operations
-- `/api/banks/` - Bank list operations
-- `/api/settlements/` - Settlement operations
-- `/api/settlement-schedules/` - Settlement schedule operations
-- `/webhook/` - Paystack webhook endpoint
+## Documentation
 
-Detailed API documentation is available in the `docs/` directory.
+- [Installation](docs/installation.md)
+- [Configuration & environment variables](docs/configuration.md)
+- [Usage guide](docs/usage.md): deposits, transfers by phone, payments & escrow, withdrawals, fees, refunds, settlements
+- [REST API reference](docs/api_reference.md)
+- [Extending](docs/extending.md): signals, notifications, custom fees, your own endpoints, the Paystack client
 
-## Admin Interface
+## Load testing
 
-The wallet system provides a rich admin interface with:
+`loadtest/benchmark_ledger.py` measures ledger throughput on your database and checks
+the books balance afterwards; `loadtest/locustfile.py` load-tests your full HTTP stack.
+See [loadtest/README.md](loadtest/README.md).
 
-- Dashboard with wallet analytics
-- Transaction monitoring
-- Card management
-- Bank account verification
-- Settlement processing
-- Webhook event handling
-- Export functionality (CSV, Excel, PDF)
+## Development
 
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+```bash
+pip install -e ".[dev]"
+pytest                                     # SQLite
+pytest --ds=your_postgres_settings         # includes the race-condition tests
+```
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+MIT — see [LICENSE](LICENSE).

@@ -1,0 +1,2 @@
+{% load i18n %}{% blocktrans %}Your withdrawal of {{ amount }} could not be completed and {{ total_amount }} has been returned to your wallet.{% endblocktrans %}
+{% if reason %}{% blocktrans %}Reason: {{ reason }}{% endblocktrans %}{% endif %}
