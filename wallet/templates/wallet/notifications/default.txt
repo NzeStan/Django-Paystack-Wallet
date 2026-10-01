@@ -1,0 +1,4 @@
+{% load i18n %}{% if amount %}{% blocktrans %}Amount: {{ amount }}{% endblocktrans %}
+{% endif %}{% if reference %}{% blocktrans %}Reference: {{ reference }}{% endblocktrans %}
+{% endif %}{% if reason %}{% blocktrans %}Reason: {{ reason }}{% endblocktrans %}
+{% endif %}{% if balance %}{% blocktrans %}Wallet balance: {{ balance }}{% endblocktrans %}{% endif %}

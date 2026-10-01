@@ -1,0 +1,2 @@
+{% load i18n %}{% blocktrans with to=recipient.tag %}You sent {{ amount }} to {{ to }}.{% endblocktrans %}
+{% blocktrans %}Reference: {{ reference }}. New balance: {{ balance }}{% endblocktrans %}

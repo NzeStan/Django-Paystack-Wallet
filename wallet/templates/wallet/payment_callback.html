@@ -1,0 +1,39 @@
+{% load i18n %}<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% trans "Payment status" %}</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; background: #f5f7fa; color: #1f2933;
+           display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+    .card { background: #fff; border-radius: 12px; padding: 32px; max-width: 420px; width: calc(100% - 32px);
+            box-shadow: 0 4px 24px rgba(0,0,0,.06); text-align: center; }
+    .success { color: #0f7b3f; } .failed, .cancelled { color: #b42318; } .pending, .unknown { color: #9a6700; }
+    dl { text-align: left; margin-top: 24px; } dt { font-size: 12px; color: #616e7c; } dd { margin: 0 0 12px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    {% if status == "success" %}
+      <h1 class="success">{% trans "Payment successful" %}</h1>
+      <p>{% trans "Your wallet has been funded." %}</p>
+    {% elif status == "failed" or status == "cancelled" %}
+      <h1 class="failed">{% trans "Payment failed" %}</h1>
+      <p>{{ transaction.failed_reason|default:_("The payment was not completed.") }}</p>
+    {% elif transaction %}
+      <h1 class="pending">{% trans "Payment processing" %}</h1>
+      <p>{% trans "We are confirming your payment. Your wallet will be credited automatically." %}</p>
+    {% else %}
+      <h1 class="unknown">{% trans "Payment not found" %}</h1>
+    {% endif %}
+    {% if transaction %}
+      <dl>
+        <dt>{% trans "Reference" %}</dt><dd>{{ transaction.reference }}</dd>
+        <dt>{% trans "Amount" %}</dt><dd>{{ transaction.amount }}</dd>
+        {% if transaction.balance_after %}<dt>{% trans "Wallet balance" %}</dt><dd>{{ transaction.balance_after }}</dd>{% endif %}
+      </dl>
+    {% endif %}
+  </div>
+</body>
+</html>

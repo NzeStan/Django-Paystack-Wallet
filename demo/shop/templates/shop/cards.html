@@ -1,0 +1,51 @@
+{% extends 'shop/base.html' %}
+{% block title %}Cards{% endblock %}
+{% block content %}
+<div class="grid">
+  <div class="card">
+    <h2>Saved cards</h2>
+    <p class="muted">Cards are saved automatically after you fund the wallet with a reusable card.</p>
+    <table><tbody id="card-list"></tbody></table>
+    <div id="card-result" class="result"></div>
+  </div>
+  <div class="card">
+    <h2>Top up from a saved card</h2>
+    <form id="charge-form">
+      <label>Card</label><select name="card_id" id="card-select"></select>
+      <label>Amount (NGN)</label><input name="amount" type="number" min="50" step="0.01" value="1000" required>
+      {% if require_pin %}<label>Transaction PIN</label><input name="pin" type="password" inputmode="numeric" maxlength="4" required>{% endif %}
+      <button>Charge card</button>
+    </form>
+    <div id="charge-result" class="result"></div>
+    <p class="muted">No checkout page: Paystack charges the saved authorization directly.</p>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadCards() {
+  const res = await Wallet.call('GET', 'cards/');
+  const cards = res.ok ? res.data.results : [];
+  document.getElementById('card-list').innerHTML = cards.length ? cards.map((c) => `<tr>
+    <td>${c.card_type_display} •••• ${c.last_four}<div class="muted">${c.bank || ''} · expires ${c.expiry}</div></td>
+    <td>${c.is_default ? '<span class="badge success">default</span>' :
+      `<button class="secondary" style="margin:0;padding:4px 10px" onclick="makeDefault('${c.id}')">Make default</button>`}</td>
+    <td><button class="danger" style="margin:0;padding:4px 10px" onclick="removeCard('${c.id}')">Remove</button></td></tr>`).join('')
+    : '<tr><td class="muted">No saved cards yet. Fund your wallet with the test card first.</td></tr>';
+  document.getElementById('card-select').innerHTML = cards.map((c) =>
+    `<option value="${c.id}">${c.card_type_display} •••• ${c.last_four}</option>`).join('');
+}
+async function makeDefault(id) { Wallet.notify('#card-result', await Wallet.call('POST', `cards/${id}/set-default/`), 'Default card updated'); loadCards(); }
+async function removeCard(id) { Wallet.notify('#card-result', await Wallet.call('DELETE', `cards/${id}/`), 'Card removed'); loadCards(); }
+loadCards();
+
+document.getElementById('charge-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const res = await Wallet.call('POST', 'wallets/me/charge-card/', Wallet.formData(event.target));
+  Wallet.notify('#charge-result', res, res.ok
+    ? (res.data.status === 'success' ? `Charged. New balance ${Wallet.money(res.data.balance_after)}` : `Status: ${res.data.status} (completes by webhook)`)
+    : '');
+});
+</script>
+{% endblock %}

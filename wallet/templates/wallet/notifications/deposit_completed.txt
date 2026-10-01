@@ -1,0 +1,3 @@
+{% load i18n %}{% blocktrans %}Your wallet was funded with {{ total_amount }}.{% endblocktrans %}
+{% blocktrans %}Reference: {{ reference }}{% endblocktrans %}
+{% blocktrans %}New balance: {{ balance }}{% endblocktrans %}

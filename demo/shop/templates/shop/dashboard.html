@@ -1,0 +1,181 @@
+{% extends 'shop/base.html' %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+<div id="callback-result" class="result"></div>
+
+<div class="grid">
+  <div class="card">
+    <h2>Balance</h2>
+    <div class="balance" id="balance">…</div>
+    <div class="muted">Updates live: webhook credits show up here without a reload.</div>
+    <div class="muted" id="daily"></div>
+  </div>
+
+  <div class="card">
+    <h2>Fund wallet (Paystack checkout)</h2>
+    <form id="deposit-form">
+      <label>Amount (NGN)</label>
+      <input name="amount" type="number" min="50" step="0.01" value="5000" required>
+      <div class="muted" id="deposit-quote"></div>
+      <button>Pay with Paystack</button>
+    </form>
+    <div id="deposit-result" class="result"></div>
+    <p class="hint">Test card: <code>4084 0840 8408 4081</code>, any future expiry, CVV <code>408</code>,
+      PIN <code>0000</code>, OTP <code>123456</code>. You can also pick Bank Transfer or USSD on the checkout page.</p>
+  </div>
+
+  <div class="card">
+    <h2>Receive money</h2>
+    <dl class="kv" id="identity"><dt>Tag</dt><dd>…</dd></dl>
+    <form id="identity-form">
+      <div class="row">
+        <div><label>Tag</label><input name="tag" id="tag-input"></div>
+        <div><label>Phone number</label><input name="phone_number" id="phone-input" placeholder="0803…"></div>
+      </div>
+      <button class="secondary">Save</button>
+    </form>
+    <div id="identity-result" class="result"></div>
+  </div>
+
+  {% if features.dedicated_accounts %}
+  <div class="card">
+    <h2>Dedicated virtual account</h2>
+    <div id="dva">…</div>
+    <button id="dva-create" class="secondary" style="display:none">Get my account number</button>
+    <button id="dva-requery" class="secondary" style="display:none">Check for new transfers</button>
+    <div id="dva-result" class="result"></div>
+    <p class="muted">In test mode Paystack uses the <code>test-bank</code> provider. Some businesses must
+      validate customers first. See the Paystack dashboard if creation fails.</p>
+  </div>
+  {% endif %}
+
+  <div class="card">
+    <h2>Transaction PIN</h2>
+    <p class="muted" id="pin-state">{% if require_pin %}Required for sending money.{% else %}Optional (turn on with WALLET_REQUIRE_TRANSACTION_PIN).{% endif %}</p>
+    <form id="pin-form">
+      <div class="row">
+        <div><label>New PIN</label><input name="pin" type="password" inputmode="numeric" maxlength="4"></div>
+        <div><label>Confirm</label><input name="confirm_pin" type="password" inputmode="numeric" maxlength="4"></div>
+      </div>
+      <label>Current PIN (when changing)</label><input name="current_pin" type="password" inputmode="numeric" maxlength="4">
+      <button class="secondary">Save PIN</button>
+    </form>
+    <div id="pin-result" class="result"></div>
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h2>Recent activity <a href="{% url 'history' %}" class="muted" style="font-weight:400">see all</a></h2>
+  <table><tbody id="recent"><tr><td class="muted">Loading…</td></tr></tbody></table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let wallet = null;
+
+async function loadWallet() {
+  const res = await Wallet.call('GET', 'wallets/me/');
+  if (!res.ok) return;
+  wallet = res.data;
+  document.getElementById('balance').textContent = Wallet.money(wallet.balance, wallet.currency);
+  document.getElementById('daily').textContent = wallet.daily_limit
+    ? `Spent today ${Wallet.money(wallet.daily_spent)} of ${Wallet.money(wallet.daily_limit)}` : '';
+  document.getElementById('identity').innerHTML =
+    `<dt>Tag</dt><dd>@${wallet.tag || '-'}</dd><dt>Phone</dt><dd>${wallet.phone_number || '-'}</dd>
+     <dt>Status</dt><dd>${wallet.is_operational ? 'Active' : 'Locked'}</dd>`;
+  if (document.activeElement.id !== 'tag-input') document.getElementById('tag-input').value = wallet.tag || '';
+  if (document.activeElement.id !== 'phone-input') document.getElementById('phone-input').value = wallet.phone_number || '';
+  const dva = document.getElementById('dva');
+  if (dva) {
+    const account = wallet.dedicated_account;
+    dva.innerHTML = account
+      ? `<dl class="kv"><dt>Bank</dt><dd>${account.bank_name}</dd><dt>Account</dt><dd><strong>${account.account_number}</strong></dd><dt>Name</dt><dd>${account.account_name}</dd></dl>
+         <p class="muted">Transfers into this account credit your wallet automatically (via webhook).</p>`
+      : '<p class="muted">No account number yet.</p>';
+    document.getElementById('dva-create').style.display = account ? 'none' : 'inline-block';
+    document.getElementById('dva-requery').style.display = account ? 'inline-block' : 'none';
+  }
+}
+
+async function loadRecent() {
+  const res = await Wallet.call('GET', 'wallets/me/transactions/?page_size=6');
+  const body = document.getElementById('recent');
+  body.innerHTML = res.ok && res.data.results.length
+    ? res.data.results.map(Wallet.txnRow).join('')
+    : '<tr><td class="muted">No transactions yet. Fund your wallet or run seed_demo.</td></tr>';
+}
+
+async function refresh() { await Promise.all([loadWallet(), loadRecent()]); }
+refresh();
+setInterval(refresh, 4000);
+
+// Back from Paystack checkout: /?reference=...&status=...
+const params = new URLSearchParams(location.search);
+if (params.get('reference')) {
+  const el = document.getElementById('callback-result');
+  const status = params.get('status');
+  el.className = 'result ' + (status === 'success' ? 'ok' : status === 'failed' ? 'error' : 'info');
+  el.textContent = status === 'success' ? `Payment ${params.get('reference')} confirmed. Your wallet has been credited.`
+    : status === 'pending' ? `Payment ${params.get('reference')} is still processing; the balance updates when Paystack confirms.`
+    : `Payment ${params.get('reference')}: ${status}.`;
+  history.replaceState(null, '', '/');
+}
+
+// Live fee quote
+const depositForm = document.getElementById('deposit-form');
+async function quote() {
+  const amount = depositForm.amount.value;
+  if (!amount || Number(amount) <= 0) return;
+  const res = await Wallet.call('POST', 'wallets/fee-quote/', { amount, transaction_type: 'deposit' });
+  document.getElementById('deposit-quote').textContent = res.ok
+    ? `You pay ${Wallet.money(res.data.customer_pays)} · wallet receives ${Wallet.money(res.data.merchant_receives)} · fee ${Wallet.money(res.data.fee_amount)} (${res.data.bearer})`
+    : '';
+}
+depositForm.amount.addEventListener('input', () => { clearTimeout(window._q); window._q = setTimeout(quote, 300); });
+quote();
+
+depositForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const button = depositForm.querySelector('button'); button.disabled = true;
+  const res = await Wallet.call('POST', 'wallets/me/deposit/', {
+    amount: depositForm.amount.value,
+    callback_url: location.origin + '/wallet/callback/',
+  });
+  if (res.ok) {
+    Wallet.notify('#deposit-result', res, 'Redirecting to Paystack…');
+    location.href = res.data.authorization_url;
+  } else {
+    Wallet.notify('#deposit-result', res); button.disabled = false;
+  }
+});
+
+document.getElementById('identity-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const res = await Wallet.call('PATCH', 'wallets/me/', Wallet.formData(event.target));
+  Wallet.notify('#identity-result', res, 'Saved');
+  loadWallet();
+});
+
+document.getElementById('pin-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const res = await Wallet.call('POST', 'wallets/me/set-pin/', Wallet.formData(event.target));
+  Wallet.notify('#pin-result', res, 'PIN saved');
+  if (res.ok) event.target.reset();
+});
+
+const dvaCreate = document.getElementById('dva-create');
+if (dvaCreate) {
+  dvaCreate.addEventListener('click', async () => {
+    dvaCreate.disabled = true;
+    const res = await Wallet.call('POST', 'wallets/me/dedicated-account/', {});
+    Wallet.notify('#dva-result', res, 'Account created');
+    dvaCreate.disabled = false; loadWallet();
+  });
+  document.getElementById('dva-requery').addEventListener('click', async () => {
+    const res = await Wallet.call('POST', 'wallets/me/requery-dedicated-account/', {});
+    Wallet.notify('#dva-result', res, 'Asked Paystack to re-check; new transfers arrive by webhook');
+  });
+}
+</script>
+{% endblock %}

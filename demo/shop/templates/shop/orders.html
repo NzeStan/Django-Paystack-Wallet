@@ -1,0 +1,47 @@
+{% extends 'shop/base.html' %}
+{% block title %}Orders{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>My purchases</h2>
+  <table>
+    <thead><tr><th>Order</th><th>Product</th><th>Seller</th><th>Amount</th><th>Status</th><th></th></tr></thead>
+    <tbody>
+    {% for order in purchases %}
+      <tr>
+        <td>#{{ order.pk }}<div class="muted">{{ order.created_at|date:"M j, H:i" }}</div></td>
+        <td>{{ order.product.name }}</td>
+        <td>@{{ order.product.seller.wallet.tag|default:order.product.seller.username }}</td>
+        <td>NGN {{ order.amount|floatformat:2 }}</td>
+        <td><span class="badge {{ order.status }}">{{ order.get_status_display }}</span></td>
+        <td>{% if order.status == 'in_escrow' %}
+          <form method="post" action="{% url 'confirm-delivery' order.pk %}">{% csrf_token %}
+            <button style="margin:0;padding:4px 10px">Confirm delivery</button></form>{% endif %}</td>
+      </tr>
+    {% empty %}<tr><td colspan="6" class="muted">No purchases yet. Visit the <a href="{% url 'shop' %}">shop</a>.</td></tr>{% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h2>My sales</h2>
+  <table>
+    <thead><tr><th>Order</th><th>Product</th><th>Buyer</th><th>Amount</th><th>Status</th><th></th></tr></thead>
+    <tbody>
+    {% for order in sales %}
+      <tr>
+        <td>#{{ order.pk }}</td>
+        <td>{{ order.product.name }}</td>
+        <td>{{ order.buyer.username }}</td>
+        <td>NGN {{ order.amount|floatformat:2 }}<div class="muted">you receive 95% after commission</div></td>
+        <td><span class="badge {{ order.status }}">{{ order.get_status_display }}</span></td>
+        <td>{% if order.status == 'in_escrow' %}
+          <form method="post" action="{% url 'refund-order' order.pk %}">{% csrf_token %}
+            <button class="danger" style="margin:0;padding:4px 10px">Can't deliver: refund buyer</button></form>{% endif %}</td>
+      </tr>
+    {% empty %}<tr><td colspan="6" class="muted">No sales yet.</td></tr>{% endfor %}
+    </tbody>
+  </table>
+  <p class="muted">Order status follows the wallet's <code>payment_released</code> / <code>payment_cancelled</code> signals
+    (<code>demo/shop/receivers.py</code>), so it stays correct even when staff act in the admin or through the API.</p>
+</div>
+{% endblock %}

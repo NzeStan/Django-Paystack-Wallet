@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "django-paystack-wallet"
+version = "1.0.0"
+description = "A pluggable Django wallet backed by Paystack: deposits, withdrawals, transfers (by phone, tag or email), payments, escrow, fees, virtual accounts, settlements and a complete Paystack API client."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Ifeanyi Stanley Nnamani", email = "nnamaniifeanyi10@gmail.com" }]
+requires-python = ">=3.10"
+keywords = ["django", "paystack", "wallet", "payments", "fintech", "nigeria", "ecommerce", "marketplace"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Framework :: Django",
+    "Framework :: Django :: 4.2",
+    "Framework :: Django :: 5.0",
+    "Framework :: Django :: 5.1",
+    "Framework :: Django :: 5.2",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial",
+]
+dependencies = [
+    "Django>=4.2",
+    "djangorestframework>=3.14",
+    "django-money>=3.4",
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+celery = ["celery>=5.3"]
+export = ["xlsxwriter>=3.0", "reportlab>=4.0"]
+all = ["celery>=5.3", "xlsxwriter>=3.0", "reportlab>=4.0"]
+dev = [
+    "pytest>=8",
+    "pytest-django>=4.8",
+    "pytest-cov>=5",
+    "responses>=0.25",
+    "celery>=5.3",
+    "xlsxwriter>=3.0",
+    "reportlab>=4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/NzeStan/django-paystack-wallet"
+Documentation = "https://github.com/NzeStan/django-paystack-wallet/tree/main/docs"
+"Bug Tracker" = "https://github.com/NzeStan/django-paystack-wallet/issues"
+
+[tool.setuptools.packages.find]
+include = ["wallet*"]
+
+[tool.setuptools.package-data]
+wallet = ["templates/**/*"]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "tests.settings"
+python_files = ["test_*.py"]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+filterwarnings = [
+    "ignore::DeprecationWarning:celery.*",
+    "ignore::DeprecationWarning:kombu.*",
+]
+
+[tool.coverage.run]
+source = ["wallet"]
+omit = ["wallet/migrations/*"]

@@ -1,0 +1,2 @@
+{% load i18n %}{% blocktrans %}Fund your wallet any time by transferring to:{% endblocktrans %}
+{{ account_number }} - {{ bank_name }} ({{ account_name }})
