@@ -50,9 +50,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/NzeStan/django-paystack-wallet"
-Documentation = "https://github.com/NzeStan/django-paystack-wallet/tree/main/docs"
-"Bug Tracker" = "https://github.com/NzeStan/django-paystack-wallet/issues"
+Homepage = "https://github.com/NzeStan/Django-Paystack-Wallet"
+Documentation = "https://github.com/NzeStan/Django-Paystack-Wallet/tree/main/docs"
+Changelog = "https://github.com/NzeStan/Django-Paystack-Wallet/blob/main/CHANGELOG.md"
+"Bug Tracker" = "https://github.com/NzeStan/Django-Paystack-Wallet/issues"
 
 [tool.setuptools.packages.find]
 include = ["wallet*"]
