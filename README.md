@@ -32,7 +32,7 @@ send and receive money — and switch off anything you don't need.
 | Audit log of every refund, reversal, escrow decision and lock | "Who did this?" |
 
 These are covered by 520+ tests, including race-condition tests against PostgreSQL, and
-[a ledger benchmark](loadtest/README.md) that proves the books balance under load.
+[a ledger benchmark](https://github.com/NzeStan/Django-Paystack-Wallet/blob/main/loadtest/README.md) that proves the books balance under load.
 
 ## Installation
 
@@ -80,7 +80,7 @@ That's it: every user gets a wallet automatically, and the API is live under `/w
 
 ## Try it in 5 minutes
 
-The [`demo/`](demo/README.md) folder is a small Django site built on the package: fund a
+The [`demo/`](https://github.com/NzeStan/Django-Paystack-Wallet/blob/main/demo/README.md) folder is a small Django site built on the package: fund a
 wallet through real Paystack test checkout, send money by phone number, withdraw to a
 bank, save cards, buy from a mini marketplace with escrow, and watch webhooks arrive.
 
@@ -160,17 +160,17 @@ What is core and what is pluggable:
 
 ## Documentation
 
-- [Installation](docs/installation.md)
-- [Configuration & environment variables](docs/configuration.md)
-- [Usage guide](docs/usage.md): deposits, transfers by phone, payments & escrow, withdrawals, fees, refunds, settlements
-- [REST API reference](docs/api_reference.md)
-- [Extending](docs/extending.md): signals, notifications, custom fees, your own endpoints, the Paystack client
+- [Installation](https://github.com/NzeStan/Django-Paystack-Wallet/blob/main/docs/installation.md)
+- [Configuration & environment variables](https://github.com/NzeStan/Django-Paystack-Wallet/blob/main/docs/configuration.md)
+- [Usage guide](https://github.com/NzeStan/Django-Paystack-Wallet/blob/main/docs/usage.md): deposits, transfers by phone, payments & escrow, withdrawals, fees, refunds, settlements
+- [REST API reference](https://github.com/NzeStan/Django-Paystack-Wallet/blob/main/docs/api_reference.md)
+- [Extending](https://github.com/NzeStan/Django-Paystack-Wallet/blob/main/docs/extending.md): signals, notifications, custom fees, your own endpoints, the Paystack client
 
 ## Load testing
 
 `loadtest/benchmark_ledger.py` measures ledger throughput on your database and checks
 the books balance afterwards; `loadtest/locustfile.py` load-tests your full HTTP stack.
-See [loadtest/README.md](loadtest/README.md).
+See [loadtest/README.md](https://github.com/NzeStan/Django-Paystack-Wallet/blob/main/loadtest/README.md).
 
 ## Development
 
@@ -182,4 +182,4 @@ pytest --ds=your_postgres_settings         # includes the race-condition tests
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/NzeStan/Django-Paystack-Wallet/blob/main/LICENSE).
